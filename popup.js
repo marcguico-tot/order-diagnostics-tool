@@ -1,5 +1,6 @@
 const CONFIG_KEY = 'totExciseConfig';
 const SHEET_KEY = 'totExciseSheetUrl';
+const LAST_ORDER_KEY = 'totLastOrder';
 
 const DEFAULT_CONFIG = [
   {domain:'fullsend.com', handle:'full-send-pouches'},
@@ -270,6 +271,16 @@ document.getElementById('analyzePastedBtn').addEventListener('click', async ()=>
   }
 });
 
+document.getElementById('clearBtn').addEventListener('click', async ()=>{
+  await chrome.storage.local.remove([LAST_ORDER_KEY]);
+  document.getElementById('orderInput').value = '';
+  document.getElementById('pasteArea').value = '';
+  document.getElementById('jsonPanel').style.display = 'none';
+  document.getElementById('diagList').innerHTML = '';
+  document.getElementById('diagEmpty').style.display = 'block';
+  setStatus('Cleared.', 'ok');
+});
+
 document.getElementById('fullTabBtn').addEventListener('click', ()=>{
   chrome.tabs.create({url: chrome.runtime.getURL('popup.html?full=1')});
 });
@@ -440,7 +451,7 @@ function renderDiagnostics(checks){
   });
 }
 
-async function handleOrderData(order){
+async function handleOrderData(order, opts){
   document.getElementById('jsonPanel').style.display = 'block';
   document.getElementById('jsonView').innerHTML = syntaxHighlight(order);
   document.getElementById('orderMeta').textContent =
@@ -449,6 +460,16 @@ async function handleOrderData(order){
   const sheetUrl = document.getElementById('sheetUrl').value.trim();
   const compliance = sheetUrl ? await getComplianceRows(sheetUrl) : null;
   renderDiagnostics(analyzeOrder(order, compliance));
+
+  if(!(opts && opts.skipPersist)){
+    await chrome.storage.local.set({
+      [LAST_ORDER_KEY]: {
+        order,
+        orderInputValue: document.getElementById('orderInput').value,
+        domainIdx: document.getElementById('domainSelect').value
+      }
+    });
+  }
 }
 
 async function init(){
@@ -460,6 +481,20 @@ async function init(){
   const stored = await chrome.storage.local.get([SHEET_KEY]);
   sheetInput.value = stored[SHEET_KEY] || '';
   sheetInput.addEventListener('input', ()=> chrome.storage.local.set({[SHEET_KEY]: sheetInput.value.trim()}));
+
+  // Restore the last order looked at, since Chrome discards popup state entirely on blur.
+  const last = await chrome.storage.local.get([LAST_ORDER_KEY]);
+  const saved = last[LAST_ORDER_KEY];
+  if(saved && saved.order){
+    document.getElementById('orderInput').value = saved.orderInputValue || '';
+    if(saved.domainIdx !== undefined && CONFIG[saved.domainIdx]){
+      document.getElementById('domainSelect').value = saved.domainIdx;
+      updateHandleHint();
+    }
+    document.getElementById('pasteArea').value = JSON.stringify(saved.order, null, 2);
+    await handleOrderData(saved.order, {skipPersist:true});
+    setStatus('Restored last order (popup state resets when it loses focus).', 'ok');
+  }
 }
 
 init();
