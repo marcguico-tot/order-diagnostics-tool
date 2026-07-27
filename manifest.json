@@ -20,5 +20,5 @@
     "128": "icon128.png"
   },
   "permissions": ["storage"],
-  "host_permissions": ["https://admin.shopify.com/*"]
+  "host_permissions": ["https://admin.shopify.com/*", "https://docs.google.com/*"]
 }
