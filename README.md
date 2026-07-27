@@ -106,6 +106,15 @@ If the state isn't found in the sheet, or the fetch fails (e.g. sharing settings
 - The only host permissions requested are `admin.shopify.com` (order lookup) and `docs.google.com` (compliance sheet, only used if you set one) — it can't read or modify any other site
 - Storefront config and the compliance sheet URL are stored locally via `chrome.storage.local`, never transmitted anywhere by this extension
 
+## A note on the popup losing focus
+
+Chrome destroys a popup's entire page — and all its JS state — the instant it loses focus (e.g. you click outside it). Reopening isn't "restoring a hidden window," it's a completely fresh load. This isn't something an extension can override; it's how Chrome manages popups.
+
+Two ways this is handled here:
+
+- The popup **auto-restores the last order you loaded** (via `chrome.storage.local`) when reopened, so an accidental click-away doesn't lose your place. Click **Clear** to dismiss it and start fresh.
+- If you're going to be working an order for a while, use **⤢ Full view** instead — that opens the same UI in a real tab, which behaves like a normal webpage and won't vanish on blur.
+
 ## Known limitations
 
 - Chrome/Chromium only (Manifest V3); untested on Firefox or Safari
