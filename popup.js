@@ -155,6 +155,75 @@ function currentUrl(){
   return `https://admin.shopify.com/store/${handle}/orders/${orderId}.json`;
 }
 
+// ---- Compliance sheet (PACT & Excise tab) ----
+// Columns (0-indexed): 0 State | 1 PACT Agency | 2 PACT Required License | 3 PACT Fees
+// | 4 PACT Registration Portal | 5 (blank spacer) | 6 Excise Agency | 7 Excise Required License
+// | 8 Excise Registration Portal | 9 Excise Tax. Rows 0-1 are headers; data starts at row 2.
+const STATE_ABBR_TO_NAME = {
+  AL:'Alabama',AK:'Alaska',AZ:'Arizona',AR:'Arkansas',CA:'California',CO:'Colorado',
+  CT:'Connecticut',DE:'Delaware',FL:'Florida',GA:'Georgia',HI:'Hawaii',ID:'Idaho',
+  IL:'Illinois',IN:'Indiana',IA:'Iowa',KS:'Kansas',KY:'Kentucky',LA:'Louisiana',
+  ME:'Maine',MD:'Maryland',MA:'Massachusetts',MI:'Michigan',MN:'Minnesota',
+  MS:'Mississippi',MO:'Missouri',MT:'Montana',NE:'Nebraska',NV:'Nevada',
+  NH:'New Hampshire',NJ:'New Jersey',NM:'New Mexico',NY:'New York',NC:'North Carolina',
+  ND:'North Dakota',OH:'Ohio',OK:'Oklahoma',OR:'Oregon',PA:'Pennsylvania',
+  RI:'Rhode Island',SC:'South Carolina',SD:'South Dakota',TN:'Tennessee',TX:'Texas',
+  UT:'Utah',VT:'Vermont',VA:'Virginia',WA:'Washington',WV:'West Virginia',
+  WI:'Wisconsin',WY:'Wyoming',DC:'District of Columbia'
+};
+
+function parseCSV(text){
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for(let i=0;i<text.length;i++){
+    const c = text[i];
+    if(inQuotes){
+      if(c === '"'){
+        if(text[i+1] === '"'){ field += '"'; i++; }
+        else { inQuotes = false; }
+      } else { field += c; }
+    } else {
+      if(c === '"'){ inQuotes = true; }
+      else if(c === ','){ row.push(field); field=''; }
+      else if(c === '\n'){ row.push(field); rows.push(row); row=[]; field=''; }
+      else if(c === '\r'){ /* skip, \r\n handled via \n */ }
+      else { field += c; }
+    }
+  }
+  if(field.length || row.length){ row.push(field); rows.push(row); }
+  return rows;
+}
+
+let complianceCache = null; // {url, rows} | {url, error}
+
+async function getComplianceRows(url){
+  if(!url) return {rows:null, error:null};
+  if(complianceCache && complianceCache.url === url) return complianceCache;
+  try{
+    const res = await fetch(url);
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    const text = await res.text();
+    complianceCache = {url, rows: parseCSV(text), error:null};
+  }catch(e){
+    complianceCache = {url, rows:null, error: e.message || 'fetch failed'};
+  }
+  return complianceCache;
+}
+
+function findComplianceRow(rows, order){
+  if(!rows) return null;
+  const ship = order.shipping_address;
+  if(!ship) return null;
+  let stateName = ship.province;
+  if(!stateName && ship.province_code) stateName = STATE_ABBR_TO_NAME[ship.province_code.toUpperCase()];
+  if(!stateName) return null;
+  const target = stateName.trim().toLowerCase();
+  for(let i=2;i<rows.length;i++){
+    if(rows[i][0] && rows[i][0].trim().toLowerCase() === target) return rows[i];
+  }
+  return null;
+}
+
 function setStatus(msg, type){
   const el = document.getElementById('fetchStatus');
   el.textContent = msg;
@@ -183,18 +252,18 @@ document.getElementById('fetchBtn').addEventListener('click', async ()=>{
     }
     const data = await res.json();
     setStatus('Loaded order ' + url, 'ok');
-    handleOrderData(data.order || data);
+    await handleOrderData(data.order || data);
   }catch(err){
     setStatus('Fetch failed — ' + (err.message || 'unknown error') + '. Try "Open in Shopify" and paste the JSON below instead.', 'err');
   }
 });
 
-document.getElementById('analyzePastedBtn').addEventListener('click', ()=>{
+document.getElementById('analyzePastedBtn').addEventListener('click', async ()=>{
   const raw = document.getElementById('pasteArea').value.trim();
   if(!raw){ return; }
   try{
     const data = JSON.parse(raw);
-    handleOrderData(data.order || data);
+    await handleOrderData(data.order || data);
     setStatus('Loaded from pasted JSON.', 'ok');
   }catch(e){
     setStatus('Could not parse that as JSON — check for a stray character or truncated paste.', 'err');
@@ -226,7 +295,7 @@ function syntaxHighlight(json){
 // ---- Diagnostics ----
 function num(v){ const n = parseFloat(v); return isNaN(n) ? 0 : n; }
 
-function analyzeOrder(order){
+function analyzeOrder(order, compliance){
   const checks = [];
   const lineItems = order.line_items || [];
 
@@ -300,12 +369,27 @@ function analyzeOrder(order){
   });
 
   const state = ship ? (ship.province_code || ship.province) : null;
-  checks.push({
-    label:'State-specific rate config',
-    status: 'info',
-    summary: state ? `Ship-to state: ${state} — cross-check against the compliance calendar` : 'No ship-to state to check',
-    detail: state ? `Verify ${state}'s excise tax / PACT registration rules for this order date against the compliance reference.` : null
-  });
+  let stateCheck;
+  if(!state){
+    stateCheck = { label:'State-specific rate config', status:'flag', summary:'No ship-to state to check', detail:null };
+  } else if(!compliance || (!compliance.rows && !compliance.error)){
+    stateCheck = { label:'State-specific rate config', status:'info', summary:`Ship-to state: ${state} — add a compliance sheet CSV URL below to auto-check`, detail:null };
+  } else if(compliance.error){
+    stateCheck = { label:'State-specific rate config', status:'flag', summary:`Ship-to state: ${state} — couldn't load compliance sheet`, detail:`Error: ${compliance.error}\nCheck the CSV URL is still valid (Google can revoke export links if sharing settings change).` };
+  } else {
+    const match = findComplianceRow(compliance.rows, order);
+    if(!match){
+      stateCheck = { label:'State-specific rate config', status:'flag', summary:`Ship-to state: ${state} — no matching row in compliance sheet`, detail:'Check the sheet\'s state-name spelling against this order\'s shipping address.' };
+    } else {
+      stateCheck = {
+        label:'State-specific rate config',
+        status:'info',
+        summary:`Ship-to state: ${match[0]} — compliance details found`,
+        detail: `PACT — Agency: ${match[1]||'n/a'} | License: ${match[2]||'n/a'} | Fees: ${match[3]||'n/a'}${match[4]?(' | Portal: '+match[4]):''}\n\nExcise — Agency: ${match[6]||'n/a'} | License: ${match[7]||'n/a'}${match[8]?(' | Portal: '+match[8]):''}\n${(match[9]||'No excise tax detail listed').trim()}`
+      };
+    }
+  }
+  checks.push(stateCheck);
 
   const totalQty = lineItems.reduce((s,li)=>s+(li.quantity||0),0);
   const bigCart = lineItems.length>15 || totalQty>50;
@@ -356,12 +440,15 @@ function renderDiagnostics(checks){
   });
 }
 
-function handleOrderData(order){
+async function handleOrderData(order){
   document.getElementById('jsonPanel').style.display = 'block';
   document.getElementById('jsonView').innerHTML = syntaxHighlight(order);
   document.getElementById('orderMeta').textContent =
     `#${order.order_number || order.name || order.id || ''} · ${order.created_at ? order.created_at.slice(0,10) : ''}`;
-  renderDiagnostics(analyzeOrder(order));
+
+  const sheetUrl = document.getElementById('sheetUrl').value.trim();
+  const compliance = sheetUrl ? await getComplianceRows(sheetUrl) : null;
+  renderDiagnostics(analyzeOrder(order, compliance));
 }
 
 async function init(){
