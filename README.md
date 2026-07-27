@@ -71,6 +71,10 @@ A field for a published Google Sheets CSV URL, intended for cross-referencing sh
 ├── manifest.json   # MV3 manifest, host_permissions for admin.shopify.com
 ├── popup.html      # Popup markup + styles
 ├── popup.js        # All logic: config, fetch, diagnostics, JSON rendering
+├── icon16.png
+├── icon32.png
+├── icon48.png
+├── icon128.png
 └── README.md
 ```
 
