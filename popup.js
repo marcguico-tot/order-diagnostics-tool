@@ -705,7 +705,7 @@ document.getElementById('bulkScanBtn').addEventListener('click', async ()=>{
 
   document.getElementById('bulkResultsPanel').style.display = 'block';
   document.getElementById('bulkSummary').textContent =
-    `Scanned ${totalScanned} orders across ${pagesFetched} page(s), found ${matches.length} in range, ${flagged.length} need attention.`;
+    `Checked ${totalScanned} recent order(s) across ${pagesFetched} page(s) to find your range — ${matches.length} matched, ${flagged.length} need attention.`;
 
   const list = document.getElementById('bulkResultsList');
   list.innerHTML = '';
