@@ -231,6 +231,38 @@ function setStatus(msg, type){
   el.className = 'status-line show' + (type ? ' '+type : '');
 }
 
+function skeletonRows(count, widths){
+  let html = '';
+  for(let i=0;i<count;i++){
+    const w = widths ? widths[i % widths.length] : (60 + (i*13)%35);
+    html += `<div class="skeleton-row" style="width:${w}%;"></div>`;
+  }
+  return html;
+}
+
+function showLoadingState(){
+  document.getElementById('totStatusPanel').style.display = 'block';
+  document.getElementById('totStatusList').innerHTML = skeletonRows(2, [70, 55]);
+
+  document.getElementById('diagEmpty').style.display = 'none';
+  document.getElementById('diagList').innerHTML = skeletonRows(4, [90, 75, 85, 65]);
+
+  document.getElementById('notesPanel').style.display = 'none';
+
+  document.getElementById('jsonPanel').style.display = 'block';
+  document.getElementById('orderMeta').textContent = '';
+  document.getElementById('jsonView').innerHTML = `<div style="display:flex;flex-direction:column;gap:8px;">${skeletonRows(6, [80, 60, 90, 45, 70, 55])}</div>`;
+}
+
+function resetToEmptyState(){
+  document.getElementById('totStatusPanel').style.display = 'none';
+  document.getElementById('totStatusList').innerHTML = '';
+  document.getElementById('diagList').innerHTML = '';
+  document.getElementById('diagEmpty').style.display = 'block';
+  document.getElementById('notesPanel').style.display = 'none';
+  document.getElementById('jsonPanel').style.display = 'none';
+}
+
 document.getElementById('openTabBtn').addEventListener('click', ()=>{
   const url = currentUrl();
   if(!url){ setStatus('Select a storefront with a saved handle, and enter an order ID.', 'err'); return; }
@@ -241,14 +273,17 @@ async function fetchOrder(){
   const url = currentUrl();
   if(!url){ setStatus('Select a storefront with a saved handle, and enter an order ID.', 'err'); return; }
   setStatus('Fetching ' + url + ' …');
+  showLoadingState();
   try{
     const res = await fetch(url, {credentials:'include'});
     if(res.status === 401 || res.status === 403){
       setStatus(`Not authenticated for this store (${res.status}). Open it in Shopify first to log in, then try Fetch again.`, 'err');
+      resetToEmptyState();
       return;
     }
     if(!res.ok){
       setStatus(`Request returned ${res.status}. Check the store handle and order ID are correct.`, 'err');
+      resetToEmptyState();
       return;
     }
     const data = await res.json();
@@ -256,6 +291,7 @@ async function fetchOrder(){
     await handleOrderData(data.order || data);
   }catch(err){
     setStatus('Fetch failed — ' + (err.message || 'unknown error') + '. Try "Open in Shopify" and paste the JSON below instead.', 'err');
+    resetToEmptyState();
   }
 }
 
