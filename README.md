@@ -39,6 +39,10 @@ To pick up changes after editing the source, click the reload icon on the extens
 
 ## Usage
 
+**If you're already on a Shopify order page** (`admin.shopify.com/store/.../orders/...`), just open the popup — it detects that and auto-fetches the order for you, no typing needed.
+
+Otherwise:
+
 1. Open the popup and pick a **storefront** from the dropdown
 2. Enter the **order ID**, or paste the full `admin.shopify.com/store/.../orders/...` URL — pasting a full URL also auto-fills the storefront and syncs its store handle (see below)
 3. Click **Fetch order JSON**
@@ -112,7 +116,7 @@ Chrome destroys a popup's entire page — and all its JS state — the instant i
 
 Two ways this is handled here:
 
-- The popup **auto-restores the last order you loaded** (via `chrome.storage.local`) when reopened, so an accidental click-away doesn't lose your place. Click **Clear** to dismiss it and start fresh.
+- The popup **auto-restores the last order you loaded** (via `chrome.storage.local`) when reopened, so an accidental click-away doesn't lose your place. Click **Clear** to dismiss it and start fresh. If you happen to be on a Shopify order page when you reopen it, though, that takes priority — it auto-fetches the order you're currently looking at instead of the restored one.
 - If you're going to be working an order for a while, use **⤢ Full view** instead — that opens the same UI in a real tab, which behaves like a normal webpage and won't vanish on blur.
 
 ## Known limitations
