@@ -19,9 +19,11 @@ Given an order, it runs 8 diagnostic passes and flags anything worth a closer lo
 
 Each check shows a `Flag` / `OK` / `Info` badge and expands for detail pulled straight from the order JSON.
 
-## Suggested monitoring note
+## Worth flagging
 
-Below the diagnostics, the tool also generates a one-line note in the same format the team already uses for the daily Active Monitoring Slack report (e.g. `1543: Status: [:bangbang:] - No TOT tag — verify age/ID check was completed`), with a **Copy** button so it can be pasted straight in.
+Below the diagnostics, the tool generates a note when there's something actually worth flagging — mirroring the manual notes your team already adds to individual orders in the daily Active Monitoring Slack report (e.g. `1543: Status: [:bangbang:] - No TOT tag — verify age/ID check was completed`). If nothing's notable, this panel doesn't appear at all — no empty `[:+1:]` noise.
+
+It includes a **Copy** button for the line to paste into today's report if you're logging one — this is a per-order helper, not a replacement for the Active Monitoring tool itself.
 
 What it currently detects:
 - **TOT tag presence** — flags a missing TOT tag, *unless* every line item on the order is non-regulated merch (shirt/cap/hat/flag/bag/etc.), in which case it's expected and shown as informational rather than a flag
