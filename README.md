@@ -4,12 +4,33 @@ A Chrome extension for Token of Trust ops/support that pulls a Shopify order's r
 
 Shopify only, for now — BigCommerce and WordPress storefronts aren't supported.
 
+## TOT status (ground truth, from order tags)
+
+Above the diagnostics, the tool reads Token of Trust's own tags directly off the order — this is authoritative status straight from TOT, not something inferred from checkout mechanics. Two independent tags are surfaced:
+
+**Verification:**
+| Tag | Meaning |
+|---|---|
+| `tot-cleared` | Passed verification |
+| `tot-not-verified` | Pending — hasn't cleared yet, don't fulfill |
+| `tot-rejected` | Failed (e.g. under minimum age) — don't fulfill |
+| `tot-not-required` | All items are `tot-no-verification` product-tagged, so no check ran |
+
+**Excise tax:**
+| Tag | Meaning |
+|---|---|
+| `tot-excise-tax-collected` | Required and correctly collected |
+| `tot-excise-tax-not-required` | Not required for this order |
+| `tot-excise-tax-incorrect` | Required but *not* collected correctly — the core problem this tool exists to troubleshoot |
+
+**Important caveat:** if excise informational tags are disabled in Shopify settings, `not-required`/`collected` may be suppressed — but `incorrect` always shows. So a missing excise tag doesn't necessarily mean the order is fine; it's shown as informational ("no tag found"), not assumed OK.
+
 ## What it checks
 
 Given an order, it runs 8 diagnostic passes and flags anything worth a closer look:
 
 1. **Coupons / discounts** — discount codes or order-level discounts that might affect the taxable subtotal
-2. **Product metadata (PMD)** — line items missing `taxable` or `tax_lines`
+2. **Product metadata (PMD)** — line items missing `taxable` or `tax_lines`. Excludes TOT's own injected excise-tax line item (`vendor: "TOT"`, SKU prefix `TOT_TAXLINE_`) and Route's shipping-protection line item (`vendor: "Route"`, SKU prefix `ROUTEINS`) — both are legitimately non-taxable by design, not compliance gaps
 3. **Order modification** — edited quantities or refunds that may predate/postdate the original tax calc
 4. **Address mismatch** — missing ship-to state, or ship-to/bill-to states that don't match
 5. **Payment method** — non-standard gateways (manual, COD, bogus) that can bypass the checkout flow that triggers tax apps
@@ -21,13 +42,14 @@ Each check shows a `Flag` / `OK` / `Info` badge and expands for detail pulled st
 
 ## Worth flagging
 
-Below the diagnostics, the tool generates a note when there's something actually worth flagging — mirroring the manual notes your team already adds to individual orders in the daily Active Monitoring Slack report (e.g. `1543: Status: [:bangbang:] - No TOT tag — verify age/ID check was completed`). If nothing's notable, this panel doesn't appear at all — no empty `[:+1:]` noise.
+Below the diagnostics, the tool generates a note when there's something actually worth flagging — mirroring the manual notes your team already adds to individual orders in the daily Active Monitoring Slack report (e.g. `1543: Status: [:bangbang:] - Excise tax incorrect (tot-excise-tax-incorrect tag)`). If nothing's notable, this panel doesn't appear at all — no empty `[:+1:]` noise.
 
 It includes a **Copy** button for the line to paste into today's report if you're logging one — this is a per-order helper, not a replacement for the Active Monitoring tool itself.
 
 What it currently detects:
-- **TOT tag presence** — flags a missing TOT tag, *unless* every line item on the order is non-regulated merch (shirt/cap/hat/flag/bag/etc.), in which case it's expected and shown as informational rather than a flag
-- **Missing PMD** (reusing the diagnostics check above)
+- **Excise tax incorrect** (`tot-excise-tax-incorrect` tag)
+- **TOT verification rejected or pending** (`tot-rejected` / `tot-not-verified` tags)
+- **Missing PMD** (reusing the diagnostics check above, same ancillary-item exclusions)
 - **Manual payment gateway** — flags orders that look manually entered
 - **Store credit** — notes if store credit was used as (part of) payment
 - **Refunds on record**
@@ -38,7 +60,7 @@ What it currently detects:
 
 Fetching `https://admin.shopify.com/store/{handle}/orders/{id}.json` from a regular web page (e.g. a GitHub Pages tool) gets blocked by CORS — Shopify doesn't return headers that let a different origin read the response, even with a valid logged-in session cookie.
 
-Extensions aren't bound by that restriction for origins listed in `host_permissions`. This extension declares `https://admin.shopify.com/*`, so its popup can `fetch()` the order JSON directly and read the result — using whatever Shopify admin session is already active in your browser. No API tokens, no backend, nothing installed server-side.
+Extensions aren't bound by that restriction for origins listed in `host_permissions`. This extension declares `https://admin.shopify.com/*`, so it can `fetch()` the order JSON directly and read the result — using whatever Shopify admin session is already active in your browser. No API tokens, no backend, nothing installed server-side.
 
 ## Install (unpacked)
 
@@ -50,21 +72,23 @@ This isn't published to the Chrome Web Store — load it as an unpacked extensio
 4. Click **Load unpacked** and select the repo folder
 5. Pin the extension to your toolbar
 
+Clicking the toolbar icon opens the tool as a **side panel** docked to the edge of the browser window — it sits alongside the page rather than floating on top of it, so it never covers the order you're looking at. This requires Chrome 114+ (or another Chromium browser with Side Panel API support).
+
 To pick up changes after editing the source, click the reload icon on the extension's card in `chrome://extensions`.
 
 ## Usage
 
-**If you're already on a Shopify order page** (`admin.shopify.com/store/.../orders/...`), just open the popup — it detects that and auto-fetches the order for you, no typing needed.
+**If you're already on a Shopify order page** (`admin.shopify.com/store/.../orders/...`), just open the side panel — it detects that and auto-fetches the order for you, no typing needed.
 
 Otherwise:
 
-1. Open the popup and pick a **storefront** from the dropdown
+1. Open the side panel and pick a **storefront** from the dropdown
 2. Enter the **order ID**, or paste the full `admin.shopify.com/store/.../orders/...` URL — pasting a full URL also auto-fills the storefront and syncs its store handle (see below)
 3. Click **Fetch order JSON**
    - If you're not logged into that store's admin, you'll get a 401/403 — open the store in Shopify to log in, then fetch again
    - If fetch fails for any other reason, use **Open in Shopify ↗** to view the order, copy the JSON, and paste it into the manual box as a fallback
 4. Review the diagnostics panel and the raw JSON below it
-5. Click **⤢ Full view** to open the same UI in a full tab if the popup feels cramped
+5. Click **⤢ Full view** if you'd rather have it in its own full browser tab instead of the docked panel
 
 ## Configuration
 
@@ -101,7 +125,7 @@ Expected column layout (0-indexed), matching the PACT & Excise tab:
 | I | Excise: Registration Portal |
 | J | Excise Tax detail (free text, may include multiple sub-jurisdiction lines) |
 
-Rows 1–2 are treated as headers; data is read starting at row 3. The order's `shipping_address.province` (or `province_code`, mapped to a full state name) is matched case-insensitively against column A. The sheet is fetched once per popup session and cached — reopen the popup to pick up sheet edits.
+Rows 1–2 are treated as headers; data is read starting at row 3. The order's `shipping_address.province` (or `province_code`, mapped to a full state name) is matched case-insensitively against column A. The sheet is fetched once per panel session and cached — close and reopen the side panel (or reload the extension) to pick up sheet edits.
 
 If the state isn't found in the sheet, or the fetch fails (e.g. sharing settings changed), the check flags it rather than failing silently.
 
@@ -110,7 +134,8 @@ If the state isn't found in the sheet, or the fetch fails (e.g. sharing settings
 ```
 .
 ├── manifest.json   # MV3 manifest, host_permissions for admin.shopify.com + docs.google.com
-├── popup.html      # Popup markup + styles
+├── background.js   # Service worker: opens the side panel on toolbar icon click
+├── popup.html      # UI markup + styles (used for the side panel and the full-tab view)
 ├── popup.js        # All logic: config, fetch, diagnostics, JSON rendering
 ├── icon16.png
 ├── icon32.png
@@ -125,18 +150,17 @@ If the state isn't found in the sheet, or the fetch fails (e.g. sharing settings
 - The only host permissions requested are `admin.shopify.com` (order lookup) and `docs.google.com` (compliance sheet, only used if you set one) — it can't read or modify any other site
 - Storefront config and the compliance sheet URL are stored locally via `chrome.storage.local`, never transmitted anywhere by this extension
 
-## A note on the popup losing focus
+## Why the side panel instead of a popup
 
-Chrome destroys a popup's entire page — and all its JS state — the instant it loses focus (e.g. you click outside it). Reopening isn't "restoring a hidden window," it's a completely fresh load. This isn't something an extension can override; it's how Chrome manages popups.
+The tool started as a `default_popup`, which has two real problems: it floats on top of the page as a disconnected overlay (so it covers whatever you were looking at — the order's fraud banner, shipping/billing info, etc.), and Chrome destroys the entire popup and its JS state the instant it loses focus, so an accidental click-away meant losing your place.
 
-Two ways this is handled here:
+Switching to the **Side Panel API** fixes both: it docks alongside the page instead of covering it, and it stays alive as long as it's open rather than getting torn down on blur. The last-order restore behavior (via `chrome.storage.local`) is still in place as a backstop in case the panel does get closed and reopened, but it's no longer doing as much heavy lifting as it was when this was a popup.
 
-- The popup **auto-restores the last order you loaded** (via `chrome.storage.local`) when reopened, so an accidental click-away doesn't lose your place. Click **Clear** to dismiss it and start fresh. If you happen to be on a Shopify order page when you reopen it, though, that takes priority — it auto-fetches the order you're currently looking at instead of the restored one.
-- If you're going to be working an order for a while, use **⤢ Full view** instead — that opens the same UI in a real tab, which behaves like a normal webpage and won't vanish on blur.
+If you're on an older Chromium browser without Side Panel API support (pre-Chrome 114), this extension won't work as-is — it would need `default_popup` added back to `manifest.json`'s `action` as a fallback.
 
 ## Known limitations
 
-- Chrome/Chromium only (Manifest V3); untested on Firefox or Safari
+- Chrome/Chromium only (Manifest V3), and specifically **Chrome 114+** for Side Panel API support; untested on Firefox or Safari
 - Requires you to already be authenticated in `admin.shopify.com` for the store you're querying — the extension rides your existing session, it doesn't log in for you
 - Store handles for custom domains aren't auto-discoverable and must be added manually the first time
 - Not published to the Chrome Web Store — every user loads it as unpacked, and reinstalling/removing the extension clears its local config
