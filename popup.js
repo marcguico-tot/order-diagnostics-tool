@@ -280,6 +280,9 @@ document.getElementById('clearBtn').addEventListener('click', async ()=>{
   document.getElementById('jsonPanel').style.display = 'none';
   document.getElementById('diagList').innerHTML = '';
   document.getElementById('diagEmpty').style.display = 'block';
+  document.getElementById('notesPanel').style.display = 'none';
+  document.getElementById('notesList').innerHTML = '';
+  document.getElementById('slackNoteLine').value = '';
   setStatus('Cleared.', 'ok');
 });
 
@@ -428,6 +431,92 @@ function badgeLabel(status){
   return {flag:'Flag', ok:'OK', info:'Info', err:'Error'}[status] || status;
 }
 
+// ---- Auto-generated monitoring notes (mirrors the manual Active Monitoring report format) ----
+const MERCH_KEYWORDS = ['shirt','tee','t-shirt','hat','cap','flag','bag','tote','hoodie','sweatshirt','beanie','sticker','apparel'];
+
+function isMerchOnlyOrder(lineItems){
+  if(!lineItems.length) return false;
+  return lineItems.every(li=>{
+    const hay = `${li.title||''} ${li.product_type||''}`.toLowerCase();
+    return MERCH_KEYWORDS.some(k=>hay.includes(k));
+  });
+}
+
+function hasTotTag(order){
+  return /\btot\b/i.test(order.tags || '');
+}
+
+function generateAutoNotes(order){
+  const lineItems = order.line_items || [];
+  const notes = []; // {level:'flag'|'info', text}
+
+  const merchOnly = isMerchOnlyOrder(lineItems);
+  if(!hasTotTag(order)){
+    if(merchOnly){
+      notes.push({level:'info', text:'No TOT tag — expected, order is merch-only (shirt/cap/bag/etc.)'});
+    } else {
+      notes.push({level:'flag', text:'No TOT tag — verify age/ID check was completed'});
+    }
+  }
+
+  const untaxed = lineItems.filter(li => li.taxable === false || !li.tax_lines || li.tax_lines.length===0);
+  if(untaxed.length && !merchOnly){
+    notes.push({level:'flag', text:`Missing PMD on ${untaxed.length} item(s): ${untaxed.map(li=>li.title).join(', ')}`});
+  }
+
+  const gateways = (order.payment_gateway_names || []).map(g=>(g||'').toLowerCase());
+  if(gateways.some(g=>g.includes('manual'))){
+    notes.push({level:'flag', text:'This looks like a manual order (manual payment gateway)'});
+  }
+  if(gateways.some(g=>g.includes('store credit'))){
+    notes.push({level:'info', text:'Store credit used as (part of) payment'});
+  }
+
+  const refunds = order.refunds || [];
+  if(refunds.length){
+    notes.push({level:'info', text:`${refunds.length} refund(s) on record`});
+  }
+
+  return notes;
+}
+
+function renderAutoNotes(order){
+  const notes = generateAutoNotes(order);
+  const panel = document.getElementById('notesPanel');
+  const list = document.getElementById('notesList');
+  const lineEl = document.getElementById('slackNoteLine');
+  panel.style.display = 'block';
+  list.innerHTML = '';
+
+  if(!notes.length){
+    list.innerHTML = '<div class="diag-summary" style="padding:2px 0;">Nothing notable detected.</div>';
+  } else {
+    notes.forEach(n=>{
+      const row = document.createElement('div');
+      row.className = 'diag-summary';
+      row.style.padding = '2px 0';
+      row.innerHTML = `<span class="badge ${n.level}" style="margin-right:6px;">${badgeLabel(n.level)}</span>${n.text}`;
+      list.appendChild(row);
+    });
+  }
+
+  const hasFlag = notes.some(n=>n.level==='flag');
+  const emoji = hasFlag ? ':bangbang:' : ':+1:';
+  const orderRef = order.order_number || order.name || order.id || '';
+  const noteText = notes.length ? ' - ' + notes.map(n=>n.text).join(' - ') : '';
+  lineEl.value = `${orderRef}: Status: [${emoji}]${noteText}`;
+}
+
+document.getElementById('copyNoteBtn').addEventListener('click', async ()=>{
+  const text = document.getElementById('slackNoteLine').value;
+  try{
+    await navigator.clipboard.writeText(text);
+    setStatus('Copied monitoring note to clipboard.', 'ok');
+  }catch(e){
+    setStatus('Could not copy automatically — select the text and copy manually.', 'err');
+  }
+});
+
 function renderDiagnostics(checks){
   document.getElementById('diagEmpty').style.display = 'none';
   const list = document.getElementById('diagList');
@@ -462,6 +551,7 @@ async function handleOrderData(order, opts){
   const sheetUrl = document.getElementById('sheetUrl').value.trim();
   const compliance = sheetUrl ? await getComplianceRows(sheetUrl) : null;
   renderDiagnostics(analyzeOrder(order, compliance));
+  renderAutoNotes(order);
 
   if(!(opts && opts.skipPersist)){
     await chrome.storage.local.set({
