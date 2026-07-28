@@ -483,27 +483,29 @@ function generateAutoNotes(order){
 function renderAutoNotes(order){
   const notes = generateAutoNotes(order);
   const panel = document.getElementById('notesPanel');
+
+  if(!notes.length){
+    panel.style.display = 'none';
+    return;
+  }
+
   const list = document.getElementById('notesList');
   const lineEl = document.getElementById('slackNoteLine');
   panel.style.display = 'block';
   list.innerHTML = '';
 
-  if(!notes.length){
-    list.innerHTML = '<div class="diag-summary" style="padding:2px 0;">Nothing notable detected.</div>';
-  } else {
-    notes.forEach(n=>{
-      const row = document.createElement('div');
-      row.className = 'diag-summary';
-      row.style.padding = '2px 0';
-      row.innerHTML = `<span class="badge ${n.level}" style="margin-right:6px;">${badgeLabel(n.level)}</span>${n.text}`;
-      list.appendChild(row);
-    });
-  }
+  notes.forEach(n=>{
+    const row = document.createElement('div');
+    row.className = 'diag-summary';
+    row.style.padding = '2px 0';
+    row.innerHTML = `<span class="badge ${n.level}" style="margin-right:6px;">${badgeLabel(n.level)}</span>${n.text}`;
+    list.appendChild(row);
+  });
 
   const hasFlag = notes.some(n=>n.level==='flag');
   const emoji = hasFlag ? ':bangbang:' : ':+1:';
   const orderRef = order.order_number || order.name || order.id || '';
-  const noteText = notes.length ? ' - ' + notes.map(n=>n.text).join(' - ') : '';
+  const noteText = ' - ' + notes.map(n=>n.text).join(' - ');
   lineEl.value = `${orderRef}: Status: [${emoji}]${noteText}`;
 }
 
