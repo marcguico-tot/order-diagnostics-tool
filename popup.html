@@ -28,12 +28,12 @@
     background:var(--bg);
     color:var(--text);
     font-family:var(--sans);
-    width:460px;
-    max-height:600px;
-    overflow-y:auto;
+    width:100%;
+    min-width:300px;
+    min-height:100vh;
     padding:16px;
   }
-  body.full-tab{ width:auto; max-height:none; max-width:900px; margin:0 auto; padding:28px; }
+  body.full-tab{ max-width:900px; margin:0 auto; padding:28px; }
 
   header{margin-bottom:16px;display:flex;align-items:flex-start;justify-content:space-between;gap:10px;}
   header .eyebrow{
@@ -207,6 +207,11 @@
     </details>
   </div>
 
+  <div class="panel" id="totStatusPanel" style="display:none;">
+    <h2>TOT status <span style="text-transform:none;font-weight:400;color:var(--muted);">(from order tags)</span></h2>
+    <div id="totStatusList"></div>
+  </div>
+
   <div class="panel" id="diagPanel">
     <h2>Diagnostics</h2>
     <div class="empty-state" id="diagEmpty">Fetch or paste an order to run the checks.</div>
@@ -225,7 +230,10 @@
   <div class="panel" id="jsonPanel" style="display:none;">
     <div class="json-toolbar">
       <h2 style="margin:0;">Order JSON</h2>
-      <span class="order-meta" id="orderMeta"></span>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span class="order-meta" id="orderMeta"></span>
+        <button class="btn small" id="copyJsonBtn">Copy</button>
+      </div>
     </div>
     <pre class="json-view" id="jsonView"></pre>
   </div>
