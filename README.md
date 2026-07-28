@@ -19,6 +19,19 @@ Given an order, it runs 8 diagnostic passes and flags anything worth a closer lo
 
 Each check shows a `Flag` / `OK` / `Info` badge and expands for detail pulled straight from the order JSON.
 
+## Suggested monitoring note
+
+Below the diagnostics, the tool also generates a one-line note in the same format the team already uses for the daily Active Monitoring Slack report (e.g. `1543: Status: [:bangbang:] - No TOT tag — verify age/ID check was completed`), with a **Copy** button so it can be pasted straight in.
+
+What it currently detects:
+- **TOT tag presence** — flags a missing TOT tag, *unless* every line item on the order is non-regulated merch (shirt/cap/hat/flag/bag/etc.), in which case it's expected and shown as informational rather than a flag
+- **Missing PMD** (reusing the diagnostics check above)
+- **Manual payment gateway** — flags orders that look manually entered
+- **Store credit** — notes if store credit was used as (part of) payment
+- **Refunds on record**
+
+**Known gap:** the manual "overcharged / undercharged (no coupon)" check your team does by eyeballing the live storefront price isn't replicated here — that requires the *current* product price, which isn't present in the order JSON. Automating it would mean also fetching the product from Shopify's Products API and comparing; not yet built.
+
 ## Why an extension
 
 Fetching `https://admin.shopify.com/store/{handle}/orders/{id}.json` from a regular web page (e.g. a GitHub Pages tool) gets blocked by CORS — Shopify doesn't return headers that let a different origin read the response, even with a valid logged-in session cookie.
