@@ -60,11 +60,15 @@ What it currently detects:
 
 `admin.shopify.com/store/{handle}/orders.json` — the same `.json` trick used for individual orders — also works on the order **list** page, and returns a page of orders (classic Shopify REST shape, 50 by default; the tool requests `?limit=250`). This means a range of recent orders can be scanned client-side without hitting each one individually.
 
-**Usage:** pick the storefront (same dropdown as single lookup), enter a range (`GV153890-GV153896` or `153890-153896`) or a comma-separated list — paste straight from the store's order list, prefix and all (e.g. `GV153896`), it's stripped automatically. Click **Scan for issues**. Every matched order is run through the same `generateAutoNotes` logic as "Worth flagging" — only orders with at least one `Flag`-level note are shown in the results. Click a result to load its full diagnostics/JSON into the main panels without a second fetch (the order data is already in memory from the scan).
+**If this fails with `Failed to fetch` (not an HTTP error status like 404):** that specific error means the request never got a response at all — a network/CORS-level failure, not a normal error page. The individual-order `.json` endpoint works via `fetch()`; if the order-list endpoint internally redirects to the store's legacy `{handle}.myshopify.com/admin/...` domain to actually serve the data, a `fetch()` call only follows that redirect successfully if `host_permissions` also covers the redirect target — which is why `*.myshopify.com` is included. This is inferred from the symptom pattern (works via direct browser navigation, works via `fetch()` for individual orders, fails via `fetch()` only for the list endpoint, regardless of order or query params) rather than confirmed directly.
+
+**If a real, existing order isn't found even though it should be within reach:** the order-list request includes `status=any` specifically because Shopify's classic order-list API defaults to showing only *open* orders — closed/archived orders (a common end state for orders that are fully paid and fulfilled) are silently excluded otherwise, regardless of how many pages are fetched. Without this, both single lookup and bulk scan could report "not found" for a perfectly real order that's simply been archived.
+
+**Usage:** pick the storefront (same dropdown as single lookup), enter a range (`GV153890-GV153896` or `153890-153896`) or a comma-separated list — paste straight from the store's order list, prefix and all (e.g. `GV153896`), it's stripped automatically. Click **Scan for issues**. Every matched order is run through the same `generateAutoNotes` logic as "Worth flagging" — only orders with at least one `Flag`-level note are shown in the results. Click a result to load its full diagnostics/JSON into the main panels without a second fetch (the order data is already in memory from the scan). **Clear** wipes the range input and results in one click, useful when a scan turns up a lot of flagged orders and you want a clean slate for the next one.
 
 **Matching is based on the order's `name` field** (the digits after the store's prefix, e.g. `153890` in `GV153890`) — not `order_number` — since on some storefronts those two diverge. `order_number` is checked as a fallback only if an order's `name` has no trailing digits.
 
-**How pagination works:** the tool follows the response's `Link: <...>; rel="next"` header (standard Shopify REST cursor pagination) up to 6 pages, and stops early once a page's lowest name-derived number drops below the requested range's minimum — since the list is sorted newest-first, nothing older can still be in range. There's no confirmed documentation for this internal endpoint's exact behavior (page size, sort order, whether `Link` is even present) — this is inferred from observed responses, not guaranteed. Very old order numbers, or endpoints that don't paginate the way assumed, may not be fully reachable.
+**How pagination works:** the tool follows the response's `Link: <...>; rel="next"` header (standard Shopify REST cursor pagination) up to 6 pages. For a range (not a comma list), it also stops early once a page's lowest name-derived number drops below the range's minimum — since the list is sorted newest-first, nothing older can still be in range; a comma list always checks the full 6 pages since there's no single cutoff to reason about. There's no confirmed documentation for this internal endpoint's exact behavior (page size, sort order, whether `Link` is even present) — this is inferred from observed responses, not guaranteed. Very old order numbers, or endpoints that don't paginate the way assumed, may not be fully reachable.
 
 **Known limitations:**
 - Compliance-sheet state lookups are skipped during bulk scan (would mean re-fetching/matching the CSV per order) — only the tag-based and PMD-based checks run
@@ -155,7 +159,7 @@ If the state isn't found in the sheet, or the fetch fails (e.g. sharing settings
 
 ```
 .
-├── manifest.json   # MV3 manifest, host_permissions for admin.shopify.com + docs.google.com
+├── manifest.json   # MV3 manifest, host_permissions for admin.shopify.com + *.myshopify.com + docs.google.com
 ├── background.js   # Service worker: opens the side panel on toolbar icon click
 ├── popup.html      # UI markup + styles (used for the side panel and the full-tab view)
 ├── popup.js        # All logic: config, fetch, diagnostics, JSON rendering
@@ -169,7 +173,7 @@ If the state isn't found in the sheet, or the fetch fails (e.g. sharing settings
 ## Privacy / scope notes
 
 - No external servers involved — everything runs client-side in the extension
-- The only host permissions requested are `admin.shopify.com` (order lookup) and `docs.google.com` (compliance sheet, only used if you set one) — it can't read or modify any other site
+- The only host permissions requested are `admin.shopify.com` (order lookup), `*.myshopify.com` (see note below), and `docs.google.com` (compliance sheet, only used if you set one) — it can't read or modify any other site
 - Storefront config and the compliance sheet URL are stored locally via `chrome.storage.local`, never transmitted anywhere by this extension
 
 ## Why the side panel instead of a popup

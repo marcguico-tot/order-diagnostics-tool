@@ -179,10 +179,10 @@ async function searchOrderByNameOrNumber(handle, query){
   const targetNum = extractNumberFromQuery(query);
   const queryLower = query.trim().toLowerCase();
   const MAX_PAGES = 8;
-  let url = `https://admin.shopify.com/store/${handle}/orders.json?limit=250`;
+  let url = `https://admin.shopify.com/store/${handle}/orders.json?status=any&limit=250`;
   let pages = 0;
   while(url && pages < MAX_PAGES){
-    const {orders, nextUrl} = await fetchOrdersPage(url);
+    const {orders, nextUrl} = await fetchOrdersPageWithFallback(url);
     pages++;
     for(const o of orders){
       if(o.name && o.name.trim().toLowerCase() === queryLower) return o;
@@ -763,6 +763,29 @@ async function fetchOrdersPage(url){
   return {orders: data.orders || [], nextUrl};
 }
 
+// Some storefronts' order-list endpoint appears not to accept (or mishandles) a `limit` param —
+// requests with it can fail outright at the network level ("Failed to fetch", not an HTTP error
+// status). If that happens on a URL that included it, retry once without it before giving up.
+async function fetchOrdersPageWithFallback(url){
+  try{
+    return await fetchOrdersPage(url);
+  }catch(err){
+    if(url.includes('limit=250')){
+      const fallbackUrl = url.replace(/[?&]limit=250/, '').replace(/\?&/,'?');
+      return await fetchOrdersPage(fallbackUrl);
+    }
+    throw err;
+  }
+}
+
+document.getElementById('bulkClearBtn').addEventListener('click', ()=>{
+  document.getElementById('bulkRangeInput').value = '';
+  document.getElementById('bulkResultsPanel').style.display = 'none';
+  document.getElementById('bulkResultsList').innerHTML = '';
+  document.getElementById('bulkSummary').textContent = '';
+  setBulkStatus('Cleared.', 'ok');
+});
+
 document.getElementById('bulkScanBtn').addEventListener('click', async ()=>{
   const handle = currentStoreHandle();
   if(!handle){ setBulkStatus('Select a storefront with a saved handle first.', 'err'); return; }
@@ -773,17 +796,24 @@ document.getElementById('bulkScanBtn').addEventListener('click', async ()=>{
   setBulkStatus('Scanning…');
 
   const MAX_PAGES = 6;
-  let url = `https://admin.shopify.com/store/${handle}/orders.json?limit=250`;
+  let url = `https://admin.shopify.com/store/${handle}/orders.json?status=any&limit=250`;
   let totalScanned = 0, pagesFetched = 0;
+  let minSeen = null, maxSeen = null;
   const matches = [];
 
   try{
     while(url && pagesFetched < MAX_PAGES){
-      const {orders, nextUrl} = await fetchOrdersPage(url);
+      const {orders, nextUrl} = await fetchOrdersPageWithFallback(url);
       pagesFetched++;
       totalScanned += orders.length;
+      console.log(`[bulk scan] page ${pagesFetched}: ${orders.length} orders, ${orders[0]?.name || '?'} .. ${orders[orders.length-1]?.name || '?'}, next=${nextUrl || '(none)'}`);
       for(const order of orders){
         if(orderMatchesRange(order, range)) matches.push(order);
+        const n = extractOrderNameNumber(order) ?? order.order_number;
+        if(typeof n === 'number'){
+          if(minSeen === null || n < minSeen) minSeen = n;
+          if(maxSeen === null || n > maxSeen) maxSeen = n;
+        }
       }
       if(orders.length){
         const minOnPage = pageMinNameNumber(orders);
@@ -793,16 +823,20 @@ document.getElementById('bulkScanBtn').addEventListener('click', async ()=>{
       setBulkStatus(`Scanning… ${totalScanned} orders checked across ${pagesFetched} page(s)`);
     }
   }catch(err){
-    setBulkStatus('Scan failed — ' + (err.message || 'unknown error') + '. Try a smaller range, or check you\'re logged into this store.', 'err');
+    setBulkStatus('Scan failed — ' + (err.message || 'unknown error') + '. If single-order lookup works fine on this store, this may be specific to the order-list endpoint — try again, or check you\'re logged into this store.', 'err');
     return;
   }
 
   const flagged = matches.map(order => ({order, notes: generateAutoNotes(order)}))
     .filter(r => r.notes.some(n=>n.level==='flag'));
 
+  const coverageNote = (minSeen !== null && maxSeen !== null)
+    ? ` Covered order numbers ${maxSeen} down to ${minSeen}${pagesFetched >= MAX_PAGES ? ' (hit the page cap — older orders weren\'t reachable)' : ''}.`
+    : '';
+
   document.getElementById('bulkResultsPanel').style.display = 'block';
   document.getElementById('bulkSummary').textContent =
-    `Checked ${totalScanned} recent order(s) across ${pagesFetched} page(s) to find your range — ${matches.length} matched, ${flagged.length} need attention.`;
+    `Checked ${totalScanned} recent order(s) across ${pagesFetched} page(s) to find your range — ${matches.length} matched, ${flagged.length} need attention.${coverageNote}`;
 
   const list = document.getElementById('bulkResultsList');
   list.innerHTML = '';

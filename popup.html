@@ -199,35 +199,16 @@
     <label for="bulkRangeInput">Order number range or list</label>
     <input type="text" id="bulkRangeInput" placeholder="e.g. GV153890-GV153896, or GV153896,GV153895,GV153894">
     <div class="hint">Paste order names straight from the store's order list (e.g. GV153896) — the prefix is stripped automatically. Plain numbers work too.</div>
-    <div class="btn-row"><button class="btn primary" id="bulkScanBtn">Scan for issues</button></div>
+    <div class="btn-row">
+      <button class="btn primary" id="bulkScanBtn">Scan for issues</button>
+      <button class="btn ghost small" id="bulkClearBtn" title="Clear the scan results">Clear</button>
+    </div>
     <div class="status-line" id="bulkStatus"></div>
     <div id="bulkResultsPanel" style="display:none;margin-top:12px;">
       <div class="diag-summary" id="bulkSummary" style="margin-bottom:8px;"></div>
       <div id="bulkResultsList"></div>
     </div>
     <div class="hint" style="margin-top:8px;">Only scans as many pages as the storefront's order list returns before running out of matches or hitting a safety cap — very old order numbers may not be reachable in one scan.</div>
-  </div>
-
-  <div class="panel">
-    <h2>Storefront config</h2>
-    <details class="config" id="cfgDetails">
-      <summary>Domain → Shopify store handle mapping</summary>
-      <div class="hint" style="margin-top:6px;">Saved via chrome.storage, synced across your Chrome profile.</div>
-      <table class="cfg" id="cfgTable">
-        <thead><tr><th>Domain</th><th>Handle</th><th></th></tr></thead>
-        <tbody id="cfgBody"></tbody>
-      </table>
-      <div class="btn-row">
-        <button class="btn small" id="addRowBtn">+ Add row</button>
-        <button class="btn small" id="resetCfgBtn">Reset to defaults</button>
-      </div>
-    </details>
-    <details class="config" style="margin-top:10px;">
-      <summary>Compliance sheet (optional)</summary>
-      <label for="sheetUrl">Published CSV URL</label>
-      <input type="text" id="sheetUrl" placeholder="https://docs.google.com/…/export?format=csv&gid=0">
-      <div class="hint">CSV export of your PACT & Excise sheet. Once set, "State-specific rate config" auto-matches the ship-to state.</div>
-    </details>
   </div>
 
   <div class="panel" id="totStatusPanel" style="display:none;">
@@ -259,6 +240,28 @@
       </div>
     </div>
     <pre class="json-view" id="jsonView"></pre>
+  </div>
+
+  <div class="panel">
+    <h2>Storefront config</h2>
+    <details class="config" id="cfgDetails">
+      <summary>Domain → Shopify store handle mapping</summary>
+      <div class="hint" style="margin-top:6px;">Saved via chrome.storage, synced across your Chrome profile.</div>
+      <table class="cfg" id="cfgTable">
+        <thead><tr><th>Domain</th><th>Handle</th><th></th></tr></thead>
+        <tbody id="cfgBody"></tbody>
+      </table>
+      <div class="btn-row">
+        <button class="btn small" id="addRowBtn">+ Add row</button>
+        <button class="btn small" id="resetCfgBtn">Reset to defaults</button>
+      </div>
+    </details>
+    <details class="config" style="margin-top:10px;">
+      <summary>Compliance sheet (optional)</summary>
+      <label for="sheetUrl">Published CSV URL</label>
+      <input type="text" id="sheetUrl" placeholder="https://docs.google.com/…/export?format=csv&gid=0">
+      <div class="hint">CSV export of your PACT & Excise sheet. Once set, "State-specific rate config" auto-matches the ship-to state.</div>
+    </details>
   </div>
 
 <script src="popup.js"></script>
