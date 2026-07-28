@@ -56,6 +56,19 @@ What it currently detects:
 
 **Known gap:** the manual "overcharged / undercharged (no coupon)" check your team does by eyeballing the live storefront price isn't replicated here — that requires the *current* product price, which isn't present in the order JSON. Automating it would mean also fetching the product from Shopify's Products API and comparing; not yet built.
 
+## Bulk scan (beta)
+
+`admin.shopify.com/store/{handle}/orders.json` — the same `.json` trick used for individual orders — also works on the order **list** page, and returns a page of orders (classic Shopify REST shape, 50 by default; the tool requests `?limit=250`). This means a range of recent orders can be scanned client-side without hitting each one individually.
+
+**Usage:** pick the storefront (same dropdown as single lookup), enter an order number range (`153800-153900`) or a comma-separated list, and click **Scan for issues**. Every matched order is run through the same `generateAutoNotes` logic as "Worth flagging" — only orders with at least one `Flag`-level note are shown in the results. Click a result to load its full diagnostics/JSON into the main panels without a second fetch (the order data is already in memory from the scan).
+
+**How pagination works:** the tool follows the response's `Link: <...>; rel="next"` header (standard Shopify REST cursor pagination) up to 6 pages, and stops early once a page's lowest order number drops below the requested range's minimum — since the list is sorted newest-first, nothing older can still be in range. There's no confirmed documentation for this internal endpoint's exact behavior (page size, sort order, whether `Link` is even present) — this is inferred from observed responses, not guaranteed. Very old order numbers, or endpoints that don't paginate the way assumed, may not be fully reachable.
+
+**Known limitations:**
+- Compliance-sheet state lookups are skipped during bulk scan (would mean re-fetching/matching the CSV per order) — only the tag-based and PMD-based checks run
+- No visibility into orders scanned-but-not-flagged beyond the summary count — if you need to review "everything," use single-order lookup
+- Safety-capped at 6 pages (~1,500 orders at the observed page size) to avoid runaway fetches
+
 ## Why an extension
 
 Fetching `https://admin.shopify.com/store/{handle}/orders/{id}.json` from a regular web page (e.g. a GitHub Pages tool) gets blocked by CORS — Shopify doesn't return headers that let a different origin read the response, even with a valid logged-in session cookie.
