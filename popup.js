@@ -273,11 +273,24 @@ document.getElementById('analyzePastedBtn').addEventListener('click', async ()=>
   }
 });
 
+document.getElementById('copyJsonBtn').addEventListener('click', async ()=>{
+  if(!currentOrderData){ setStatus('No order loaded yet.', 'err'); return; }
+  try{
+    await navigator.clipboard.writeText(JSON.stringify(currentOrderData, null, 2));
+    setStatus('Copied order JSON to clipboard.', 'ok');
+  }catch(e){
+    setStatus('Could not copy automatically — select the text in the JSON panel and copy manually.', 'err');
+  }
+});
+
 document.getElementById('clearBtn').addEventListener('click', async ()=>{
   await chrome.storage.local.remove([LAST_ORDER_KEY]);
+  currentOrderData = null;
   document.getElementById('orderInput').value = '';
   document.getElementById('pasteArea').value = '';
   document.getElementById('jsonPanel').style.display = 'none';
+  document.getElementById('totStatusPanel').style.display = 'none';
+  document.getElementById('totStatusList').innerHTML = '';
   document.getElementById('diagList').innerHTML = '';
   document.getElementById('diagEmpty').style.display = 'block';
   document.getElementById('notesPanel').style.display = 'none';
@@ -330,13 +343,14 @@ function analyzeOrder(order, compliance){
       : null
   });
 
-  const untaxed = lineItems.filter(li => li.taxable === false || !li.tax_lines || li.tax_lines.length===0);
+  const relevantItems = lineItems.filter(li=>!isAncillaryLineItem(li));
+  const untaxed = relevantItems.filter(li => li.taxable === false || !li.tax_lines || li.tax_lines.length===0);
   checks.push({
     label:'Product metadata (PMD)',
-    status: untaxed.length>0 ? 'flag' : (lineItems.length ? 'ok' : 'info'),
-    summary: lineItems.length===0 ? 'No line items on this order'
-      : untaxed.length>0 ? `${untaxed.length} of ${lineItems.length} line item(s) missing tax config`
-      : `All ${lineItems.length} line item(s) have tax_lines and taxable:true`,
+    status: untaxed.length>0 ? 'flag' : (relevantItems.length ? 'ok' : 'info'),
+    summary: relevantItems.length===0 ? 'No taxable-candidate line items on this order'
+      : untaxed.length>0 ? `${untaxed.length} of ${relevantItems.length} item(s) missing tax config`
+      : `All ${relevantItems.length} item(s) have tax_lines and taxable:true`,
     detail: untaxed.length>0
       ? untaxed.map(li=>`• ${li.title}  (SKU ${li.sku||'n/a'}, product_id ${li.product_id})\n   taxable: ${li.taxable}, tax_lines: ${(li.tax_lines||[]).length}`).join('\n')
       : null
@@ -431,36 +445,82 @@ function badgeLabel(status){
   return {flag:'Flag', ok:'OK', info:'Info', err:'Error'}[status] || status;
 }
 
-// ---- Auto-generated monitoring notes (mirrors the manual Active Monitoring report format) ----
-const MERCH_KEYWORDS = ['shirt','tee','t-shirt','hat','cap','flag','bag','tote','hoodie','sweatshirt','beanie','sticker','apparel'];
-
-function isMerchOnlyOrder(lineItems){
-  if(!lineItems.length) return false;
-  return lineItems.every(li=>{
-    const hay = `${li.title||''} ${li.product_type||''}`.toLowerCase();
-    return MERCH_KEYWORDS.some(k=>hay.includes(k));
-  });
+// ---- TOT tag vocabulary (authoritative — straight from TOT's own app, not inferred) ----
+// Verification: tot-cleared | tot-not-verified | tot-rejected | tot-not-required
+// Excise tax:    tot-excise-tax-collected | tot-excise-tax-not-required | tot-excise-tax-incorrect
+// Note: if excise informational tags are disabled in Shopify settings, "not-required"/"collected"
+// may be suppressed — but "incorrect" always shows. So a missing excise tag is NOT proof of "fine".
+function parseTotTags(order){
+  const tags = (order.tags || '').split(',').map(t=>t.trim().toLowerCase());
+  const verification =
+    tags.includes('tot-cleared') ? 'cleared' :
+    tags.includes('tot-not-verified') ? 'not-verified' :
+    tags.includes('tot-rejected') ? 'rejected' :
+    tags.includes('tot-not-required') ? 'not-required' : null;
+  const excise =
+    tags.includes('tot-excise-tax-collected') ? 'collected' :
+    tags.includes('tot-excise-tax-not-required') ? 'not-required' :
+    tags.includes('tot-excise-tax-incorrect') ? 'incorrect' : null;
+  return {verification, excise};
 }
 
-function hasTotTag(order){
-  return /\btot\b/i.test(order.tags || '');
+// Line items TOT/Route inject that are legitimately non-taxable by design (tax collection line
+// itself, shipping protection add-on) — excluding these from PMD checks avoids false positives.
+function isAncillaryLineItem(li){
+  const vendor = (li.vendor || '').toLowerCase();
+  const sku = (li.sku || '').toUpperCase();
+  return vendor === 'tot' || vendor === 'route' || sku.startsWith('TOT_TAXLINE_') || sku.startsWith('ROUTEINS');
+}
+
+function renderTotStatus(order){
+  const panel = document.getElementById('totStatusPanel');
+  const list = document.getElementById('totStatusList');
+  const {verification, excise} = parseTotTags(order);
+  panel.style.display = 'block';
+  list.innerHTML = '';
+
+  const VERIFICATION_META = {
+    'cleared': {status:'ok', text:'Cleared'},
+    'not-verified': {status:'flag', text:'Not verified — pending, do not fulfill yet'},
+    'rejected': {status:'err', text:'Rejected — do not fulfill'},
+    'not-required': {status:'ok', text:'Not required (order is all no-verification items)'},
+    null: {status:'info', text:'No verification tag found'}
+  };
+  const EXCISE_META = {
+    'collected': {status:'ok', text:'Collected correctly'},
+    'not-required': {status:'ok', text:'Not required for this order'},
+    'incorrect': {status:'err', text:'Incorrect — required but not collected correctly'},
+    null: {status:'info', text:'No excise tag found — informational tags may be off in settings, or this order predates tagging'}
+  };
+
+  const vMeta = VERIFICATION_META[verification];
+  const eMeta = EXCISE_META[excise];
+
+  const row = (label, meta) => `
+    <div class="diag-summary" style="padding:3px 0;display:flex;align-items:center;gap:8px;">
+      <span class="badge ${meta.status}">${badgeLabel(meta.status)}</span>
+      <span><strong>${label}:</strong> ${meta.text}</span>
+    </div>`;
+  list.innerHTML = row('Verification', vMeta) + row('Excise tax', eMeta);
 }
 
 function generateAutoNotes(order){
   const lineItems = order.line_items || [];
   const notes = []; // {level:'flag'|'info', text}
+  const {verification, excise} = parseTotTags(order);
 
-  const merchOnly = isMerchOnlyOrder(lineItems);
-  if(!hasTotTag(order)){
-    if(merchOnly){
-      notes.push({level:'info', text:'No TOT tag — expected, order is merch-only (shirt/cap/bag/etc.)'});
-    } else {
-      notes.push({level:'flag', text:'No TOT tag — verify age/ID check was completed'});
-    }
+  if(excise === 'incorrect'){
+    notes.push({level:'flag', text:'Excise tax incorrect (tot-excise-tax-incorrect tag)'});
+  }
+  if(verification === 'rejected'){
+    notes.push({level:'flag', text:'TOT verification rejected — do not fulfill'});
+  } else if(verification === 'not-verified'){
+    notes.push({level:'flag', text:'TOT verification pending — not yet cleared'});
   }
 
-  const untaxed = lineItems.filter(li => li.taxable === false || !li.tax_lines || li.tax_lines.length===0);
-  if(untaxed.length && !merchOnly){
+  const relevantItems = lineItems.filter(li=>!isAncillaryLineItem(li));
+  const untaxed = relevantItems.filter(li => li.taxable === false || !li.tax_lines || li.tax_lines.length===0);
+  if(untaxed.length && excise !== 'not-required'){
     notes.push({level:'flag', text:`Missing PMD on ${untaxed.length} item(s): ${untaxed.map(li=>li.title).join(', ')}`});
   }
 
@@ -544,7 +604,10 @@ function renderDiagnostics(checks){
   });
 }
 
+let currentOrderData = null;
+
 async function handleOrderData(order, opts){
+  currentOrderData = order;
   document.getElementById('jsonPanel').style.display = 'block';
   document.getElementById('jsonView').innerHTML = syntaxHighlight(order);
   document.getElementById('orderMeta').textContent =
@@ -552,6 +615,7 @@ async function handleOrderData(order, opts){
 
   const sheetUrl = document.getElementById('sheetUrl').value.trim();
   const compliance = sheetUrl ? await getComplianceRows(sheetUrl) : null;
+  renderTotStatus(order);
   renderDiagnostics(analyzeOrder(order, compliance));
   renderAutoNotes(order);
 
