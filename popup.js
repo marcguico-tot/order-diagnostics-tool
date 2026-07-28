@@ -237,7 +237,7 @@ document.getElementById('openTabBtn').addEventListener('click', ()=>{
   chrome.tabs.create({url: url.replace(/\.json$/, '')});
 });
 
-document.getElementById('fetchBtn').addEventListener('click', async ()=>{
+async function fetchOrder(){
   const url = currentUrl();
   if(!url){ setStatus('Select a storefront with a saved handle, and enter an order ID.', 'err'); return; }
   setStatus('Fetching ' + url + ' …');
@@ -257,7 +257,9 @@ document.getElementById('fetchBtn').addEventListener('click', async ()=>{
   }catch(err){
     setStatus('Fetch failed — ' + (err.message || 'unknown error') + '. Try "Open in Shopify" and paste the JSON below instead.', 'err');
   }
-});
+}
+
+document.getElementById('fetchBtn').addEventListener('click', fetchOrder);
 
 document.getElementById('analyzePastedBtn').addEventListener('click', async ()=>{
   const raw = document.getElementById('pasteArea').value.trim();
@@ -482,7 +484,17 @@ async function init(){
   sheetInput.value = stored[SHEET_KEY] || '';
   sheetInput.addEventListener('input', ()=> chrome.storage.local.set({[SHEET_KEY]: sheetInput.value.trim()}));
 
-  // Restore the last order looked at, since Chrome discards popup state entirely on blur.
+  // If the active tab is currently on a Shopify order page, prefill from it and auto-fetch —
+  // this takes priority over restoring the last order, since it reflects current intent.
+  const detected = await detectCurrentOrderTab();
+  if(detected){
+    document.getElementById('orderInput').value = detected.url;
+    document.getElementById('orderInput').dispatchEvent(new Event('input', {bubbles:true}));
+    await fetchOrder();
+    return;
+  }
+
+  // Otherwise, restore the last order looked at, since Chrome discards popup state entirely on blur.
   const last = await chrome.storage.local.get([LAST_ORDER_KEY]);
   const saved = last[LAST_ORDER_KEY];
   if(saved && saved.order){
@@ -494,6 +506,19 @@ async function init(){
     document.getElementById('pasteArea').value = JSON.stringify(saved.order, null, 2);
     await handleOrderData(saved.order, {skipPersist:true});
     setStatus('Restored last order (popup state resets when it loses focus).', 'ok');
+  }
+}
+
+async function detectCurrentOrderTab(){
+  try{
+    const tabs = await chrome.tabs.query({active:true, currentWindow:true});
+    const tabUrl = tabs && tabs[0] && tabs[0].url;
+    if(!tabUrl) return null;
+    const m = tabUrl.match(/admin\.shopify\.com\/store\/([a-zA-Z0-9\-]+)\/orders\/(\d+)/);
+    if(!m) return null;
+    return {url: tabUrl, handle: m[1], orderId: m[2]};
+  }catch(e){
+    return null; // no tab access (e.g. opened via Full view, or permission not granted for this host)
   }
 }
 
