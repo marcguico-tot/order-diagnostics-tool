@@ -174,9 +174,9 @@
     <select id="domainSelect"></select>
     <div class="hint" id="handleHint"></div>
 
-    <label for="orderInput">Order ID or admin order URL</label>
-    <input type="text" id="orderInput" placeholder="6814552096991 — or paste the full admin.shopify.com order URL">
-    <div class="hint">Pasting a full admin order URL auto-fills the storefront and saves the handle if it's missing.</div>
+    <label for="orderInput">Order name, order number, or admin order URL</label>
+    <input type="text" id="orderInput" placeholder="GV153847, 153847, or paste the full admin.shopify.com order URL">
+    <div class="hint">Order name/number searches the storefront's order list to resolve it — no need to find the internal order ID. Pasting a full admin order URL still works too, and auto-fills the storefront (saving its handle if it's missing).</div>
 
     <div class="btn-row">
       <button class="btn primary" id="fetchBtn">Fetch order JSON</button>
@@ -197,8 +197,8 @@
     <h2>Bulk scan <span style="text-transform:none;font-weight:400;color:var(--muted);">(beta)</span></h2>
     <div class="hint" style="margin-bottom:10px;">Scans a range of recent orders on the selected storefront (above) and flags only the ones worth a closer look.</div>
     <label for="bulkRangeInput">Order number range or list</label>
-    <input type="text" id="bulkRangeInput" placeholder="e.g. 153800-153900, or 153801,153802,153850">
-    <div class="hint">Uses order numbers (the plain number, not the internal order ID) — matches what's shown in the store's order list.</div>
+    <input type="text" id="bulkRangeInput" placeholder="e.g. GV153890-GV153896, or GV153896,GV153895,GV153894">
+    <div class="hint">Paste order names straight from the store's order list (e.g. GV153896) — the prefix is stripped automatically. Plain numbers work too.</div>
     <div class="btn-row"><button class="btn primary" id="bulkScanBtn">Scan for issues</button></div>
     <div class="status-line" id="bulkStatus"></div>
     <div id="bulkResultsPanel" style="display:none;margin-top:12px;">

@@ -141,27 +141,151 @@ document.getElementById('orderInput').addEventListener('input', async e=>{
   }
 });
 
-function currentUrl(){
-  const parsedFromInput = parseOrderInput(document.getElementById('orderInput').value);
-  let handle, orderId;
-  if(parsedFromInput.handle){
-    handle = parsedFromInput.handle;
-    orderId = parsedFromInput.orderId;
-  } else {
-    const row = CONFIG[document.getElementById('domainSelect').value];
-    handle = row ? row.handle : '';
-    orderId = parsedFromInput.orderId;
-  }
-  if(!handle || !orderId) return null;
-  return `https://admin.shopify.com/store/${handle}/orders/${orderId}.json`;
-}
-
 function currentStoreHandle(){
   const parsedFromInput = parseOrderInput(document.getElementById('orderInput').value);
   if(parsedFromInput.handle) return parsedFromInput.handle;
   const row = CONFIG[document.getElementById('domainSelect').value];
   return row ? row.handle : null;
 }
+
+// Shopify's internal order id (used in admin URLs) is a long number (10+ digits) and has
+// no simple relationship to the order_number or name shown in the UI — some stores' order
+// names don't even numerically match order_number. So a bare short number or a name like
+// "GV153847" can't be turned into a URL directly; it has to be looked up against the
+// storefront's order list instead.
+function looksLikeInternalId(str){
+  return /^\d{9,}$/.test(str);
+}
+
+function extractNumberFromQuery(q){
+  const m = (q||'').match(/(\d+)\s*$/);
+  return m ? parseInt(m[1],10) : null;
+}
+
+// The trailing digits in an order's `name` field (e.g. "GV153847" -> 153847) — this is what
+// range/list matching should key off, since on some storefronts `order_number` doesn't match
+// the digits in `name` at all. `order_number` is kept only as a secondary fallback check.
+function extractOrderNameNumber(order){
+  const m = (order.name||'').match(/(\d+)\s*$/);
+  return m ? parseInt(m[1],10) : null;
+}
+
+function pageMinNameNumber(orders){
+  const nums = orders.map(extractOrderNameNumber).filter(n=>n!==null);
+  return nums.length ? Math.min(...nums) : null;
+}
+
+async function searchOrderByNameOrNumber(handle, query){
+  const targetNum = extractNumberFromQuery(query);
+  const queryLower = query.trim().toLowerCase();
+  const MAX_PAGES = 8;
+  let url = `https://admin.shopify.com/store/${handle}/orders.json?limit=250`;
+  let pages = 0;
+  while(url && pages < MAX_PAGES){
+    const {orders, nextUrl} = await fetchOrdersPage(url);
+    pages++;
+    for(const o of orders){
+      if(o.name && o.name.trim().toLowerCase() === queryLower) return o;
+      if(targetNum !== null && extractOrderNameNumber(o) === targetNum) return o;
+      if(targetNum !== null && o.order_number === targetNum) return o; // fallback, in case name has no trailing digits
+    }
+    if(targetNum !== null && orders.length){
+      const minOnPage = pageMinNameNumber(orders);
+      if(minOnPage !== null && minOnPage < targetNum) break; // sorted newest-first; nothing older can match
+    }
+    url = nextUrl;
+  }
+  return null;
+}
+
+document.getElementById('openTabBtn').addEventListener('click', async ()=>{
+  const raw = document.getElementById('orderInput').value.trim();
+  const parsedUrl = parseOrderInput(raw);
+  if(parsedUrl.handle && parsedUrl.orderId){
+    chrome.tabs.create({url: `https://admin.shopify.com/store/${parsedUrl.handle}/orders/${parsedUrl.orderId}`});
+    return;
+  }
+  const handle = currentStoreHandle();
+  if(!handle){ setStatus('Select a storefront with a saved handle, and enter an order ID, name, or URL.', 'err'); return; }
+  if(looksLikeInternalId(raw)){
+    chrome.tabs.create({url: `https://admin.shopify.com/store/${handle}/orders/${raw}`});
+    return;
+  }
+  if(!raw){ setStatus('Enter an order ID, name, or admin order URL.', 'err'); return; }
+  setStatus(`Looking up ${raw} to open it…`);
+  try{
+    const found = await searchOrderByNameOrNumber(handle, raw);
+    if(!found){ setStatus(`Couldn't find an order matching "${raw}" in recent orders on this store.`, 'err'); return; }
+    chrome.tabs.create({url: `https://admin.shopify.com/store/${handle}/orders/${found.id}`});
+  }catch(err){
+    setStatus('Lookup failed — ' + (err.message || 'unknown error'), 'err');
+  }
+});
+
+async function fetchOrderById(handle, orderId){
+  const url = `https://admin.shopify.com/store/${handle}/orders/${orderId}.json`;
+  setStatus('Fetching ' + url + ' …');
+  showLoadingState();
+  try{
+    const res = await fetch(url, {credentials:'include'});
+    if(res.status === 401 || res.status === 403){
+      setStatus(`Not authenticated for this store (${res.status}). Open it in Shopify first to log in, then try Fetch again.`, 'err');
+      resetToEmptyState();
+      return;
+    }
+    if(!res.ok){
+      setStatus(`Request returned ${res.status}. Check the store handle and order ID are correct.`, 'err');
+      resetToEmptyState();
+      return;
+    }
+    const data = await res.json();
+    setStatus('Loaded order ' + url, 'ok');
+    await handleOrderData(data.order || data);
+  }catch(err){
+    setStatus('Fetch failed — ' + (err.message || 'unknown error') + '. Try "Open in Shopify" and paste the JSON below instead.', 'err');
+    resetToEmptyState();
+  }
+}
+
+async function fetchOrder(){
+  const raw = document.getElementById('orderInput').value.trim();
+  if(!raw){ setStatus('Enter an order ID, name, or admin order URL.', 'err'); return; }
+
+  const parsedUrl = parseOrderInput(raw);
+  if(parsedUrl.handle && parsedUrl.orderId){
+    await fetchOrderById(parsedUrl.handle, parsedUrl.orderId);
+    return;
+  }
+
+  const handle = currentStoreHandle();
+  if(!handle){ setStatus('Select a storefront with a saved handle first.', 'err'); return; }
+
+  if(looksLikeInternalId(raw)){
+    await fetchOrderById(handle, raw);
+    return;
+  }
+
+  // Order name (e.g. GV153847) or order number (e.g. 153847) — search the order list for it.
+  setStatus(`Looking up ${raw} on ${handle}…`);
+  showLoadingState();
+  try{
+    const found = await searchOrderByNameOrNumber(handle, raw);
+    if(!found){
+      setStatus(`Couldn't find an order matching "${raw}" in recent orders on this store.`, 'err');
+      resetToEmptyState();
+      return;
+    }
+    setStatus(`Loaded order ${found.name || found.order_number}.`, 'ok');
+    await handleOrderData(found);
+  }catch(err){
+    setStatus('Lookup failed — ' + (err.message || 'unknown error'), 'err');
+    resetToEmptyState();
+  }
+}
+
+document.getElementById('fetchBtn').addEventListener('click', fetchOrder);
+
+
 
 // ---- Compliance sheet (PACT & Excise tab) ----
 // Columns (0-indexed): 0 State | 1 PACT Agency | 2 PACT Required License | 3 PACT Fees
@@ -269,40 +393,6 @@ function resetToEmptyState(){
   document.getElementById('notesPanel').style.display = 'none';
   document.getElementById('jsonPanel').style.display = 'none';
 }
-
-document.getElementById('openTabBtn').addEventListener('click', ()=>{
-  const url = currentUrl();
-  if(!url){ setStatus('Select a storefront with a saved handle, and enter an order ID.', 'err'); return; }
-  chrome.tabs.create({url: url.replace(/\.json$/, '')});
-});
-
-async function fetchOrder(){
-  const url = currentUrl();
-  if(!url){ setStatus('Select a storefront with a saved handle, and enter an order ID.', 'err'); return; }
-  setStatus('Fetching ' + url + ' …');
-  showLoadingState();
-  try{
-    const res = await fetch(url, {credentials:'include'});
-    if(res.status === 401 || res.status === 403){
-      setStatus(`Not authenticated for this store (${res.status}). Open it in Shopify first to log in, then try Fetch again.`, 'err');
-      resetToEmptyState();
-      return;
-    }
-    if(!res.ok){
-      setStatus(`Request returned ${res.status}. Check the store handle and order ID are correct.`, 'err');
-      resetToEmptyState();
-      return;
-    }
-    const data = await res.json();
-    setStatus('Loaded order ' + url, 'ok');
-    await handleOrderData(data.order || data);
-  }catch(err){
-    setStatus('Fetch failed — ' + (err.message || 'unknown error') + '. Try "Open in Shopify" and paste the JSON below instead.', 'err');
-    resetToEmptyState();
-  }
-}
-
-document.getElementById('fetchBtn').addEventListener('click', fetchOrder);
 
 document.getElementById('analyzePastedBtn').addEventListener('click', async ()=>{
   const raw = document.getElementById('pasteArea').value.trim();
@@ -631,21 +721,28 @@ function setBulkStatus(msg, type){
 
 function parseRangeInput(input){
   input = (input||'').trim();
-  const rangeMatch = input.match(/^(\d+)\s*-\s*(\d+)$/);
+  // Accepts plain numbers or prefixed order names (e.g. GV153890), range or comma list.
+  const rangeMatch = input.match(/^[A-Za-z]*(\d+)\s*-\s*[A-Za-z]*(\d+)$/);
   if(rangeMatch){
     const min = parseInt(rangeMatch[1],10), max = parseInt(rangeMatch[2],10);
     return {mode:'range', min: Math.min(min,max), max: Math.max(min,max)};
   }
-  const list = input.split(',').map(s=>s.trim()).filter(Boolean).map(s=>parseInt(s,10)).filter(n=>!isNaN(n));
+  const list = input.split(',')
+    .map(s=>s.trim())
+    .filter(Boolean)
+    .map(s=>{ const m = s.match(/(\d+)\s*$/); return m ? parseInt(m[1],10) : NaN; })
+    .filter(n=>!isNaN(n));
   if(list.length) return {mode:'list', set: new Set(list)};
   return null;
 }
 
 function orderMatchesRange(order, range){
-  const n = order.order_number;
-  if(n === undefined || n === null) return false;
-  if(range.mode === 'range') return n >= range.min && n <= range.max;
-  return range.set.has(n);
+  const n = extractOrderNameNumber(order);
+  const fallback = order.order_number;
+  const candidates = [n, fallback].filter(v => v !== undefined && v !== null);
+  if(!candidates.length) return false;
+  if(range.mode === 'range') return candidates.some(v => v >= range.min && v <= range.max);
+  return candidates.some(v => range.set.has(v));
 }
 
 function extractLinkNext(linkHeader){
@@ -689,8 +786,8 @@ document.getElementById('bulkScanBtn').addEventListener('click', async ()=>{
         if(orderMatchesRange(order, range)) matches.push(order);
       }
       if(orders.length){
-        const minOnPage = Math.min(...orders.map(o=>o.order_number).filter(n=>typeof n === 'number'));
-        if(range.mode === 'range' && minOnPage < range.min) break; // older pages can't contain anything in range
+        const minOnPage = pageMinNameNumber(orders);
+        if(range.mode === 'range' && minOnPage !== null && minOnPage < range.min) break; // older pages can't contain anything in range
       }
       url = nextUrl;
       setBulkStatus(`Scanning… ${totalScanned} orders checked across ${pagesFetched} page(s)`);
@@ -797,8 +894,21 @@ async function init(){
   sheetInput.value = stored[SHEET_KEY] || '';
   sheetInput.addEventListener('input', ()=> chrome.storage.local.set({[SHEET_KEY]: sheetInput.value.trim()}));
 
-  // If the active tab is currently on a Shopify order page, prefill from it and auto-fetch —
-  // this takes priority over restoring the last order, since it reflects current intent.
+  // Auto-select the storefront dropdown from whatever store admin the current tab is on —
+  // any page under admin.shopify.com/store/{handle}, not just an order page. This means
+  // bulk scan (and anything else keyed off the dropdown) can't silently point at the wrong
+  // store just because the dropdown was left on whatever it was last set to.
+  const currentHandle = await detectCurrentTabStoreHandle();
+  if(currentHandle){
+    const idx = CONFIG.findIndex(r => r.handle === currentHandle);
+    if(idx >= 0){
+      document.getElementById('domainSelect').value = idx;
+      updateHandleHint();
+    }
+  }
+
+  // If that tab is specifically an order page, prefill from it and auto-fetch — this takes
+  // priority over restoring the last order, since it reflects current intent.
   const detected = await detectCurrentOrderTab();
   if(detected){
     document.getElementById('orderInput').value = detected.url;
@@ -807,18 +917,38 @@ async function init(){
     return;
   }
 
-  // Otherwise, restore the last order looked at, since Chrome discards popup state entirely on blur.
+  // Otherwise, restore the last order looked at, since Chrome discards popup state entirely on
+  // blur — but only if it belongs to the store currently open, to avoid showing stale data from
+  // a different storefront than the one the dropdown now points at.
   const last = await chrome.storage.local.get([LAST_ORDER_KEY]);
   const saved = last[LAST_ORDER_KEY];
   if(saved && saved.order){
-    document.getElementById('orderInput').value = saved.orderInputValue || '';
-    if(saved.domainIdx !== undefined && CONFIG[saved.domainIdx]){
-      document.getElementById('domainSelect').value = saved.domainIdx;
-      updateHandleHint();
+    const savedRow = CONFIG[saved.domainIdx];
+    const mismatchedStore = currentHandle && savedRow && savedRow.handle !== currentHandle;
+    if(mismatchedStore){
+      setStatus(`On ${currentHandle}'s admin — not restoring the last viewed order since it was from a different store.`, 'ok');
+    } else {
+      document.getElementById('orderInput').value = saved.orderInputValue || '';
+      if(!currentHandle && saved.domainIdx !== undefined && CONFIG[saved.domainIdx]){
+        document.getElementById('domainSelect').value = saved.domainIdx;
+        updateHandleHint();
+      }
+      document.getElementById('pasteArea').value = JSON.stringify(saved.order, null, 2);
+      await handleOrderData(saved.order, {skipPersist:true});
+      setStatus('Restored last order (popup state resets when it loses focus).', 'ok');
     }
-    document.getElementById('pasteArea').value = JSON.stringify(saved.order, null, 2);
-    await handleOrderData(saved.order, {skipPersist:true});
-    setStatus('Restored last order (popup state resets when it loses focus).', 'ok');
+  }
+}
+
+async function detectCurrentTabStoreHandle(){
+  try{
+    const tabs = await chrome.tabs.query({active:true, currentWindow:true});
+    const tabUrl = tabs && tabs[0] && tabs[0].url;
+    if(!tabUrl) return null;
+    const m = tabUrl.match(/admin\.shopify\.com\/store\/([a-zA-Z0-9\-]+)/);
+    return m ? m[1] : null;
+  }catch(e){
+    return null;
   }
 }
 
@@ -833,6 +963,29 @@ async function detectCurrentOrderTab(){
   }catch(e){
     return null; // no tab access (e.g. opened via Full view, or permission not granted for this host)
   }
+}
+
+// The side panel persists across tab switches (unlike a popup), so if the user switches to a
+// different store's admin tab while it's open, keep the dropdown in sync rather than leaving
+// it pointed at whatever store was active when the panel first opened.
+async function syncDropdownToActiveTab(){
+  const currentHandle = await detectCurrentTabStoreHandle();
+  if(!currentHandle) return;
+  const select = document.getElementById('domainSelect');
+  const currentRow = CONFIG[select.value];
+  if(currentRow && currentRow.handle === currentHandle) return; // already correct
+  const idx = CONFIG.findIndex(r => r.handle === currentHandle);
+  if(idx >= 0){
+    select.value = idx;
+    updateHandleHint();
+    setStatus(`Storefront switched to match the current tab (${currentHandle}).`, 'ok');
+  }
+}
+if(chrome.tabs && chrome.tabs.onActivated){
+  chrome.tabs.onActivated.addListener(()=> syncDropdownToActiveTab());
+}
+if(chrome.tabs && chrome.tabs.onUpdated){
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo)=>{ if(changeInfo.url) syncDropdownToActiveTab(); });
 }
 
 init();

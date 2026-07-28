@@ -60,9 +60,11 @@ What it currently detects:
 
 `admin.shopify.com/store/{handle}/orders.json` — the same `.json` trick used for individual orders — also works on the order **list** page, and returns a page of orders (classic Shopify REST shape, 50 by default; the tool requests `?limit=250`). This means a range of recent orders can be scanned client-side without hitting each one individually.
 
-**Usage:** pick the storefront (same dropdown as single lookup), enter an order number range (`153800-153900`) or a comma-separated list, and click **Scan for issues**. Every matched order is run through the same `generateAutoNotes` logic as "Worth flagging" — only orders with at least one `Flag`-level note are shown in the results. Click a result to load its full diagnostics/JSON into the main panels without a second fetch (the order data is already in memory from the scan).
+**Usage:** pick the storefront (same dropdown as single lookup), enter a range (`GV153890-GV153896` or `153890-153896`) or a comma-separated list — paste straight from the store's order list, prefix and all (e.g. `GV153896`), it's stripped automatically. Click **Scan for issues**. Every matched order is run through the same `generateAutoNotes` logic as "Worth flagging" — only orders with at least one `Flag`-level note are shown in the results. Click a result to load its full diagnostics/JSON into the main panels without a second fetch (the order data is already in memory from the scan).
 
-**How pagination works:** the tool follows the response's `Link: <...>; rel="next"` header (standard Shopify REST cursor pagination) up to 6 pages, and stops early once a page's lowest order number drops below the requested range's minimum — since the list is sorted newest-first, nothing older can still be in range. There's no confirmed documentation for this internal endpoint's exact behavior (page size, sort order, whether `Link` is even present) — this is inferred from observed responses, not guaranteed. Very old order numbers, or endpoints that don't paginate the way assumed, may not be fully reachable.
+**Matching is based on the order's `name` field** (the digits after the store's prefix, e.g. `153890` in `GV153890`) — not `order_number` — since on some storefronts those two diverge. `order_number` is checked as a fallback only if an order's `name` has no trailing digits.
+
+**How pagination works:** the tool follows the response's `Link: <...>; rel="next"` header (standard Shopify REST cursor pagination) up to 6 pages, and stops early once a page's lowest name-derived number drops below the requested range's minimum — since the list is sorted newest-first, nothing older can still be in range. There's no confirmed documentation for this internal endpoint's exact behavior (page size, sort order, whether `Link` is even present) — this is inferred from observed responses, not guaranteed. Very old order numbers, or endpoints that don't paginate the way assumed, may not be fully reachable.
 
 **Known limitations:**
 - Compliance-sheet state lookups are skipped during bulk scan (would mean re-fetching/matching the CSV per order) — only the tag-based and PMD-based checks run
@@ -93,15 +95,22 @@ To pick up changes after editing the source, click the reload icon on the extens
 
 **If you're already on a Shopify order page** (`admin.shopify.com/store/.../orders/...`), just open the side panel — it detects that and auto-fetches the order for you, no typing needed.
 
+**The storefront dropdown auto-selects itself, too** — not just for order pages, but any page under a store's `admin.shopify.com/store/{handle}/...` (the orders list, dashboard, anywhere), as long as that handle is already in your storefront config. This is meant to prevent the dropdown being left on the wrong store while you're focused on typing a bulk range or order name — it matches whatever store's admin tab is actually active. Since the side panel persists across tab switches (unlike a popup), it keeps re-checking as you switch tabs and updates the dropdown live if you move to a different store's admin — a status line confirms when it does. If the last order you viewed belongs to a different store than the one currently detected, it won't be restored on open (to avoid showing stale data next to a dropdown pointed at a different storefront).
+
 Otherwise:
 
 1. Open the side panel and pick a **storefront** from the dropdown
-2. Enter the **order ID**, or paste the full `admin.shopify.com/store/.../orders/...` URL — pasting a full URL also auto-fills the storefront and syncs its store handle (see below)
+2. Enter one of three things in the order field:
+   - **Order name** (e.g. `GV153847`) — what actually shows up in the store's order list, and what the Active Monitoring process is based on
+   - **Order number** (e.g. `153847`) — the plain number, without the store's prefix
+   - The **full admin order URL** (or just the internal order ID, e.g. `7193953272054`)
 3. Click **Fetch order JSON**
    - If you're not logged into that store's admin, you'll get a 401/403 — open the store in Shopify to log in, then fetch again
    - If fetch fails for any other reason, use **Open in Shopify ↗** to view the order, copy the JSON, and paste it into the manual box as a fallback
 4. Review the diagnostics panel and the raw JSON below it
 5. Click **⤢ Full view** if you'd rather have it in its own full browser tab instead of the docked panel
+
+**Why order name/number needs a lookup, not a direct fetch:** Shopify's admin order URL is keyed on the order's internal ID (`7193953272054`), which has no derivable relationship to the order name or order_number — and on some storefronts, the order name isn't even numerically consistent with order_number. So entering a name or number triggers a search of the storefront's order list (same mechanism as Bulk scan below) to resolve it to the right order, rather than guessing at a URL. Pasting a full admin URL (or the raw internal ID) skips that search and fetches directly — it's the faster path if you already have it.
 
 ## Configuration
 
