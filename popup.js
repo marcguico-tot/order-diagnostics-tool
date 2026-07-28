@@ -156,6 +156,13 @@ function currentUrl(){
   return `https://admin.shopify.com/store/${handle}/orders/${orderId}.json`;
 }
 
+function currentStoreHandle(){
+  const parsedFromInput = parseOrderInput(document.getElementById('orderInput').value);
+  if(parsedFromInput.handle) return parsedFromInput.handle;
+  const row = CONFIG[document.getElementById('domainSelect').value];
+  return row ? row.handle : null;
+}
+
 // ---- Compliance sheet (PACT & Excise tab) ----
 // Columns (0-indexed): 0 State | 1 PACT Agency | 2 PACT Required License | 3 PACT Fees
 // | 4 PACT Registration Portal | 5 (blank spacer) | 6 Excise Agency | 7 Excise Required License
@@ -613,6 +620,120 @@ document.getElementById('copyNoteBtn').addEventListener('click', async ()=>{
   }catch(e){
     setStatus('Could not copy automatically — select the text and copy manually.', 'err');
   }
+});
+
+// ---- Bulk scan ----
+function setBulkStatus(msg, type){
+  const el = document.getElementById('bulkStatus');
+  el.textContent = msg;
+  el.className = 'status-line show' + (type ? ' '+type : '');
+}
+
+function parseRangeInput(input){
+  input = (input||'').trim();
+  const rangeMatch = input.match(/^(\d+)\s*-\s*(\d+)$/);
+  if(rangeMatch){
+    const min = parseInt(rangeMatch[1],10), max = parseInt(rangeMatch[2],10);
+    return {mode:'range', min: Math.min(min,max), max: Math.max(min,max)};
+  }
+  const list = input.split(',').map(s=>s.trim()).filter(Boolean).map(s=>parseInt(s,10)).filter(n=>!isNaN(n));
+  if(list.length) return {mode:'list', set: new Set(list)};
+  return null;
+}
+
+function orderMatchesRange(order, range){
+  const n = order.order_number;
+  if(n === undefined || n === null) return false;
+  if(range.mode === 'range') return n >= range.min && n <= range.max;
+  return range.set.has(n);
+}
+
+function extractLinkNext(linkHeader){
+  if(!linkHeader) return null;
+  const parts = linkHeader.split(',');
+  for(const part of parts){
+    const m = part.match(/<([^>]+)>;\s*rel="next"/);
+    if(m) return m[1];
+  }
+  return null;
+}
+
+async function fetchOrdersPage(url){
+  const res = await fetch(url, {credentials:'include'});
+  if(!res.ok) throw new Error('HTTP ' + res.status);
+  const data = await res.json();
+  const nextUrl = extractLinkNext(res.headers.get('Link'));
+  return {orders: data.orders || [], nextUrl};
+}
+
+document.getElementById('bulkScanBtn').addEventListener('click', async ()=>{
+  const handle = currentStoreHandle();
+  if(!handle){ setBulkStatus('Select a storefront with a saved handle first.', 'err'); return; }
+  const range = parseRangeInput(document.getElementById('bulkRangeInput').value);
+  if(!range){ setBulkStatus('Enter a range like 153800-153900, or a comma-separated list of order numbers.', 'err'); return; }
+
+  document.getElementById('bulkResultsPanel').style.display = 'none';
+  setBulkStatus('Scanning…');
+
+  const MAX_PAGES = 6;
+  let url = `https://admin.shopify.com/store/${handle}/orders.json?limit=250`;
+  let totalScanned = 0, pagesFetched = 0;
+  const matches = [];
+
+  try{
+    while(url && pagesFetched < MAX_PAGES){
+      const {orders, nextUrl} = await fetchOrdersPage(url);
+      pagesFetched++;
+      totalScanned += orders.length;
+      for(const order of orders){
+        if(orderMatchesRange(order, range)) matches.push(order);
+      }
+      if(orders.length){
+        const minOnPage = Math.min(...orders.map(o=>o.order_number).filter(n=>typeof n === 'number'));
+        if(range.mode === 'range' && minOnPage < range.min) break; // older pages can't contain anything in range
+      }
+      url = nextUrl;
+      setBulkStatus(`Scanning… ${totalScanned} orders checked across ${pagesFetched} page(s)`);
+    }
+  }catch(err){
+    setBulkStatus('Scan failed — ' + (err.message || 'unknown error') + '. Try a smaller range, or check you\'re logged into this store.', 'err');
+    return;
+  }
+
+  const flagged = matches.map(order => ({order, notes: generateAutoNotes(order)}))
+    .filter(r => r.notes.some(n=>n.level==='flag'));
+
+  document.getElementById('bulkResultsPanel').style.display = 'block';
+  document.getElementById('bulkSummary').textContent =
+    `Scanned ${totalScanned} orders across ${pagesFetched} page(s), found ${matches.length} in range, ${flagged.length} need attention.`;
+
+  const list = document.getElementById('bulkResultsList');
+  list.innerHTML = '';
+  if(!flagged.length){
+    list.innerHTML = '<div class="empty-state">Nothing flagged in this range.</div>';
+  } else {
+    flagged.forEach(({order, notes})=>{
+      const item = document.createElement('div');
+      item.className = 'diag-item';
+      item.style.cursor = 'pointer';
+      const summary = notes.map(n=>n.text).join(' · ');
+      item.innerHTML = `
+        <div class="diag-head">
+          <div class="diag-title">#${order.order_number}</div>
+          <span class="badge flag">Flag</span>
+        </div>
+        <div class="diag-summary">${summary}</div>
+      `;
+      item.addEventListener('click', async ()=>{
+        document.getElementById('orderInput').value = `https://admin.shopify.com/store/${handle}/orders/${order.id}`;
+        await handleOrderData(order);
+        setStatus(`Loaded order #${order.order_number} from bulk scan.`, 'ok');
+      });
+      list.appendChild(item);
+    });
+  }
+
+  setBulkStatus(`Done — ${flagged.length} of ${matches.length} matched orders flagged.`, 'ok');
 });
 
 function renderDiagnostics(checks){
