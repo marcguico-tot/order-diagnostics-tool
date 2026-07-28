@@ -194,6 +194,21 @@
   </div>
 
   <div class="panel">
+    <h2>Bulk scan <span style="text-transform:none;font-weight:400;color:var(--muted);">(beta)</span></h2>
+    <div class="hint" style="margin-bottom:10px;">Scans a range of recent orders on the selected storefront (above) and flags only the ones worth a closer look.</div>
+    <label for="bulkRangeInput">Order number range or list</label>
+    <input type="text" id="bulkRangeInput" placeholder="e.g. 153800-153900, or 153801,153802,153850">
+    <div class="hint">Uses order numbers (the plain number, not the internal order ID) — matches what's shown in the store's order list.</div>
+    <div class="btn-row"><button class="btn primary" id="bulkScanBtn">Scan for issues</button></div>
+    <div class="status-line" id="bulkStatus"></div>
+    <div id="bulkResultsPanel" style="display:none;margin-top:12px;">
+      <div class="diag-summary" id="bulkSummary" style="margin-bottom:8px;"></div>
+      <div id="bulkResultsList"></div>
+    </div>
+    <div class="hint" style="margin-top:8px;">Only scans as many pages as the storefront's order list returns before running out of matches or hitting a safety cap — very old order numbers may not be reachable in one scan.</div>
+  </div>
+
+  <div class="panel">
     <h2>Storefront config</h2>
     <details class="config" id="cfgDetails">
       <summary>Domain → Shopify store handle mapping</summary>
