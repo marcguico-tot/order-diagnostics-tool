@@ -222,13 +222,21 @@
     <div id="diagList"></div>
   </div>
 
+  <div class="panel" id="livePricePanel" style="display:none;">
+    <h2>Live price check <span style="text-transform:none;font-weight:400;color:var(--muted);">(beta)</span></h2>
+    <div class="hint" style="margin-bottom:10px;">Compares what was charged against each product's <em>current</em> live price. Only meaningful for same-day orders — prices legitimately change over time, so a mismatch on an older order doesn't necessarily mean anything was wrong at checkout. Not run automatically since it requires a separate fetch per product.</div>
+    <div class="btn-row"><button class="btn small" id="checkLivePricesBtn">Check current prices</button></div>
+    <div class="status-line" id="livePriceStatus"></div>
+    <div id="livePriceResults" style="margin-top:10px;"></div>
+  </div>
+
   <div class="panel" id="notesPanel" style="display:none;">
     <h2>Worth flagging</h2>
     <div id="notesList"></div>
     <label for="slackNoteLine" style="margin-top:12px;">Line to paste into today's Active Monitoring report, if you're logging one</label>
     <input type="text" id="slackNoteLine" readonly>
     <div class="btn-row"><button class="btn small" id="copyNoteBtn">Copy</button></div>
-    <div class="hint">Doesn't replicate the manual over/undercharged-vs-live-price check — that needs the current storefront price, which isn't in the order JSON.</div>
+    <div class="hint">Doesn't include the "Live price check" above — that's a separate on-demand check (see that panel), not run automatically for every note.</div>
   </div>
 
   <div class="panel" id="jsonPanel" style="display:none;">

@@ -27,16 +27,17 @@ Above the diagnostics, the tool reads Token of Trust's own tags directly off the
 
 ## What it checks
 
-Given an order, it runs 8 diagnostic passes and flags anything worth a closer look:
+Given an order, it runs 9 diagnostic passes and flags anything worth a closer look:
 
 1. **Coupons / discounts** — discount codes or order-level discounts that might affect the taxable subtotal
 2. **Product metadata (PMD)** — line items missing `taxable` or `tax_lines`. Excludes TOT's own injected excise-tax line item (`vendor: "TOT"`, SKU prefix `TOT_TAXLINE_`) and Route's shipping-protection line item (`vendor: "Route"`, SKU prefix `ROUTEINS`) — both are legitimately non-taxable by design, not compliance gaps
 3. **Order modification** — edited quantities or refunds that may predate/postdate the original tax calc
 4. **Address mismatch** — missing ship-to state, or ship-to/bill-to states that don't match
-5. **Payment method** — non-standard gateways (manual, COD, bogus) that can bypass the checkout flow that triggers tax apps
-6. **State-specific rate config** — matches the ship-to state against your PACT & Excise compliance sheet and shows the licensing agency, fees, and excise tax detail for that state
-7. **Cart size / SKU count** — unusually large carts that may hit tax-app limits
-8. **Vendor / product specific** — lists vendors and SKUs for manual cross-check against exemption lists
+5. **Tax jurisdiction match** — compares the state named in each `"___ State Tax"` line against the order's actual ship-to state, catching cases where the tax engine resolved the wrong state entirely (e.g. a city name that exists in two different states — Concordia, KS vs. Concordia Parish, LA — geocoded to the wrong one)
+6. **Payment method** — non-standard gateways (manual, COD, bogus) that can bypass the checkout flow that triggers tax apps
+7. **State-specific rate config** — matches the ship-to state against your PACT & Excise compliance sheet and shows the licensing agency, fees, and excise tax detail for that state
+8. **Cart size / SKU count** — unusually large carts that may hit tax-app limits
+9. **Vendor / product specific** — lists vendors and SKUs for manual cross-check against exemption lists
 
 Each check shows a `Flag` / `OK` / `Info` badge and expands for detail pulled straight from the order JSON.
 
@@ -50,11 +51,27 @@ What it currently detects:
 - **Excise tax incorrect** (`tot-excise-tax-incorrect` tag)
 - **TOT verification rejected or pending** (`tot-rejected` / `tot-not-verified` tags)
 - **Missing PMD** (reusing the diagnostics check above, same ancillary-item exclusions)
+- **Wrong-state tax calculated** (reusing the Tax jurisdiction match check above) — a `___ State Tax` line that doesn't match the ship-to state, e.g. a city/place name existing in two states getting geocoded wrong
 - **Manual payment gateway** — flags orders that look manually entered
 - **Store credit** — notes if store credit was used as (part of) payment
 - **Refunds on record**
 
-**Known gap:** the manual "overcharged / undercharged (no coupon)" check your team does by eyeballing the live storefront price isn't replicated here — that requires the *current* product price, which isn't present in the order JSON. Automating it would mean also fetching the product from Shopify's Products API and comparing; not yet built.
+**The manual "overcharged / undercharged (no coupon)" check** your team does by eyeballing the live storefront price is now partially automated — see **Live price check** below.
+
+## Live price check (beta)
+
+Compares what each line item was actually charged against the product's **current** listed price — `admin.shopify.com/store/{handle}/products/{product_id}.json` works the same way the order `.json` trick does, and stays within the same `admin.shopify.com` permission already granted (no new host permission needed, unlike the earlier storefront-AJAX idea which would've required per-domain access to every client's public storefront).
+
+**Usage:** load an order, then click **Check current prices** in its own panel — this is a manual, on-demand action, not run automatically. Each unique product on the order is fetched once (deduped, in parallel), then each line item's `price` is compared against the matching variant's current `price`.
+
+**Why this is on-demand, not automatic:**
+- It costs a separate network request per unique product on the order — fine for a deliberate check, wasteful to run on every single lookup
+- **A price mismatch is only real evidence for same-day orders.** Prices legitimately change over time (sales, repricing, promotions), so flagging every historical order with a different price than today's would mostly just be noise, not signal. This fits the tool's original Active Monitoring use case (checking today's orders) much better than it fits investigating something from weeks ago.
+
+**Known limitations:**
+- Ancillary line items (TOT's excise tax line, Route's shipping protection) are excluded from the comparison — same exclusion as the PMD check, since they aren't real priced products
+- If a product's been deleted, archived, or a specific variant removed since the order was placed, that line item shows as informational ("could not check") rather than a false flag
+- Compares against the **variant's** price specifically (matched by `variant_id`), not the product's base price, so multi-variant products are compared correctly
 
 ## Bulk scan (beta)
 

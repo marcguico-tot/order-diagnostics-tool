@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "TOT Order Diagnostics Tool",
-  "version": "1.2.0",
-  "description": "Look up Shopify order JSON directly and run excise tax troubleshooting checks: coupons, PMD, order edits, address mismatch, payment method, state rate config, cart size, vendor/product.",
+  "version": "1.4.0",
+  "description": "Look up Shopify order JSON directly and run excise tax troubleshooting checks: coupons, PMD, order edits, address mismatch, tax jurisdiction match, payment method, state rate config, cart size, vendor/product, plus an on-demand live price check.",
   "action": {
     "default_title": "Order Diagnostics Tool",
     "default_icon": {

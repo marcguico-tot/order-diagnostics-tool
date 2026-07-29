@@ -392,6 +392,8 @@ function resetToEmptyState(){
   document.getElementById('diagEmpty').style.display = 'block';
   document.getElementById('notesPanel').style.display = 'none';
   document.getElementById('jsonPanel').style.display = 'none';
+  document.getElementById('livePricePanel').style.display = 'none';
+  document.getElementById('livePriceResults').innerHTML = '';
 }
 
 document.getElementById('analyzePastedBtn').addEventListener('click', async ()=>{
@@ -429,6 +431,8 @@ document.getElementById('clearBtn').addEventListener('click', async ()=>{
   document.getElementById('notesPanel').style.display = 'none';
   document.getElementById('notesList').innerHTML = '';
   document.getElementById('slackNoteLine').value = '';
+  document.getElementById('livePricePanel').style.display = 'none';
+  document.getElementById('livePriceResults').innerHTML = '';
   setStatus('Cleared.', 'ok');
 });
 
@@ -456,6 +460,23 @@ function syntaxHighlight(json){
 
 // ---- Diagnostics ----
 function num(v){ const n = parseFloat(v); return isNaN(n) ? 0 : n; }
+
+// Catches cases where the tax engine resolved the wrong state entirely — e.g. a city name
+// that exists in two different states getting geocoded to the wrong one (Concordia, KS vs.
+// Concordia Parish, LA). Compares the state named in each "___ State Tax" line against the
+// order's actual ship-to state. Shared by the diagnostics check and the auto-notes flag.
+function findWrongStateTaxLines(order){
+  const ship = order.shipping_address;
+  const shipStateName = ship ? (STATE_ABBR_TO_NAME[(ship.province_code||'').toUpperCase()] || ship.province) : null;
+  const taxLineStates = (order.tax_lines || [])
+    .map(t => (t.title||'').match(/^(.+?)\s+State Tax$/i))
+    .filter(Boolean)
+    .map(m => m[1].trim());
+  const wrongStateTaxLines = shipStateName
+    ? [...new Set(taxLineStates.filter(s => s.toLowerCase() !== shipStateName.toLowerCase()))]
+    : [];
+  return {shipStateName, taxLineStates, wrongStateTaxLines};
+}
 
 function analyzeOrder(order, compliance){
   const checks = [];
@@ -517,6 +538,19 @@ function analyzeOrder(order, compliance){
       : `Ship-to and bill-to both resolve to ${ship.province_code}`,
     detail: (noShipState || mismatch)
       ? `Shipping: ${ship ? [ship.address1, ship.city, ship.province_code, ship.zip].filter(Boolean).join(', ') : 'none'}\nBilling: ${bill ? [bill.address1, bill.city, bill.province_code, bill.zip].filter(Boolean).join(', ') : 'none'}`
+      : null
+  });
+
+  const {shipStateName, taxLineStates, wrongStateTaxLines} = findWrongStateTaxLines(order);
+  checks.push({
+    label:'Tax jurisdiction match',
+    status: !shipStateName ? 'info' : wrongStateTaxLines.length ? 'flag' : (taxLineStates.length ? 'ok' : 'info'),
+    summary: !shipStateName ? 'No ship-to state to compare tax_lines against'
+      : wrongStateTaxLines.length ? `Tax calculated for ${wrongStateTaxLines.join(', ')}, but order ships to ${shipStateName}`
+      : taxLineStates.length ? `Tax lines match ship-to state (${shipStateName})`
+      : 'No state-level tax_lines to check (may be a no-tax state, or excise-only order)',
+    detail: wrongStateTaxLines.length
+      ? `Ship-to: ${[ship.address1, ship.city, ship.province_code, ship.zip].filter(Boolean).join(', ')}\nThis usually means a city/place name that exists in more than one state was geocoded to the wrong one. Worth checking the address against the actual state before assuming the tax engine is broken generally.`
       : null
   });
 
@@ -657,6 +691,11 @@ function generateAutoNotes(order){
     notes.push({level:'flag', text:`Missing PMD on ${untaxed.length} item(s): ${untaxed.map(li=>li.title).join(', ')}`});
   }
 
+  const {wrongStateTaxLines, shipStateName} = findWrongStateTaxLines(order);
+  if(wrongStateTaxLines.length){
+    notes.push({level:'flag', text:`Tax calculated for ${wrongStateTaxLines.join(', ')} but ships to ${shipStateName} — check for a city/place name collision`});
+  }
+
   const gateways = (order.payment_gateway_names || []).map(g=>(g||'').toLowerCase());
   if(gateways.some(g=>g.includes('manual'))){
     notes.push({level:'flag', text:'This looks like a manual order (manual payment gateway)'});
@@ -709,6 +748,92 @@ document.getElementById('copyNoteBtn').addEventListener('click', async ()=>{
     setStatus('Copied monitoring note to clipboard.', 'ok');
   }catch(e){
     setStatus('Could not copy automatically — select the text and copy manually.', 'err');
+  }
+});
+
+// ---- Live price check (on-demand, not run automatically) ----
+function setLivePriceStatus(msg, type){
+  const el = document.getElementById('livePriceStatus');
+  el.textContent = msg;
+  el.className = 'status-line show' + (type ? ' '+type : '');
+}
+
+function resetLivePriceCheck(){
+  document.getElementById('livePricePanel').style.display = 'block';
+  document.getElementById('livePriceResults').innerHTML = '';
+  document.getElementById('livePriceStatus').className = 'status-line';
+  document.getElementById('livePriceStatus').textContent = '';
+}
+
+async function fetchProductVariants(handle, productId){
+  const url = `https://admin.shopify.com/store/${handle}/products/${productId}.json`;
+  const res = await fetch(url, {credentials:'include'});
+  if(!res.ok) throw new Error('HTTP ' + res.status);
+  const data = await res.json();
+  return (data.product && data.product.variants) || [];
+}
+
+async function checkLivePrices(order, handle){
+  const lineItems = (order.line_items || []).filter(li=>!isAncillaryLineItem(li));
+  const productIds = [...new Set(lineItems.map(li=>li.product_id).filter(Boolean))];
+  const variantsByProduct = {};
+  await Promise.all(productIds.map(async pid=>{
+    try{
+      variantsByProduct[pid] = await fetchProductVariants(handle, pid);
+    }catch(e){
+      variantsByProduct[pid] = null; // deleted/archived product, or fetch failed
+    }
+  }));
+
+  return lineItems.map(li=>{
+    const variants = variantsByProduct[li.product_id];
+    if(!variants){
+      return {title: li.title, chargedPrice: li.price, currentPrice: null, note: 'Could not fetch current product data (deleted, archived, or request failed)'};
+    }
+    const variant = variants.find(v=>v.id === li.variant_id);
+    if(!variant){
+      return {title: li.title, chargedPrice: li.price, currentPrice: null, note: 'This variant no longer exists on the current product'};
+    }
+    const charged = parseFloat(li.price), current = parseFloat(variant.price);
+    return {title: li.title, chargedPrice: li.price, currentPrice: variant.price, mismatch: Math.abs(charged-current) > 0.001};
+  });
+}
+
+function renderLivePriceResults(results){
+  const container = document.getElementById('livePriceResults');
+  container.innerHTML = '';
+  results.forEach(r=>{
+    const badgeClass = r.mismatch ? 'flag' : (r.currentPrice===null ? 'info' : 'ok');
+    const badgeText = r.mismatch ? 'Flag' : (r.currentPrice===null ? 'Info' : 'OK');
+    const row = document.createElement('div');
+    row.className = 'diag-item';
+    row.innerHTML = `
+      <div class="diag-head">
+        <div class="diag-title">${r.title}</div>
+        <span class="badge ${badgeClass}">${badgeText}</span>
+      </div>
+      <div class="diag-summary">${r.currentPrice===null ? (r.note||'Could not check') : `Charged $${r.chargedPrice} — current listed price $${r.currentPrice}`}</div>
+    `;
+    container.appendChild(row);
+  });
+}
+
+document.getElementById('checkLivePricesBtn').addEventListener('click', async ()=>{
+  if(!currentOrderData){ setLivePriceStatus('No order loaded yet.', 'err'); return; }
+  const handle = currentStoreHandle();
+  if(!handle){ setLivePriceStatus('Select a storefront with a saved handle first.', 'err'); return; }
+  setLivePriceStatus('Checking current prices…');
+  document.getElementById('livePriceResults').innerHTML = '';
+  try{
+    const results = await checkLivePrices(currentOrderData, handle);
+    renderLivePriceResults(results);
+    const mismatches = results.filter(r=>r.mismatch).length;
+    setLivePriceStatus(
+      mismatches ? `${mismatches} of ${results.length} item(s) differ from the current listed price.` : `All ${results.length} item(s) match the current listed price.`,
+      mismatches ? 'err' : 'ok'
+    );
+  }catch(err){
+    setLivePriceStatus('Check failed — ' + (err.message || 'unknown error'), 'err');
   }
 });
 
@@ -906,6 +1031,7 @@ async function handleOrderData(order, opts){
   renderTotStatus(order);
   renderDiagnostics(analyzeOrder(order, compliance));
   renderAutoNotes(order);
+  resetLivePriceCheck();
 
   if(!(opts && opts.skipPersist)){
     await chrome.storage.local.set({
