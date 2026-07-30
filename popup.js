@@ -1,5 +1,6 @@
 const CONFIG_KEY = 'totExciseConfig';
 const SHEET_KEY = 'totExciseSheetUrl';
+const DEFAULT_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1SfUcsK7z5yavPytlnuVxZZkhdhb4Y0yxjaamt8WkX2k/export?format=csv&gid=0';
 const LAST_ORDER_KEY = 'totLastOrder';
 
 const DEFAULT_CONFIG = [
@@ -1095,7 +1096,8 @@ async function init(){
 
   const sheetInput = document.getElementById('sheetUrl');
   const stored = await chrome.storage.local.get([SHEET_KEY]);
-  sheetInput.value = stored[SHEET_KEY] || '';
+  sheetInput.value = stored[SHEET_KEY] || DEFAULT_SHEET_URL;
+  if(!stored[SHEET_KEY]) chrome.storage.local.set({[SHEET_KEY]: DEFAULT_SHEET_URL});
   sheetInput.addEventListener('input', ()=> chrome.storage.local.set({[SHEET_KEY]: sheetInput.value.trim()}));
 
   // WooCommerce: independent of Shopify/BigCommerce detection below — a WooCommerce store's
@@ -1253,16 +1255,18 @@ function bcGetDdByLabel(doc, labelText){
 
 function bcExtractStateFromAddressText(text){
   if(!text) return null;
-  const lines = text.split('\n').map(l=>l.trim()).filter(Boolean);
-  for(const line of lines){
-    const m = line.match(/,\s*([A-Za-z][A-Za-z\s]*[A-Za-z])\s+\d{5}(-\d{4})?\s*$/);
-    if(!m) continue;
-    const token = m[1].trim();
-    if(STATE_ABBR_TO_NAME[token.toUpperCase()]) return STATE_ABBR_TO_NAME[token.toUpperCase()];
-    const fullMatch = Object.values(STATE_ABBR_TO_NAME).find(name => name.toLowerCase() === token.toLowerCase());
-    if(fullMatch) return fullMatch;
-  }
-  return null;
+  // Some stores render city/state/zip on separate lines (via <br>-separated text nodes with
+  // real whitespace between them in the source) rather than one combined "City, State Zip"
+  // line — confirmed via a real order where this caused "could not read state" despite the
+  // address clearly showing one. Normalizing all whitespace into single spaces first means the
+  // pattern can be found regardless of how the original markup broke it into lines.
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  const m = normalized.match(/,\s*([A-Za-z][A-Za-z\s]*?)\s+(\d{5})(-\d{4})?\b/);
+  if(!m) return null;
+  const token = m[1].trim();
+  if(STATE_ABBR_TO_NAME[token.toUpperCase()]) return STATE_ABBR_TO_NAME[token.toUpperCase()];
+  const fullMatch = Object.values(STATE_ABBR_TO_NAME).find(name => name.toLowerCase() === token.toLowerCase());
+  return fullMatch || null;
 }
 
 // Parses the order-details quick-view fragment: line items, excise tax line, ship-to state, payment method.
