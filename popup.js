@@ -349,6 +349,11 @@ function findComplianceRow(rows, order){
   let stateName = ship.province;
   if(!stateName && ship.province_code) stateName = STATE_ABBR_TO_NAME[ship.province_code.toUpperCase()];
   if(!stateName) return null;
+  return findComplianceRowByStateName(rows, stateName);
+}
+
+function findComplianceRowByStateName(rows, stateName){
+  if(!rows || !stateName) return null;
   const target = stateName.trim().toLowerCase();
   for(let i=2;i<rows.length;i++){
     if(rows[i][0] && rows[i][0].trim().toLowerCase() === target) return rows[i];
@@ -436,6 +441,10 @@ document.getElementById('clearBtn').addEventListener('click', async ()=>{
   setStatus('Cleared.', 'ok');
 });
 
+document.getElementById('refreshBtn').addEventListener('click', ()=>{
+  location.reload();
+});
+
 document.getElementById('fullTabBtn').addEventListener('click', ()=>{
   chrome.tabs.create({url: chrome.runtime.getURL('popup.html?full=1')});
 });
@@ -456,6 +465,20 @@ function syntaxHighlight(json){
       else if(/null/.test(match)) cls='jv-null';
       return `<span class="${cls}">${match}</span>`;
     });
+}
+
+// Colorizes raw HTML markup as displayed text — not a full parser, same "good enough for
+// readability" spirit as the JSON highlighter above. Tags/attributes/values/comments only.
+function htmlSyntaxHighlight(html){
+  let esc = html.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  esc = esc.replace(/&lt;!--[\s\S]*?--&gt;/g, m => `<span class="html-comment">${m}</span>`);
+  esc = esc.replace(/&lt;(\/?)([a-zA-Z][a-zA-Z0-9:-]*)((?:(?!&gt;)[\s\S])*?)(\/?)&gt;/g, (full, slash, tagName, attrsPart, selfClose) => {
+    const highlightedAttrs = attrsPart.replace(/([a-zA-Z_:][-a-zA-Z0-9_:.]*)(\s*=\s*)("[^"]*"|'[^']*')/g,
+      (m2, name, eq, val) => `<span class="html-attr">${name}</span>${eq}<span class="html-attr-val">${val}</span>`
+    );
+    return `<span class="html-tag">&lt;${slash}${tagName}</span>${highlightedAttrs}<span class="html-tag">${selfClose}&gt;</span>`;
+  });
+  return esc;
 }
 
 // ---- Diagnostics ----
@@ -752,9 +775,9 @@ document.getElementById('copyNoteBtn').addEventListener('click', async ()=>{
 });
 
 // ---- Live price check (on-demand, not run automatically) ----
-function setLivePriceStatus(msg, type){
+function setLivePriceStatus(msg, type, isHtml){
   const el = document.getElementById('livePriceStatus');
-  el.textContent = msg;
+  if(isHtml) el.innerHTML = msg; else el.textContent = msg;
   el.className = 'status-line show' + (type ? ' '+type : '');
 }
 
@@ -773,16 +796,19 @@ async function fetchProductVariants(handle, productId){
   return (data.product && data.product.variants) || [];
 }
 
-async function checkLivePrices(order, handle){
+async function checkLivePrices(order, handle, onProgress){
   const lineItems = (order.line_items || []).filter(li=>!isAncillaryLineItem(li));
   const productIds = [...new Set(lineItems.map(li=>li.product_id).filter(Boolean))];
   const variantsByProduct = {};
+  let completed = 0;
   await Promise.all(productIds.map(async pid=>{
     try{
       variantsByProduct[pid] = await fetchProductVariants(handle, pid);
     }catch(e){
       variantsByProduct[pid] = null; // deleted/archived product, or fetch failed
     }
+    completed++;
+    if(onProgress) onProgress(completed, productIds.length);
   }));
 
   return lineItems.map(li=>{
@@ -822,10 +848,21 @@ document.getElementById('checkLivePricesBtn').addEventListener('click', async ()
   if(!currentOrderData){ setLivePriceStatus('No order loaded yet.', 'err'); return; }
   const handle = currentStoreHandle();
   if(!handle){ setLivePriceStatus('Select a storefront with a saved handle first.', 'err'); return; }
-  setLivePriceStatus('Checking current prices…');
+
+  const btn = document.getElementById('checkLivePricesBtn');
+  const progressWrap = document.getElementById('livePriceProgressWrap');
+  const progressBar = document.getElementById('livePriceProgressBar');
+  btn.disabled = true;
+  progressWrap.style.display = 'block';
+  progressBar.style.width = '0%';
+  setLivePriceStatus('<span class="spinner">⟳</span> Checking current prices…', null, true);
   document.getElementById('livePriceResults').innerHTML = '';
+
   try{
-    const results = await checkLivePrices(currentOrderData, handle);
+    const results = await checkLivePrices(currentOrderData, handle, (done, total)=>{
+      progressBar.style.width = `${Math.round((done/total)*100)}%`;
+      setLivePriceStatus(`<span class="spinner">⟳</span> Checked ${done} of ${total} product(s)…`, null, true);
+    });
     renderLivePriceResults(results);
     const mismatches = results.filter(r=>r.mismatch).length;
     setLivePriceStatus(
@@ -834,6 +871,9 @@ document.getElementById('checkLivePricesBtn').addEventListener('click', async ()
     );
   }catch(err){
     setLivePriceStatus('Check failed — ' + (err.message || 'unknown error'), 'err');
+  } finally {
+    btn.disabled = false;
+    progressWrap.style.display = 'none';
   }
 });
 
@@ -989,7 +1029,7 @@ document.getElementById('bulkScanBtn').addEventListener('click', async ()=>{
     });
   }
 
-  setBulkStatus(`Done — ${flagged.length} of ${matches.length} matched orders flagged.`, 'ok');
+  setBulkStatus(bulkDoneMessage(flagged.length, matches.length), 'ok');
 });
 
 function renderDiagnostics(checks){
@@ -1049,10 +1089,36 @@ async function init(){
   renderDomainSelect();
   renderCfgTable();
 
+  WC_CONFIG = await wcLoadConfig();
+  wcRenderDomainSelect();
+  wcRenderCfgTable();
+
   const sheetInput = document.getElementById('sheetUrl');
   const stored = await chrome.storage.local.get([SHEET_KEY]);
   sheetInput.value = stored[SHEET_KEY] || '';
   sheetInput.addEventListener('input', ()=> chrome.storage.local.set({[SHEET_KEY]: sheetInput.value.trim()}));
+
+  // WooCommerce: independent of Shopify/BigCommerce detection below — a WooCommerce store's
+  // domain can't match either platform's URL patterns, so no coordination needed between them.
+  const wcDetected = await detectCurrentWooCommerceOrderTab();
+  if(wcDetected){
+    switchPlatformTab('woocommerce');
+    document.getElementById('wcDomainSelect').value = wcDetected.rowIdx;
+    wcUpdateSystemHint();
+    document.getElementById('wcOrderId').value = wcDetected.orderId;
+    await runWcTest();
+  }
+
+  // Experimental: if the current tab is a BigCommerce order search-results page, prefill and
+  // auto-run the permission test. Independent of the Shopify flow below — URL patterns can't
+  // overlap between the two platforms, so no coordination needed between them.
+  const bcDetected = await detectCurrentBigCommerceOrderTab();
+  if(bcDetected){
+    switchPlatformTab('bigcommerce');
+    document.getElementById('bcSubdomain').value = bcDetected.sub;
+    document.getElementById('bcOrderId').value = bcDetected.orderId;
+    await runBcTest();
+  }
 
   // Auto-select the storefront dropdown from whatever store admin the current tab is on —
   // any page under admin.shopify.com/store/{handle}, not just an order page. This means
@@ -1147,5 +1213,1045 @@ if(chrome.tabs && chrome.tabs.onActivated){
 if(chrome.tabs && chrome.tabs.onUpdated){
   chrome.tabs.onUpdated.addListener((tabId, changeInfo)=>{ if(changeInfo.url) syncDropdownToActiveTab(); });
 }
+
+// ---- BigCommerce diagnostics (beta) ----
+let currentBcOrder = null; // {sub, parsed} — set after a successful order fetch, used by the on-demand product & price check
+
+function setBcStatus(msg, type, isHtml){
+  const statusEl = document.getElementById('bcStatus');
+  if(isHtml) statusEl.innerHTML = msg; else statusEl.textContent = msg;
+  statusEl.className = 'status-line show' + (type ? ' '+type : '');
+}
+
+async function fetchBcHtml(url, extraHeaders){
+  const res = await fetch(url, {credentials:'include', headers: extraHeaders || {}});
+  if(!res.ok) throw new Error('HTTP ' + res.status);
+  return res.text();
+}
+
+// The order-list search page returns a full HTML page containing a table row for the matched
+// order, with its status <select> — same page shape as the store's main "View orders" screen.
+function bcParseStatus(listHtml, orderId){
+  const doc = new DOMParser().parseFromString(listHtml, 'text/html');
+  const select = doc.querySelector(`#status_${orderId}`) || doc.querySelector('select.status-select');
+  if(!select) return null;
+  const opt = select.options[select.selectedIndex];
+  return opt ? opt.textContent.trim() : null;
+}
+
+// Reads a <dd> immediately following a <dt> whose visible label text matches, e.g. "Payment Method".
+function bcGetDdByLabel(doc, labelText){
+  const dts = doc.querySelectorAll('dt');
+  for(const dt of dts){
+    if(dt.textContent.trim().toLowerCase().includes(labelText.toLowerCase())){
+      const sib = dt.nextElementSibling;
+      if(sib && sib.tagName === 'DD') return sib.textContent.trim();
+    }
+  }
+  return null;
+}
+
+function bcExtractStateFromAddressText(text){
+  if(!text) return null;
+  const lines = text.split('\n').map(l=>l.trim()).filter(Boolean);
+  for(const line of lines){
+    const m = line.match(/,\s*([A-Za-z][A-Za-z\s]*[A-Za-z])\s+\d{5}(-\d{4})?\s*$/);
+    if(!m) continue;
+    const token = m[1].trim();
+    if(STATE_ABBR_TO_NAME[token.toUpperCase()]) return STATE_ABBR_TO_NAME[token.toUpperCase()];
+    const fullMatch = Object.values(STATE_ABBR_TO_NAME).find(name => name.toLowerCase() === token.toLowerCase());
+    if(fullMatch) return fullMatch;
+  }
+  return null;
+}
+
+// Parses the order-details quick-view fragment: line items, excise tax line, ship-to state, payment method.
+function bcParseDetails(detailsHtml){
+  const doc = new DOMParser().parseFromString(detailsHtml, 'text/html');
+
+  const lineItems = [...doc.querySelectorAll('dl.qview-product')].map(dl=>{
+    const nameEl = dl.querySelector('.qview-product-name a');
+    const totalEl = dl.querySelector('.qview-product-total');
+    const qtyNote = dl.querySelector('.qview-product-name .note');
+    const qtyMatch = qtyNote ? qtyNote.textContent.trim().match(/^(\d+)\s*x$/i) : null;
+    const brandEl = dl.querySelector('.product-brand');
+    const brand = brandEl ? brandEl.textContent.replace(/Brand:/i, '').trim() : null;
+    let sku = null;
+    const dts = dl.querySelectorAll('dt');
+    for(const dt of dts){
+      if(dt.textContent.trim().toLowerCase().includes('product sku')){
+        const sib = dt.nextElementSibling;
+        if(sib && sib.tagName === 'DD') sku = sib.textContent.trim();
+        break;
+      }
+    }
+    return {
+      name: nameEl ? nameEl.textContent.trim() : (dl.querySelector('.qview-product-name')?.textContent.trim() || null),
+      total: totalEl ? totalEl.textContent.trim() : null,
+      sku,
+      brand,
+      qty: qtyMatch ? parseInt(qtyMatch[1],10) : null,
+      raw: dl.textContent
+    };
+  });
+
+  const exciseItem = lineItems.find(li => (li.sku||'').toUpperCase() === 'TOT_EXCISE_TAX' || /excise tax/i.test(li.name||''));
+  let exciseState = null;
+  if(exciseItem){
+    const m = (exciseItem.name||'').match(/^([A-Za-z]{2})\s+Excise Tax$/i);
+    if(m) exciseState = STATE_ABBR_TO_NAME[m[1].toUpperCase()] || null;
+  }
+
+  const shipAddrEl = doc.querySelector('[id^="qview-shippingaddress-"]');
+  const shipState = bcExtractStateFromAddressText(shipAddrEl ? shipAddrEl.textContent : '');
+  const billAddrEl = doc.querySelector('[id^="qview-billingaddress-"]');
+  const billState = bcExtractStateFromAddressText(billAddrEl ? billAddrEl.textContent : '');
+
+  const paymentMethod = bcGetDdByLabel(doc, 'Payment Method');
+  const orderNumMatch = (doc.querySelector('h2')?.textContent || '').match(/#(\d+)/);
+
+  const discountEl = doc.querySelector('.shipping-discount');
+  const discountText = discountEl ? discountEl.textContent.trim() : null;
+
+  const realItems = lineItems.filter(li => li !== exciseItem);
+  const totalQty = realItems.reduce((s,li)=> s + (li.qty||0), 0);
+  const brands = [...new Set(realItems.map(li=>li.brand).filter(Boolean))];
+
+  return {
+    orderNumber: orderNumMatch ? orderNumMatch[1] : null,
+    lineItems,
+    lineItemCount: realItems.length,
+    totalQty,
+    brands,
+    exciseItem,
+    exciseState,
+    shipState,
+    billState,
+    paymentMethod,
+    discountText
+  };
+}
+
+function bcAnalyze(parsed, statusText, compliance){
+  const checks = [];
+
+  const flagStatuses = ['Manual Verification Required', 'Declined', 'Disputed'];
+  const infoStatuses = ['Cancelled', 'Refunded', 'Partially Refunded'];
+  checks.push({
+    label: 'Order status',
+    status: !statusText ? 'info' : flagStatuses.includes(statusText) ? 'flag' : infoStatuses.includes(statusText) ? 'info' : 'ok',
+    summary: statusText || 'Could not read status from the order list page',
+    detail: flagStatuses.includes(statusText) ? 'This status is set by TOT via API/webhook, not manually — treat it as the verification-outcome signal, similar to Shopify\'s tot-rejected/tot-not-verified tags.' : null
+  });
+
+  if(parsed.exciseItem){
+    checks.push({
+      label: 'Excise tax line item',
+      status: 'ok',
+      summary: `Present: ${parsed.exciseItem.name} — ${parsed.exciseItem.total}`,
+      detail: parsed.exciseState && parsed.shipState && parsed.exciseState !== parsed.shipState
+        ? `Ships to ${parsed.shipState}, but excise line is for ${parsed.exciseState} — possible jurisdiction mismatch, same pattern as Shopify's city/state name collisions.`
+        : null
+    });
+  } else {
+    const complianceRow = compliance && compliance.rows && parsed.shipState
+      ? findComplianceRowByStateName(compliance.rows, parsed.shipState) : null;
+    const exciseText = complianceRow ? (complianceRow[9] || '').trim() : null;
+    const looksLikeExciseRequired = exciseText && !/^(n\/a|none|no excise)/i.test(exciseText);
+    checks.push({
+      label: 'Excise tax line item',
+      status: looksLikeExciseRequired ? 'flag' : 'info',
+      summary: looksLikeExciseRequired
+        ? `No excise line item, but ${parsed.shipState}'s compliance entry lists excise tax detail`
+        : parsed.shipState ? `No excise line item — no compliance data suggesting ${parsed.shipState} requires it` : 'No excise line item, and no ship-to state to cross-check',
+      detail: looksLikeExciseRequired ? `Compliance sheet entry for ${parsed.shipState}: ${exciseText}` : null
+    });
+  }
+
+  const gateway = (parsed.paymentMethod || '').toLowerCase();
+  const unusualGateway = ['manual', 'cash on delivery', 'cod', 'bogus'].some(k => gateway.includes(k));
+  checks.push({
+    label: 'Payment method',
+    status: !parsed.paymentMethod ? 'info' : unusualGateway ? 'flag' : 'ok',
+    summary: parsed.paymentMethod || 'Not found in order details',
+    detail: unusualGateway ? 'Non-standard payment method — worth confirming this order went through the normal checkout flow.' : null
+  });
+
+  const bothAddrKnown = parsed.shipState && parsed.billState;
+  const addrMismatch = bothAddrKnown && parsed.shipState !== parsed.billState;
+  checks.push({
+    label: 'Address mismatch',
+    status: !bothAddrKnown ? 'info' : addrMismatch ? 'flag' : 'ok',
+    summary: !bothAddrKnown ? 'Could not read both billing and shipping state'
+      : addrMismatch ? `Ship-to state (${parsed.shipState}) differs from bill-to (${parsed.billState})`
+      : `Ship-to and bill-to both resolve to ${parsed.shipState}`,
+    detail: null
+  });
+
+  checks.push({
+    label: 'Coupons / discounts',
+    status: parsed.discountText ? 'flag' : 'ok',
+    summary: parsed.discountText ? `Discount applied: ${parsed.discountText}` : 'No discount code detected',
+    detail: parsed.discountText ? 'Only shipping-level coupon codes are detected reliably — product-level line-item discounts may render differently and aren\'t confirmed checked here.' : null
+  });
+
+  const bigCart = parsed.lineItemCount > 15 || parsed.totalQty > 50;
+  checks.push({
+    label: 'Cart size / SKU count',
+    status: bigCart ? 'flag' : 'ok',
+    summary: `${parsed.lineItemCount} line item(s), ${parsed.totalQty} unit(s) total`,
+    detail: bigCart ? 'Larger carts occasionally hit per-line-item limits or timeouts in third-party tax calculation apps.' : null
+  });
+
+  checks.push({
+    label: 'Vendor / product specific',
+    status: 'info',
+    summary: parsed.brands.length ? `Brands on this order: ${parsed.brands.join(', ')}` : 'No brand field found on line items',
+    detail: null
+  });
+
+  return checks;
+}
+
+function bcGenerateNotes(parsed, statusText, checks){
+  const notes = [];
+  const flagStatuses = ['Manual Verification Required', 'Declined', 'Disputed'];
+  if(flagStatuses.includes(statusText)){
+    notes.push({level:'flag', text:`Status: ${statusText}`});
+  }
+  checks.forEach(c=>{
+    if(c.status === 'flag' && c.label !== 'Order status') notes.push({level:'flag', text:`${c.label}: ${c.summary}`});
+  });
+  return notes;
+}
+
+function badgeLabelBc(status){ return badgeLabel(status); }
+
+// Shared wording for bulk scan completion, used by both Shopify and BigCommerce — avoids the
+// confusing "0 of 6 matched orders flagged" framing, which read like something was incomplete
+// rather than "checked and found nothing wrong."
+function bulkDoneMessage(flaggedCount, matchedCount){
+  if(matchedCount === 0) return 'Done — no orders matched in this range.';
+  if(flaggedCount === 0) return `Done — no issues found across ${matchedCount} matched order(s).`;
+  return `Done — ${flaggedCount} of ${matchedCount} order(s) flagged, listed below.`;
+}
+
+function bcRenderStatus(parsed, statusText, checks){
+  const panel = document.getElementById('bcStatusPanel');
+  const list = document.getElementById('bcStatusList');
+  panel.style.display = 'block';
+  const statusCheck = checks.find(c=>c.label==='Order status');
+  const exciseCheck = checks.find(c=>c.label==='Excise tax line item');
+  const row = (label, check) => `
+    <div class="diag-summary" style="padding:3px 0;display:flex;align-items:center;gap:8px;">
+      <span class="badge ${check.status}">${badgeLabelBc(check.status)}</span>
+      <span><strong>${label}:</strong> ${check.summary}</span>
+    </div>`;
+  list.innerHTML = row('Verification', statusCheck) + row('Excise tax', exciseCheck);
+}
+
+function bcRenderDiagnostics(checks){
+  const list = document.getElementById('bcDiagList');
+  document.getElementById('bcDiagEmpty').style.display = 'none';
+  list.innerHTML = '';
+  checks.forEach((c,i)=>{
+    const item = document.createElement('div');
+    item.className = 'diag-item';
+    item.innerHTML = `
+      <div class="diag-head">
+        <div class="diag-title"><span class="diag-num">${String(i+1).padStart(2,'0')}</span>${c.label}</div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="badge ${c.status}">${badgeLabelBc(c.status)}</span>
+          ${c.detail ? '<span class="chevron">▸</span>' : ''}
+        </div>
+      </div>
+      <div class="diag-summary">${c.summary}</div>
+      ${c.detail ? `<div class="diag-detail">${c.detail}</div>` : ''}
+    `;
+    if(c.detail){
+      item.querySelector('.diag-head').addEventListener('click', ()=> item.classList.toggle('expanded'));
+    }
+    list.appendChild(item);
+  });
+}
+
+function bcRenderNotes(notes, orderNumber){
+  const panel = document.getElementById('bcNotesPanel');
+  if(!notes.length){ panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+  document.getElementById('bcNotesList').innerHTML = notes.map(n=>`
+    <div class="diag-summary" style="padding:2px 0;">
+      <span class="badge ${n.level}" style="margin-right:6px;">${badgeLabelBc(n.level)}</span>${n.text}
+    </div>`).join('');
+  const emoji = notes.some(n=>n.level==='flag') ? ':bangbang:' : ':+1:';
+  document.getElementById('bcSlackNoteLine').value = `${orderNumber}: Status: [${emoji}] - ${notes.map(n=>n.text).join(' - ')}`;
+}
+
+document.getElementById('bcCopyNoteBtn').addEventListener('click', async ()=>{
+  try{
+    await navigator.clipboard.writeText(document.getElementById('bcSlackNoteLine').value);
+    setBcStatus('Copied monitoring note to clipboard.', 'ok');
+  }catch(e){
+    setBcStatus('Could not copy automatically — select the text and copy manually.', 'err');
+  }
+});
+
+document.getElementById('bcClearBtn').addEventListener('click', ()=>{
+  document.getElementById('bcOrderId').value = '';
+  document.getElementById('bcStatusPanel').style.display = 'none';
+  document.getElementById('bcDiagList').innerHTML = '';
+  document.getElementById('bcDiagEmpty').style.display = 'block';
+  document.getElementById('bcNotesPanel').style.display = 'none';
+  document.getElementById('bcRawPanel').style.display = 'none';
+  document.getElementById('bcProductPanel').style.display = 'none';
+  document.getElementById('bcProductResults').innerHTML = '';
+  currentBcOrder = null;
+  setBcStatus('Cleared.', 'ok');
+});
+
+async function runBcTest(){
+  const sub = document.getElementById('bcSubdomain').value.trim();
+  const orderId = document.getElementById('bcOrderId').value.trim();
+  if(!sub || !orderId){ setBcStatus('Enter both the store subdomain and an order ID.', 'err'); return; }
+
+  setBcStatus('Fetching order details and status…');
+  ['bcStatusPanel','bcNotesPanel','bcRawPanel','bcProductPanel'].forEach(id=>document.getElementById(id).style.display='none');
+  document.getElementById('bcDiagList').innerHTML = '';
+  document.getElementById('bcDiagEmpty').style.display = 'block';
+  document.getElementById('bcProductResults').innerHTML = '';
+  currentBcOrder = null;
+
+  try{
+    const detailsUrl = `https://${sub}.mybigcommerce.com/admin/order/${orderId}/details`;
+    const listUrl = `https://${sub}.mybigcommerce.com/admin/index.php?searchId=${orderId}&ToDo=viewOrders&orderFrom=${orderId}&orderTo=${orderId}`;
+
+    const [detailsHtml, listHtml] = await Promise.all([
+      fetchBcHtml(detailsUrl, {'X-Requested-With':'XMLHttpRequest'}),
+      fetchBcHtml(listUrl)
+    ]);
+
+    const parsed = bcParseDetails(detailsHtml);
+    const statusText = bcParseStatus(listHtml, orderId);
+
+    const sheetUrl = document.getElementById('sheetUrl').value.trim();
+    const compliance = sheetUrl ? await getComplianceRows(sheetUrl) : null;
+
+    const checks = bcAnalyze(parsed, statusText, compliance);
+    const notes = bcGenerateNotes(parsed, statusText, checks);
+
+    bcRenderStatus(parsed, statusText, checks);
+    bcRenderDiagnostics(checks);
+    bcRenderNotes(notes, parsed.orderNumber || orderId);
+
+    document.getElementById('bcProductPanel').style.display = 'block';
+    currentBcOrder = {sub, parsed};
+
+    document.getElementById('bcRawPanel').style.display = 'block';
+    document.getElementById('bcResult').innerHTML =
+      '--- order details fragment ---\n' + htmlSyntaxHighlight(detailsHtml.slice(0, 2000)) +
+      '\n\n--- order list fragment ---\n' + htmlSyntaxHighlight(listHtml.slice(0, 2000));
+
+    setBcStatus(`Loaded order #${parsed.orderNumber || orderId}.`, 'ok');
+  }catch(err){
+    setBcStatus('Fetch failed — ' + (err.message || 'unknown error') + '. Check the subdomain/order ID and that you\'re logged into this store.', 'err');
+  }
+}
+
+function bcParseMoney(str){
+  if(!str) return null;
+  const n = parseFloat(String(str).replace(/[^0-9.\-]/g, ''));
+  return isNaN(n) ? null : n;
+}
+
+async function bcFetchProductById(sub, productId){
+  const url = `https://${sub}.mybigcommerce.com/internalapi/v1/catalog/products/${productId}/`;
+  const res = await fetch(url, {credentials:'include', headers:{'X-Requested-With':'XMLHttpRequest'}});
+  if(!res.ok) throw new Error('HTTP ' + res.status);
+  const data = await res.json();
+  return data.data || null;
+}
+
+// The exact-SKU lookup only matches base product SKUs — it won't find a variant's SKU (e.g.
+// "litty-thca-thcp-hd9-afblend-cart-1g-rainbow-cotton-candy", where the base product's real SKU
+// is "litty-thca-thcp-hd9-afblend-cart-1g" and the rest is a flavor suffix). Confirmed via a real
+// order: the exact lookup returns a genuine, honest zero results (not a rate limit or error) for
+// variant SKUs. This fuzzy admin-search endpoint resolves a variant SKU back to its parent
+// product — verified with a prefix-match safety check so a fuzzy top result isn't trusted blindly.
+async function bcResolveProductViaSearch(sub, sku){
+  const url = `https://${sub}.mybigcommerce.com/internalapi/v1/controlpanel/search?q=${encodeURIComponent(sku)}`;
+  const res = await fetch(url, {credentials:'include', headers:{'X-Requested-With':'XMLHttpRequest'}});
+  if(!res.ok) throw new Error('HTTP ' + res.status);
+  const data = await res.json();
+  const results = (data.data && data.data.results) || [];
+  const productResult = results.find(r => r.type === 'products');
+  const top = productResult && productResult.items && productResult.items[0];
+  if(!top || !top.sku || !top.params || !top.params.productId) return null;
+  if(!sku.toLowerCase().startsWith(top.sku.toLowerCase())) return null; // guard against a wrong fuzzy match
+  return {productId: top.params.productId, baseSku: top.sku};
+}
+
+async function bcFetchProductBySku(sub, sku){
+  const url = `https://${sub}.mybigcommerce.com/internalapi/v1/catalog/products/?sku=${encodeURIComponent(sku)}`;
+  const res = await fetch(url, {credentials:'include', headers:{'X-Requested-With':'XMLHttpRequest'}});
+  if(!res.ok) throw new Error('HTTP ' + res.status);
+  const data = await res.json();
+  let product = (data.data && data.data[0]) || null;
+
+  if(!product){
+    const resolved = await bcResolveProductViaSearch(sub, sku);
+    if(resolved){
+      product = await bcFetchProductById(sub, resolved.productId);
+      if(product) console.log(`[product & price check] SKU "${sku}" resolved via search to base SKU "${resolved.baseSku}" (product ${resolved.productId})`);
+    }
+  }
+
+  if(!product){
+    console.log(`[product & price check] SKU "${sku}" — no match via exact lookup or search fallback.`);
+  }
+  return product;
+}
+
+function bcRenderProductResults(results){
+  const container = document.getElementById('bcProductResults');
+  container.innerHTML = '';
+  results.forEach(r=>{
+    const item = document.createElement('div');
+    item.className = 'diag-item';
+    const badgeClass = (r.priceMismatch || r.taxCodeMissing) ? 'flag' : (r.notFound ? 'info' : 'ok');
+    const badgeText = r.notFound ? 'Info' : (r.priceMismatch || r.taxCodeMissing) ? 'Flag' : 'OK';
+    let summary;
+    if(r.notFound){
+      summary = 'Product not found by SKU — may have been deleted/renamed since the order';
+    } else {
+      const priceLine = r.chargedUnit !== null
+        ? `Charged ${r.chargedUnit.toFixed(2)} — current price ${r.currentPrice.toFixed(2)}${r.priceMismatch ? ' (differs)' : ''}`
+        : 'Could not determine charged unit price';
+      const taxLine = r.taxCodeMissing ? 'No product_tax_code set' : `product_tax_code: ${r.productTaxCode}`;
+      summary = `${priceLine} · ${taxLine}`;
+    }
+    item.innerHTML = `
+      <div class="diag-head">
+        <div class="diag-title">${r.name || r.sku}</div>
+        <span class="badge ${badgeClass}">${badgeText}</span>
+      </div>
+      <div class="diag-summary">${summary}</div>
+    `;
+    container.appendChild(item);
+  });
+}
+
+document.getElementById('bcCheckProductsBtn').addEventListener('click', async ()=>{
+  if(!currentBcOrder){ setBcStatus('Fetch an order first.', 'err'); return; }
+  const {sub, parsed} = currentBcOrder;
+  const realItems = (parsed.lineItems || []).filter(li => li !== parsed.exciseItem && li.sku);
+  const uniqueSkus = [...new Set(realItems.map(li=>li.sku))];
+  if(!uniqueSkus.length){ setBcStatus('No SKUs found on this order to check.', 'err'); return; }
+
+  document.getElementById('bcProductResults').innerHTML = '';
+  const btn = document.getElementById('bcCheckProductsBtn');
+  const progressWrap = document.getElementById('bcProductProgressWrap');
+  const progressBar = document.getElementById('bcProductProgressBar');
+  btn.disabled = true;
+  progressWrap.style.display = 'block';
+  progressBar.style.width = '0%';
+
+  // Sequential with a small delay, not parallel — a variant SKU (with a flavor/option suffix,
+  // e.g. "...-rainbow-cotton-candy") needs a fallback search + a second fetch to resolve, so a
+  // large order can mean well over one request per line item. Sequential keeps the load on
+  // BigCommerce's internal API reasonable and keeps console logging readable if something fails.
+  const productBySku = {};
+  try{
+    for(let i=0;i<uniqueSkus.length;i++){
+      const sku = uniqueSkus[i];
+      setBcStatus(`<span class="spinner">⟳</span> Checking product ${i+1} of ${uniqueSkus.length}…`, null, true);
+      try{
+        productBySku[sku] = await bcFetchProductBySku(sub, sku);
+      }catch(e){
+        console.log(`[product & price check] SKU "${sku}" — fetch failed:`, e.message);
+        productBySku[sku] = null;
+      }
+      progressBar.style.width = `${Math.round(((i+1)/uniqueSkus.length)*100)}%`;
+      if(i < uniqueSkus.length - 1) await new Promise(r=>setTimeout(r, 200));
+    }
+
+    const results = realItems.map(li=>{
+      const product = productBySku[li.sku];
+      if(!product){
+        return {sku: li.sku, name: li.name, notFound: true};
+      }
+      const chargedTotal = bcParseMoney(li.total);
+      const chargedUnit = (chargedTotal !== null && li.qty) ? chargedTotal / li.qty : null;
+      const currentPrice = product.calculated_price ?? product.price ?? null;
+      const priceMismatch = chargedUnit !== null && currentPrice !== null && Math.abs(chargedUnit - currentPrice) > 0.01;
+      const taxCodeMissing = !product.product_tax_code || !product.product_tax_code.trim();
+      return {
+        sku: li.sku,
+        name: product.name || li.name,
+        chargedUnit,
+        currentPrice,
+        priceMismatch,
+        productTaxCode: product.product_tax_code,
+        taxCodeMissing
+      };
+    });
+
+    bcRenderProductResults(results);
+    const flaggedCount = results.filter(r=>r.priceMismatch || r.taxCodeMissing).length;
+    setBcStatus(`Checked ${results.length} product(s), ${flaggedCount} worth a look. Price mismatches on wholesale/B2B orders may be expected (customer-specific pricing isn't visible to this check) rather than a bug.`, flaggedCount ? 'err' : 'ok');
+  } finally {
+    btn.disabled = false;
+    progressWrap.style.display = 'none';
+  }
+});
+
+document.getElementById('bcTestBtn').addEventListener('click', runBcTest);
+
+// ---- BigCommerce bulk scan (beta) ----
+function setBcBulkStatus(msg, type, isHtml){
+  const el = document.getElementById('bcBulkStatus');
+  if(isHtml) el.innerHTML = msg; else el.textContent = msg;
+  el.className = 'status-line show' + (type ? ' '+type : '');
+}
+
+function bcParseIdRange(input){
+  input = (input||'').trim();
+  const m = input.match(/^(\d+)\s*-\s*(\d+)$/);
+  if(!m) return null;
+  const a = parseInt(m[1],10), b = parseInt(m[2],10);
+  return {min: Math.min(a,b), max: Math.max(a,b)};
+}
+
+// Parses every order row's status <select> from a range-filtered order-list response —
+// same underlying markup as the single-order status lookup, just many on one page.
+function bcParseOrderList(listHtml){
+  const doc = new DOMParser().parseFromString(listHtml, 'text/html');
+  return [...doc.querySelectorAll('select[id^="status_"]')].map(sel=>{
+    const orderId = sel.id.replace('status_', '');
+    const opt = sel.options[sel.selectedIndex];
+    return {orderId, statusText: opt ? opt.textContent.trim() : null};
+  });
+}
+
+document.getElementById('bcBulkClearBtn').addEventListener('click', ()=>{
+  document.getElementById('bcBulkRangeInput').value = '';
+  document.getElementById('bcBulkResultsPanel').style.display = 'none';
+  document.getElementById('bcBulkResultsList').innerHTML = '';
+  document.getElementById('bcBulkSummary').textContent = '';
+  setBcBulkStatus('Cleared.', 'ok');
+});
+
+document.getElementById('bcBulkScanBtn').addEventListener('click', async ()=>{
+  const sub = document.getElementById('bcSubdomain').value.trim();
+  if(!sub){ setBcBulkStatus('Enter the store subdomain in Look up order above first.', 'err'); return; }
+  const range = bcParseIdRange(document.getElementById('bcBulkRangeInput').value);
+  if(!range){ setBcBulkStatus('Enter a range like 768170-768173.', 'err'); return; }
+
+  const btn = document.getElementById('bcBulkScanBtn');
+  const progressWrap = document.getElementById('bcBulkProgressWrap');
+  const progressBar = document.getElementById('bcBulkProgressBar');
+  document.getElementById('bcBulkResultsPanel').style.display = 'none';
+  btn.disabled = true;
+  setBcBulkStatus('Fetching order list…');
+
+  try{
+    const listUrl = `https://${sub}.mybigcommerce.com/admin/index.php?ToDo=viewOrders&orderFrom=${range.min}&orderTo=${range.max}&limit=100`;
+    const listHtml = await fetchBcHtml(listUrl);
+    const orderRows = bcParseOrderList(listHtml);
+
+    if(!orderRows.length){
+      setBcBulkStatus('No orders found in that range.', 'err');
+      return;
+    }
+
+    const sheetUrl = document.getElementById('sheetUrl').value.trim();
+    const compliance = sheetUrl ? await getComplianceRows(sheetUrl) : null;
+
+    progressWrap.style.display = 'block';
+    progressBar.style.width = '0%';
+
+    const flagged = [];
+    for(let i=0;i<orderRows.length;i++){
+      const {orderId, statusText} = orderRows[i];
+      setBcBulkStatus(`<span class="spinner">⟳</span> Checking order ${i+1} of ${orderRows.length} (#${orderId})…`, null, true);
+      try{
+        const detailsHtml = await fetchBcHtml(
+          `https://${sub}.mybigcommerce.com/admin/order/${orderId}/details`,
+          {'X-Requested-With':'XMLHttpRequest'}
+        );
+        const parsed = bcParseDetails(detailsHtml);
+        const checks = bcAnalyze(parsed, statusText, compliance);
+        const notes = bcGenerateNotes(parsed, statusText, checks);
+        if(notes.some(n=>n.level==='flag')){
+          flagged.push({orderId, orderNumber: parsed.orderNumber || orderId, notes});
+        }
+      }catch(e){
+        console.log(`[bulk scan] order ${orderId} failed:`, e.message);
+      }
+      progressBar.style.width = `${Math.round(((i+1)/orderRows.length)*100)}%`;
+      if(i < orderRows.length - 1) await new Promise(r=>setTimeout(r, 200));
+    }
+
+    document.getElementById('bcBulkResultsPanel').style.display = 'block';
+    document.getElementById('bcBulkSummary').textContent =
+      `Checked ${orderRows.length} order(s) in range ${range.min}-${range.max} — ${flagged.length} need attention.`;
+
+    const list = document.getElementById('bcBulkResultsList');
+    list.innerHTML = '';
+    if(!flagged.length){
+      list.innerHTML = '<div class="empty-state">Nothing flagged in this range.</div>';
+    } else {
+      flagged.forEach(r=>{
+        const item = document.createElement('div');
+        item.className = 'diag-item';
+        item.style.cursor = 'pointer';
+        item.innerHTML = `
+          <div class="diag-head">
+            <div class="diag-title">#${r.orderNumber}</div>
+            <span class="badge flag">Flag</span>
+          </div>
+          <div class="diag-summary">${r.notes.map(n=>n.text).join(' · ')}</div>
+        `;
+        item.addEventListener('click', async ()=>{
+          document.getElementById('bcOrderId').value = r.orderId;
+          await runBcTest();
+        });
+        list.appendChild(item);
+      });
+    }
+    setBcBulkStatus(bulkDoneMessage(flagged.length, orderRows.length), flagged.length ? 'err' : 'ok');
+  }catch(err){
+    setBcBulkStatus('Scan failed — ' + (err.message || 'unknown error') + '. Check the subdomain and that you\'re logged into this store.', 'err');
+  } finally {
+    btn.disabled = false;
+    progressWrap.style.display = 'none';
+  }
+});
+
+// BigCommerce order pages don't have a clean /orders/{id} URL like Shopify — the tab's actual
+// URL when "viewing" an order is the search-results page, with the order ID in a query param
+// (orderFrom / searchId), not the path. The /admin/order/{id}/details endpoint is just an AJAX
+// call fired in the background from that page, not something the browser navigates to directly.
+async function detectCurrentBigCommerceOrderTab(){
+  try{
+    const tabs = await chrome.tabs.query({active:true, currentWindow:true});
+    const tabUrl = tabs && tabs[0] && tabs[0].url;
+    if(!tabUrl) return null;
+    const hostMatch = tabUrl.match(/^https:\/\/([a-zA-Z0-9\-]+)\.mybigcommerce\.com\//);
+    if(!hostMatch) return null;
+    const sub = hostMatch[1];
+
+    // Newer "manage" admin UI: clean path-based order ID, e.g. /manage/orders/768160
+    const pathMatch = tabUrl.match(/\/manage\/orders\/(\d+)(?:[\/?#]|$)/);
+    if(pathMatch) return {sub, orderId: pathMatch[1]};
+
+    // Legacy admin UI: order ID in a query param instead (orderFrom/searchId/orderId)
+    const u = new URL(tabUrl);
+    const orderId = u.searchParams.get('orderFrom') || u.searchParams.get('searchId') || u.searchParams.get('orderId');
+    if(!orderId) return null;
+    return {sub, orderId};
+  }catch(e){
+    return null;
+  }
+}
+
+// ---- WooCommerce (step 1: fetch + raw field display only, no diagnostics yet) ----
+const WC_CONFIG_KEY = 'totWcConfig';
+const WC_DEFAULT_CONFIG = [
+  {domain:'vapesocietysupplies.com', system:'classic'},
+  {domain:'vapedepotusa.com', system:'hpos'}
+];
+let WC_CONFIG = [];
+
+async function wcLoadConfig(){
+  const stored = await chrome.storage.local.get([WC_CONFIG_KEY]);
+  if(stored[WC_CONFIG_KEY]) return stored[WC_CONFIG_KEY];
+  return JSON.parse(JSON.stringify(WC_DEFAULT_CONFIG));
+}
+async function wcSaveConfig(){
+  await chrome.storage.local.set({[WC_CONFIG_KEY]: WC_CONFIG});
+}
+
+function wcRenderDomainSelect(){
+  const sel = document.getElementById('wcDomainSelect');
+  const prev = sel.value;
+  sel.innerHTML = '';
+  WC_CONFIG.forEach((row,i)=>{
+    const opt = document.createElement('option');
+    opt.value = i;
+    opt.textContent = row.domain;
+    sel.appendChild(opt);
+  });
+  if(prev && WC_CONFIG[prev]) sel.value = prev;
+  wcUpdateSystemHint();
+}
+function wcUpdateSystemHint(){
+  const i = document.getElementById('wcDomainSelect').value;
+  const row = WC_CONFIG[i];
+  const hint = document.getElementById('wcSystemHint');
+  hint.textContent = row ? `Order system: ${row.system === 'hpos' ? 'HPOS (admin.php?page=wc-orders)' : 'Classic (post.php)'}` : '';
+}
+
+function wcRenderCfgTable(){
+  const body = document.getElementById('wcCfgBody');
+  body.innerHTML = '';
+  WC_CONFIG.forEach((row,i)=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><input type="text" data-i="${i}" data-f="domain" value="${escapeAttr(row.domain)}"></td>
+      <td>
+        <select data-i="${i}" data-f="system" class="wc-system-select">
+          <option value="classic" ${row.system==='classic'?'selected':''}>Classic</option>
+          <option value="hpos" ${row.system==='hpos'?'selected':''}>HPOS</option>
+        </select>
+      </td>
+      <td><button class="row-del" data-i="${i}" title="Remove">✕</button></td>`;
+    body.appendChild(tr);
+  });
+  body.querySelectorAll('input[type="text"]').forEach(inp=>{
+    inp.addEventListener('input', async e=>{
+      const i = +e.target.dataset.i;
+      WC_CONFIG[i].domain = e.target.value.trim();
+      await wcSaveConfig();
+      wcRenderDomainSelect();
+    });
+  });
+  body.querySelectorAll('.wc-system-select').forEach(sel=>{
+    sel.addEventListener('change', async e=>{
+      const i = +e.target.dataset.i;
+      WC_CONFIG[i].system = e.target.value;
+      await wcSaveConfig();
+      wcRenderDomainSelect();
+    });
+  });
+  body.querySelectorAll('.row-del').forEach(btn=>{
+    btn.addEventListener('click', async e=>{
+      WC_CONFIG.splice(+e.target.dataset.i,1);
+      await wcSaveConfig();
+      wcRenderCfgTable();
+      wcRenderDomainSelect();
+    });
+  });
+}
+
+document.getElementById('wcAddRowBtn').addEventListener('click', async ()=>{
+  WC_CONFIG.push({domain:'', system:'classic'});
+  await wcSaveConfig(); wcRenderCfgTable(); wcRenderDomainSelect();
+});
+document.getElementById('wcResetCfgBtn').addEventListener('click', async ()=>{
+  if(!confirm('Reset WooCommerce storefront config to defaults?')) return;
+  WC_CONFIG = JSON.parse(JSON.stringify(WC_DEFAULT_CONFIG));
+  await wcSaveConfig(); wcRenderCfgTable(); wcRenderDomainSelect();
+});
+document.getElementById('wcDomainSelect').addEventListener('change', wcUpdateSystemHint);
+
+function wcBuildUrl(domain, system, orderId){
+  return system === 'hpos'
+    ? `https://${domain}/wp-admin/admin.php?page=wc-orders&action=edit&id=${orderId}`
+    : `https://${domain}/wp-admin/post.php?post=${orderId}&action=edit`;
+}
+
+// Same custom-fields postmeta editor markup confirmed present on both classic and HPOS order
+// pages — WordPress's generic meta box, not something rewritten per order-storage backend.
+function wcParseMetaFields(html){
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const keyInputs = doc.querySelectorAll('input[type="text"][id^="meta-"][id$="-key"]');
+  const fields = [];
+  keyInputs.forEach(input=>{
+    const m = input.id.match(/^meta-(\d+)-key$/);
+    if(!m) return;
+    const rowId = m[1];
+    const key = input.value;
+    const valueEl = doc.getElementById(`meta-${rowId}-value`);
+    const value = valueEl ? valueEl.textContent : null;
+    fields.push({key, value});
+  });
+  return fields;
+}
+
+// Confirmed via real orders on both classic and HPOS stores: billing/shipping state and payment
+// method all live in clean, structured form fields (input value / select selected option) — no
+// free-text address parsing needed here, unlike BigCommerce's shipping address block.
+function wcParseDetails(html){
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const fields = wcParseMetaFields(html);
+  const billingState = doc.querySelector('#_billing_state')?.value || null;
+  const shippingState = doc.querySelector('#_shipping_state')?.value || null;
+  const paySelect = doc.querySelector('#_payment_method');
+  const payOpt = paySelect ? paySelect.options[paySelect.selectedIndex] : null;
+  const paymentMethod = payOpt ? {value: payOpt.value, text: payOpt.textContent.trim()} : null;
+  const orderNumMatch = (doc.querySelector('title')?.textContent || '').match(/Order #?(\d+)/) ||
+                         (doc.querySelector('h1')?.textContent || '').match(/#(\d+)/);
+  return {
+    fields, billingState, shippingState, paymentMethod,
+    orderNumber: orderNumMatch ? orderNumMatch[1] : null
+  };
+}
+
+function wcGetField(fields, key){
+  const f = fields.find(x => x.key === key);
+  return f ? f.value : undefined;
+}
+
+function wcAnalyze(parsed, compliance){
+  const checks = [];
+  const fields = parsed.fields;
+
+  // Verification — only "isCleared" is a confirmed real "good" value so far. A store that has
+  // none of the verification-related fields at all (like the excise-focused Vape Society Supply
+  // store) simply doesn't use this module — that's informational, not a problem. But a store
+  // that DOES use it (has tot_quarantined/tot_quarantine_manually_removed) and still lacks a
+  // clean tot_status gets flagged — confirmed against a real quarantine-override order that
+  // would've otherwise silently passed as "info" if absence of the field were always treated
+  // as non-applicable.
+  const totStatus = wcGetField(fields, 'tot_status');
+  const totQuarantined = wcGetField(fields, 'tot_quarantined');
+  const totQuarantineManuallyRemoved = wcGetField(fields, 'tot_quarantine_manually_removed');
+  const hasVerificationModule = totStatus !== undefined || totQuarantined !== undefined || totQuarantineManuallyRemoved !== undefined;
+  const isCleared = totStatus === 'isCleared';
+  checks.push({
+    label: 'Verification status',
+    status: !hasVerificationModule ? 'info' : isCleared ? 'ok' : 'flag',
+    summary: !hasVerificationModule
+      ? 'This store doesn\'t appear to use the verification module (no tot_status/tot_quarantined fields at all)'
+      : isCleared ? 'Cleared (tot_status: isCleared)' : `Not cleared${totStatus ? ` (tot_status: ${totStatus})` : ' (no tot_status set)'}`,
+    detail: (hasVerificationModule && !isCleared)
+      ? `tot_quarantined: ${totQuarantined === undefined ? '(not set)' : totQuarantined || '(empty)'}\ntot_quarantine_manually_removed: ${totQuarantineManuallyRemoved === undefined ? '(not set)' : totQuarantineManuallyRemoved}\nNo confirmed clean rejected/pending example yet — raw fields shown for manual judgment rather than a specific verdict.`
+      : null
+  });
+
+  // Excise — confirmed via two real orders from the same store: exciseTaxStatus itself doesn't
+  // distinguish collected vs. not-required (both read "RECONCILED"); totTaxCollected is the
+  // actual signal.
+  const totTaxCollectedRaw = wcGetField(fields, 'totTaxCollected');
+  const totTaxCollected = totTaxCollectedRaw !== undefined ? parseFloat(totTaxCollectedRaw) : null;
+  if(totTaxCollected !== null && totTaxCollected > 0){
+    checks.push({
+      label: 'Excise tax collected',
+      status: 'ok',
+      summary: `Collected: $${totTaxCollected.toFixed(2)}`,
+      detail: null
+    });
+  } else {
+    const stateName = parsed.shippingState ? (STATE_ABBR_TO_NAME[parsed.shippingState.toUpperCase()] || parsed.shippingState) : null;
+    const complianceRow = compliance && compliance.rows && stateName
+      ? findComplianceRowByStateName(compliance.rows, stateName) : null;
+    const exciseText = complianceRow ? (complianceRow[9] || '').trim() : null;
+    const looksLikeExciseRequired = exciseText && !/^(n\/a|none|no excise)/i.test(exciseText);
+    checks.push({
+      label: 'Excise tax collected',
+      status: looksLikeExciseRequired ? 'flag' : 'info',
+      summary: totTaxCollectedRaw === undefined
+        ? 'No totTaxCollected field on this order'
+        : looksLikeExciseRequired
+          ? `$0 collected, but ${stateName}'s compliance entry lists excise tax detail`
+          : stateName ? `$0 collected — no compliance data suggesting ${stateName} requires it` : '$0 collected, no ship-to state to cross-check',
+      detail: looksLikeExciseRequired ? `Compliance sheet entry for ${stateName}: ${exciseText}` : null
+    });
+  }
+
+  // Address mismatch — direct field comparison, no parsing needed (confirmed structured on both stores)
+  const bothKnown = parsed.billingState && parsed.shippingState;
+  const addrMismatch = bothKnown && parsed.billingState !== parsed.shippingState;
+  checks.push({
+    label: 'Address mismatch',
+    status: !bothKnown ? 'info' : addrMismatch ? 'flag' : 'ok',
+    summary: !bothKnown ? 'Could not read both billing and shipping state'
+      : addrMismatch ? `Ship-to (${parsed.shippingState}) differs from bill-to (${parsed.billingState})`
+      : `Ship-to and bill-to both resolve to ${parsed.shippingState}`,
+    detail: null
+  });
+
+  // Payment method
+  const pm = parsed.paymentMethod;
+  const unusualGateway = pm && ['cod', 'other', ''].includes(pm.value);
+  checks.push({
+    label: 'Payment method',
+    status: !pm ? 'info' : unusualGateway ? 'flag' : 'ok',
+    summary: pm ? `${pm.text} (${pm.value || 'none'})` : 'Not found on this order',
+    detail: unusualGateway ? 'Non-standard payment method — worth confirming this order went through the normal checkout flow.' : null
+  });
+
+  return checks;
+}
+
+function wcGenerateNotes(checks){
+  return checks.filter(c => c.status === 'flag').map(c => ({level:'flag', text:`${c.label}: ${c.summary}`}));
+}
+
+function wcRenderStatus(checks){
+  const panel = document.getElementById('wcStatusPanel');
+  const list = document.getElementById('wcStatusList');
+  panel.style.display = 'block';
+  const verifCheck = checks.find(c => c.label === 'Verification status');
+  const exciseCheck = checks.find(c => c.label === 'Excise tax collected');
+  const row = (label, check) => `
+    <div class="diag-summary" style="padding:3px 0;display:flex;align-items:center;gap:8px;">
+      <span class="badge ${check.status}">${badgeLabel(check.status)}</span>
+      <span><strong>${label}:</strong> ${check.summary}</span>
+    </div>`;
+  list.innerHTML = row('Verification', verifCheck) + row('Excise tax', exciseCheck);
+}
+
+function wcRenderDiagnostics(checks){
+  const list = document.getElementById('wcDiagList');
+  document.getElementById('wcDiagEmpty').style.display = 'none';
+  list.innerHTML = '';
+  checks.forEach((c,i)=>{
+    const item = document.createElement('div');
+    item.className = 'diag-item';
+    item.innerHTML = `
+      <div class="diag-head">
+        <div class="diag-title"><span class="diag-num">${String(i+1).padStart(2,'0')}</span>${c.label}</div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="badge ${c.status}">${badgeLabel(c.status)}</span>
+          ${c.detail ? '<span class="chevron">▸</span>' : ''}
+        </div>
+      </div>
+      <div class="diag-summary">${c.summary}</div>
+      ${c.detail ? `<div class="diag-detail">${c.detail}</div>` : ''}
+    `;
+    if(c.detail){
+      item.querySelector('.diag-head').addEventListener('click', ()=> item.classList.toggle('expanded'));
+    }
+    list.appendChild(item);
+  });
+}
+
+function wcRenderNotes(notes, orderNumber){
+  const panel = document.getElementById('wcNotesPanel');
+  if(!notes.length){ panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+  document.getElementById('wcNotesList').innerHTML = notes.map(n=>`
+    <div class="diag-summary" style="padding:2px 0;">
+      <span class="badge ${n.level}" style="margin-right:6px;">${badgeLabel(n.level)}</span>${n.text}
+    </div>`).join('');
+  const emoji = notes.some(n=>n.level==='flag') ? ':bangbang:' : ':+1:';
+  document.getElementById('wcSlackNoteLine').value = `${orderNumber}: Status: [${emoji}] - ${notes.map(n=>n.text).join(' - ')}`;
+}
+
+document.getElementById('wcCopyNoteBtn').addEventListener('click', async ()=>{
+  try{
+    await navigator.clipboard.writeText(document.getElementById('wcSlackNoteLine').value);
+    setWcStatus('Copied monitoring note to clipboard.', 'ok');
+  }catch(e){
+    setWcStatus('Could not copy automatically — select the text and copy manually.', 'err');
+  }
+});
+
+function setWcStatus(msg, type, isHtml){
+  const el = document.getElementById('wcStatus');
+  if(isHtml) el.innerHTML = msg; else el.textContent = msg;
+  el.className = 'status-line show' + (type ? ' '+type : '');
+}
+
+function wcRenderFields(fields){
+  const panel = document.getElementById('wcFieldsPanel');
+  const list = document.getElementById('wcFieldsList');
+  if(!fields.length){
+    panel.style.display = 'block';
+    list.innerHTML = '<div class="empty-state">No custom fields found in the fetched page — parsing may need adjusting.</div>';
+    return;
+  }
+  panel.style.display = 'block';
+  list.innerHTML = fields.map(f=>`
+    <div class="diag-summary" style="padding:2px 0;font-family:var(--mono);font-size:11px;">
+      <strong>${f.key}</strong>: ${f.value === '' ? '<em style="color:var(--muted);">(empty)</em>' : f.value}
+    </div>
+  `).join('');
+}
+
+document.getElementById('wcClearBtn').addEventListener('click', ()=>{
+  document.getElementById('wcOrderId').value = '';
+  document.getElementById('wcStatusPanel').style.display = 'none';
+  document.getElementById('wcDiagList').innerHTML = '';
+  document.getElementById('wcDiagEmpty').style.display = 'block';
+  document.getElementById('wcNotesPanel').style.display = 'none';
+  document.getElementById('wcFieldsPanel').style.display = 'none';
+  document.getElementById('wcFieldsList').innerHTML = '';
+  setWcStatus('Cleared.', 'ok');
+});
+
+async function runWcTest(){
+  const i = document.getElementById('wcDomainSelect').value;
+  const row = WC_CONFIG[i];
+  const orderId = document.getElementById('wcOrderId').value.trim();
+  if(!row || !row.domain){ setWcStatus('Select (or add) a storefront domain first.', 'err'); return; }
+  if(!orderId){ setWcStatus('Enter an order ID.', 'err'); return; }
+
+  const url = wcBuildUrl(row.domain, row.system, orderId);
+  setWcStatus(`Fetching ${url} …`);
+  ['wcStatusPanel','wcNotesPanel','wcFieldsPanel'].forEach(id=>document.getElementById(id).style.display='none');
+  document.getElementById('wcDiagList').innerHTML = '';
+  document.getElementById('wcDiagEmpty').style.display = 'block';
+
+  try{
+    const res = await fetch(url, {credentials:'include'});
+    if(res.status === 401 || res.status === 403){
+      setWcStatus(`Not authenticated for this store (${res.status}). Log into ${row.domain}'s wp-admin first, then try again.`, 'err');
+      return;
+    }
+    if(!res.ok){
+      setWcStatus(`Request returned ${res.status}. Check the domain, order system setting, and order ID.`, 'err');
+      return;
+    }
+    const html = await res.text();
+    const parsed = wcParseDetails(html);
+
+    const sheetUrl = document.getElementById('sheetUrl').value.trim();
+    const compliance = sheetUrl ? await getComplianceRows(sheetUrl) : null;
+
+    const checks = wcAnalyze(parsed, compliance);
+    const notes = wcGenerateNotes(checks);
+
+    wcRenderStatus(checks);
+    wcRenderDiagnostics(checks);
+    wcRenderNotes(notes, parsed.orderNumber || orderId);
+    wcRenderFields(parsed.fields);
+
+    setWcStatus(`Loaded order ${parsed.orderNumber || orderId} from ${row.domain}.`, 'ok');
+  }catch(err){
+    setWcStatus('Fetch failed — ' + (err.message || 'unknown error') + '. Check the domain is covered by host_permissions in manifest.json and the extension was reloaded after adding it.', 'err');
+  }
+}
+
+document.getElementById('wcTestBtn').addEventListener('click', runWcTest);
+
+// WooCommerce order-edit URLs are keyed by domain + system, both of which vary per self-hosted
+// store — detection checks the current tab's hostname against configured domains, then matches
+// whichever URL pattern (classic or HPOS) that store is configured for.
+async function detectCurrentWooCommerceOrderTab(){
+  try{
+    const tabs = await chrome.tabs.query({active:true, currentWindow:true});
+    const tabUrl = tabs && tabs[0] && tabs[0].url;
+    if(!tabUrl) return null;
+    const u = new URL(tabUrl);
+    const rowIdx = WC_CONFIG.findIndex(r => r.domain && u.hostname === r.domain);
+    if(rowIdx < 0) return null;
+    const row = WC_CONFIG[rowIdx];
+    if(row.system === 'classic'){
+      const m = tabUrl.match(/\/wp-admin\/post\.php\?post=(\d+)&action=edit/);
+      if(m) return {rowIdx, orderId: m[1]};
+    } else {
+      const m = tabUrl.match(/\/wp-admin\/admin\.php\?page=wc-orders&action=edit&id=(\d+)/);
+      if(m) return {rowIdx, orderId: m[1]};
+    }
+    return null;
+  }catch(e){
+    return null;
+  }
+}
+
+// ---- Platform tab switcher ----
+function switchPlatformTab(platform){
+  document.querySelectorAll('.platform-tab').forEach(btn=>{
+    btn.classList.toggle('active', btn.dataset.platform === platform);
+  });
+  document.getElementById('platformShopify').classList.toggle('active', platform === 'shopify');
+  document.getElementById('platformBigCommerce').classList.toggle('active', platform === 'bigcommerce');
+  document.getElementById('platformWooCommerce').classList.toggle('active', platform === 'woocommerce');
+}
+document.querySelectorAll('.platform-tab').forEach(btn=>{
+  btn.addEventListener('click', ()=> switchPlatformTab(btn.dataset.platform));
+});
 
 init();

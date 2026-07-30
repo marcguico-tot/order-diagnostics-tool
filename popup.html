@@ -42,16 +42,12 @@
   }
   h1{font-size:16px;margin:0 0 4px 0;font-weight:650;}
   .sub{color:var(--muted);font-size:11.5px;line-height:1.45;}
-  .scope-note{
-    display:inline-flex;align-items:center;gap:6px;margin-top:8px;
-    font-size:10.5px;color:var(--warn);background:var(--warn-dim);
-    border:1px solid #6b4f18;padding:4px 8px;border-radius:6px;font-family:var(--mono);
-  }
-  #fullTabBtn{
+  #fullTabBtn, #refreshBtn{
     flex-shrink:0;font-size:11px;color:var(--muted);background:transparent;
     border:1px solid var(--border);border-radius:6px;padding:5px 8px;cursor:pointer;
   }
-  #fullTabBtn:hover{border-color:#3a444c;color:var(--text);}
+  #fullTabBtn:hover, #refreshBtn:hover{border-color:#3a444c;color:var(--text);}
+  #refreshBtn{font-size:14px;line-height:1;padding:5px 9px;}
   body.full-tab #fullTabBtn{display:none;}
 
   .panel{
@@ -143,6 +139,9 @@
   }
   .skeleton-row:last-child{margin-bottom:0;}
   @keyframes skeleton-pulse{ 0%,100%{opacity:.35;} 50%{opacity:.75;} }
+  @keyframes spin{ from{transform:rotate(0deg);} to{transform:rotate(360deg);} }
+  .spinner{display:inline-block;animation:spin .8s linear infinite;}
+  .btn:disabled{opacity:.5;cursor:not-allowed;}
 
   .json-toolbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;}
   .json-toolbar .order-meta{font-size:11px;color:var(--muted);font-family:var(--mono);}
@@ -152,6 +151,19 @@
   }
   .jk{color:#7ec8ff;} .jv-str{color:#a8e6a1;} .jv-num{color:#f0b96a;}
   .jv-bool{color:#ff9d9d;} .jv-null{color:var(--muted);}
+  .html-tag{color:#7ec8ff;} .html-attr{color:#f0b96a;}
+  .html-attr-val{color:#a8e6a1;} .html-comment{color:var(--muted);font-style:italic;}
+
+  .platform-tabs{display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid var(--border);}
+  .platform-tab{
+    background:none;border:none;color:var(--muted);font-family:var(--sans);
+    font-size:12.5px;font-weight:600;padding:8px 6px;cursor:pointer;
+    border-bottom:2px solid transparent;margin-bottom:-1px;
+  }
+  .platform-tab:hover{color:var(--text);}
+  .platform-tab.active{color:var(--accent);border-bottom-color:var(--accent);}
+  .platform-panel{display:none;}
+  .platform-panel.active{display:block;}
 </style>
 </head>
 <body>
@@ -161,12 +173,22 @@
       <div>
         <div class="eyebrow">TOT · Ops Tooling · Extension</div>
         <h1>Order Diagnostics Tool</h1>
-        <div class="sub">Fetch a Shopify order directly and check it against the usual reasons excise tax fails to calculate.</div>
-        <div class="scope-note">⚠ Shopify only</div>
+        <div class="sub">Fetch a Shopify or BigCommerce order directly and check it against the usual reasons excise tax fails to calculate.</div>
       </div>
     </div>
-    <button id="fullTabBtn" title="Open in a full browser tab">⤢ Full view</button>
+    <div style="display:flex;gap:8px;flex-shrink:0;">
+      <button id="refreshBtn" title="Reload this panel (picks up code changes without closing/reopening)">⟳</button>
+      <button id="fullTabBtn" title="Open in a full browser tab">⤢ Full view</button>
+    </div>
   </header>
+
+  <div class="platform-tabs">
+    <button class="platform-tab active" data-platform="shopify">Shopify</button>
+    <button class="platform-tab" data-platform="bigcommerce">BigCommerce</button>
+    <button class="platform-tab" data-platform="woocommerce">WooCommerce</button>
+  </div>
+
+  <div class="platform-panel active" id="platformShopify">
 
   <div class="panel">
     <h2>Look up order</h2>
@@ -226,6 +248,11 @@
     <h2>Live price check <span style="text-transform:none;font-weight:400;color:var(--muted);">(beta)</span></h2>
     <div class="hint" style="margin-bottom:10px;">Compares what was charged against each product's <em>current</em> live price. Only meaningful for same-day orders — prices legitimately change over time, so a mismatch on an older order doesn't necessarily mean anything was wrong at checkout. Not run automatically since it requires a separate fetch per product.</div>
     <div class="btn-row"><button class="btn small" id="checkLivePricesBtn">Check current prices</button></div>
+    <div id="livePriceProgressWrap" style="display:none;margin-top:8px;">
+      <div style="height:5px;border-radius:3px;background:var(--panel2);overflow:hidden;">
+        <div id="livePriceProgressBar" style="height:100%;width:0%;background:var(--accent);transition:width .15s ease;"></div>
+      </div>
+    </div>
     <div class="status-line" id="livePriceStatus"></div>
     <div id="livePriceResults" style="margin-top:10px;"></div>
   </div>
@@ -270,6 +297,150 @@
       <input type="text" id="sheetUrl" placeholder="https://docs.google.com/…/export?format=csv&gid=0">
       <div class="hint">CSV export of your PACT & Excise sheet. Once set, "State-specific rate config" auto-matches the ship-to state.</div>
     </details>
+  </div>
+
+  </div>
+
+  <div class="platform-panel" id="platformBigCommerce">
+
+  <div class="panel">
+    <h2>Look up order <span style="text-transform:none;font-weight:400;color:var(--warn);">(beta — fewer checks than Shopify)</span></h2>
+    <div class="hint" style="margin-bottom:10px;">Scrapes BigCommerce's admin HTML (no JSON API used here) — more fragile than the Shopify side, since a class-name change on BigCommerce's end could silently break parsing with no error. Built and verified against real orders from three different client stores.</div>
+    <label for="bcSubdomain">Store subdomain (the part before .mybigcommerce.com)</label>
+    <input type="text" id="bcSubdomain" placeholder="store-hqim8tz8ly">
+    <label for="bcOrderId">Order ID</label>
+    <input type="text" id="bcOrderId" placeholder="567097295">
+    <div class="btn-row">
+      <button class="btn primary" id="bcTestBtn">Fetch order</button>
+      <button class="btn ghost small" id="bcClearBtn">Clear</button>
+    </div>
+    <div class="status-line" id="bcStatus"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Bulk scan <span style="text-transform:none;font-weight:400;color:var(--warn);">(beta)</span></h2>
+    <div class="hint" style="margin-bottom:10px;">Scans a range of BigCommerce order IDs using the store's subdomain entered above, and flags only the ones worth a closer look. Unlike Shopify's bulk scan, this only supports a continuous numeric range (not a comma-separated list) — BigCommerce's order-list range filter (<code>orderFrom</code>/<code>orderTo</code>) works on a from/to range, confirmed against real data to return every order in between in one fetch, not just the endpoints.</div>
+    <label for="bcBulkRangeInput">Order ID range</label>
+    <input type="text" id="bcBulkRangeInput" placeholder="e.g. 768170-768173">
+    <div class="btn-row">
+      <button class="btn primary" id="bcBulkScanBtn">Scan for issues</button>
+      <button class="btn ghost small" id="bcBulkClearBtn">Clear</button>
+    </div>
+    <div id="bcBulkProgressWrap" style="display:none;margin-top:8px;">
+      <div style="height:5px;border-radius:3px;background:var(--panel2);overflow:hidden;">
+        <div id="bcBulkProgressBar" style="height:100%;width:0%;background:var(--accent);transition:width .15s ease;"></div>
+      </div>
+    </div>
+    <div class="status-line" id="bcBulkStatus"></div>
+    <div id="bcBulkResultsPanel" style="display:none;margin-top:12px;">
+      <div class="diag-summary" id="bcBulkSummary" style="margin-bottom:8px;"></div>
+      <div id="bcBulkResultsList"></div>
+    </div>
+    <div class="hint" style="margin-top:8px;">Fetches the order list once (capped at 100 orders per fetch — larger ranges aren't paginated automatically yet), then fetches each matched order's full details sequentially to run diagnostics. This is slower than Shopify's bulk scan, which gets everything in one call — BigCommerce has no single endpoint with both status and excise/address detail together.</div>
+  </div>
+
+  <div class="panel" id="bcStatusPanel" style="display:none;">
+    <h2>Status <span style="text-transform:none;font-weight:400;color:var(--muted);">(from order status + excise line item)</span></h2>
+    <div id="bcStatusList"></div>
+  </div>
+
+  <div class="panel" id="bcDiagPanel">
+    <h2>Diagnostics</h2>
+    <div class="empty-state" id="bcDiagEmpty">Fetch an order to run the checks.</div>
+    <div id="bcDiagList"></div>
+  </div>
+
+  <div class="panel" id="bcProductPanel" style="display:none;">
+    <h2>Product & price check <span style="text-transform:none;font-weight:400;color:var(--muted);">(beta)</span></h2>
+    <div class="hint" style="margin-bottom:10px;">Looks up each product by SKU via BigCommerce's internal catalog API — compares the charged price against the current listed price (same idea as Shopify's Live price check), and flags products with no <code>product_tax_code</code> set. On-demand, not automatic: one extra request per unique product on the order, and an empty tax code doesn't necessarily mean a bug — it can also mean the product is genuinely non-taxable, or just hasn't been configured in TOT yet. Use judgment on the result, same as PMD on the Shopify side.</div>
+    <div class="btn-row"><button class="btn small" id="bcCheckProductsBtn">Check products & prices</button></div>
+    <div id="bcProductProgressWrap" style="display:none;margin-top:8px;">
+      <div style="height:5px;border-radius:3px;background:var(--panel2);overflow:hidden;">
+        <div id="bcProductProgressBar" style="height:100%;width:0%;background:var(--accent);transition:width .15s ease;"></div>
+      </div>
+    </div>
+    <div class="status-line" id="bcProductStatus"></div>
+    <div id="bcProductResults" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="panel" id="bcNotesPanel" style="display:none;">
+    <h2>Worth flagging</h2>
+    <div id="bcNotesList"></div>
+    <label for="bcSlackNoteLine" style="margin-top:12px;">Line to paste into today's Active Monitoring report, if you're logging one</label>
+    <input type="text" id="bcSlackNoteLine" readonly>
+    <div class="btn-row"><button class="btn small" id="bcCopyNoteBtn">Copy</button></div>
+  </div>
+
+  <div class="panel" id="bcRawPanel" style="display:none;">
+    <details class="config">
+      <summary>Raw HTML (debugging)</summary>
+      <div class="hint" style="margin:8px 0;">Both fetched fragments, for verifying parsing against the real response if something looks off.</div>
+      <pre class="json-view" id="bcResult" style="max-height:240px;"></pre>
+    </details>
+  </div>
+
+  </div>
+
+  <div class="platform-panel" id="platformWooCommerce">
+
+  <div class="panel">
+    <h2>Look up order <span style="text-transform:none;font-weight:400;color:var(--warn);">(beta — fewer checks than Shopify/BigCommerce)</span></h2>
+    <div class="hint" style="margin-bottom:10px;">WooCommerce is self-hosted, so each store needs its own domain added below — unlike Shopify/BigCommerce, there's no shared platform suffix to cover every client with one permission. The two known stores also use genuinely different admin URL structures (classic vs. the newer HPOS order storage), tracked per-domain in the config below.</div>
+    <label for="wcDomainSelect">Storefront</label>
+    <select id="wcDomainSelect"></select>
+    <div class="hint" id="wcSystemHint"></div>
+    <label for="wcOrderId">Order ID</label>
+    <input type="text" id="wcOrderId" placeholder="2445856">
+    <div class="btn-row">
+      <button class="btn primary" id="wcTestBtn">Fetch order</button>
+      <button class="btn ghost small" id="wcClearBtn">Clear</button>
+    </div>
+    <div class="status-line" id="wcStatus"></div>
+  </div>
+
+  <div class="panel" id="wcStatusPanel" style="display:none;">
+    <h2>Status <span style="text-transform:none;font-weight:400;color:var(--muted);">(from tot_status + totTaxCollected)</span></h2>
+    <div id="wcStatusList"></div>
+  </div>
+
+  <div class="panel" id="wcDiagPanel">
+    <h2>Diagnostics</h2>
+    <div class="empty-state" id="wcDiagEmpty">Fetch an order to run the checks.</div>
+    <div id="wcDiagList"></div>
+  </div>
+
+  <div class="panel" id="wcNotesPanel" style="display:none;">
+    <h2>Worth flagging</h2>
+    <div id="wcNotesList"></div>
+    <label for="wcSlackNoteLine" style="margin-top:12px;">Line to paste into today's Active Monitoring report, if you're logging one</label>
+    <input type="text" id="wcSlackNoteLine" readonly>
+    <div class="btn-row"><button class="btn small" id="wcCopyNoteBtn">Copy</button></div>
+  </div>
+
+  <div class="panel" id="wcFieldsPanel" style="display:none;">
+    <details class="config">
+      <summary>Custom fields found (raw, unfiltered)</summary>
+      <div class="hint" style="margin:8px 0;">Every postmeta field on the order, for verifying the diagnostics above against the real underlying data.</div>
+      <div id="wcFieldsList"></div>
+    </details>
+  </div>
+
+  <div class="panel">
+    <h2>Storefront config</h2>
+    <details class="config" id="wcCfgDetails">
+      <summary>Domain → order system mapping</summary>
+      <div class="hint" style="margin-top:6px;">"Classic" = <code>post.php?post={id}&action=edit</code>. "HPOS" = <code>admin.php?page=wc-orders&action=edit&id={id}</code>. Adding a new domain here also requires adding it to the extension's <code>host_permissions</code> in <code>manifest.json</code> and reloading — this config table alone doesn't grant access.</div>
+      <table class="cfg" id="wcCfgTable">
+        <thead><tr><th>Domain</th><th>Order system</th><th></th></tr></thead>
+        <tbody id="wcCfgBody"></tbody>
+      </table>
+      <div class="btn-row">
+        <button class="btn small" id="wcAddRowBtn">+ Add row</button>
+        <button class="btn small" id="wcResetCfgBtn">Reset to defaults</button>
+      </div>
+    </details>
+  </div>
+
   </div>
 
 <script src="popup.js"></script>

@@ -62,7 +62,7 @@ What it currently detects:
 
 Compares what each line item was actually charged against the product's **current** listed price — `admin.shopify.com/store/{handle}/products/{product_id}.json` works the same way the order `.json` trick does, and stays within the same `admin.shopify.com` permission already granted (no new host permission needed, unlike the earlier storefront-AJAX idea which would've required per-domain access to every client's public storefront).
 
-**Usage:** load an order, then click **Check current prices** in its own panel — this is a manual, on-demand action, not run automatically. Each unique product on the order is fetched once (deduped, in parallel), then each line item's `price` is compared against the matching variant's current `price`.
+**Usage:** load an order, then click **Check current prices** in its own panel — this is a manual, on-demand action, not run automatically. Each unique product on the order is fetched once (deduped, in parallel), then each line item's `price` is compared against the matching variant's current `price`. A progress bar and spinner track completion as each parallel fetch resolves (not strictly sequential order, since requests are in flight simultaneously), and the button disables itself while running.
 
 **Why this is on-demand, not automatic:**
 - It costs a separate network request per unique product on the order — fine for a deliberate check, wasteful to run on every single lookup
@@ -210,7 +210,101 @@ While a fetch is in flight (auto-detected order page, or clicking Fetch), the pa
 - Store handles for custom domains aren't auto-discoverable and must be added manually the first time
 - Not published to the Chrome Web Store — every user loads it as unpacked, and reinstalling/removing the extension clears its local config
 
+## BigCommerce diagnostics (beta)
+
+Unlike Shopify, there's no `.json`-equivalent trick for BigCommerce's admin — this is genuine HTML scraping via `DOMParser`, against two fetched endpoints per order:
+- `{sub}.mybigcommerce.com/admin/order/{id}/details` — line items, excise tax line item, shipping address, payment method
+- `{sub}.mybigcommerce.com/admin/index.php?searchId={id}&ToDo=viewOrders&orderFrom={id}&orderTo={id}` — the order-list search page, for reading verification status
+
+**Why HTML scraping is inherently more fragile than the Shopify side:** there's no schema. A class-name change on BigCommerce's end breaks parsing silently — no error, just wrong or missing data. Everything below was built and verified against real order HTML from **three different client stores** (VapeRanger, LightFire Holdings, Zuluvape), not guessed at from a single sample.
+
+### What TOT looks like on BigCommerce (no tag system exists here)
+
+BigCommerce has no order-tagging system like Shopify's `tot-*` tags. TOT's integration instead uses two different mechanisms, confirmed via direct internal documentation:
+
+- **Excise tax**: modeled as its own line-item *product* (SKU `TOT_EXCISE_TAX`, named `"{State} Excise Tax"`), added to the order like any other product — **not** a proper tax line the way Shopify's `tax_lines` work. BigCommerce's native "Tax" field in the order summary reflects only its own "Basic Tax" provider and is `$0.00` even on orders with a valid excise charge.
+- **Verification status**: a **custom order status** TOT provisions via API/webhook — `"Manual Verification Required"` — confirmed to exist with identical exact text at the same status-list position across all three stores checked, despite those same stores customizing *other* native statuses independently (e.g. one store renamed "Partially Shipped" to "Partially Shipped-Pre Order"). This is the functional equivalent of Shopify's `tot-not-verified`/`tot-rejected` tags, just implemented as a status value instead of a tag.
+
+There is **no BigCommerce equivalent** of Shopify's `tot-excise-tax-collected`/`-incorrect`/`-not-required` outcome tags — TOT's own guidance is that excise tax *correctness* (not just presence) is determined by manual reconciliation, not something the platform surfaces automatically. This tool checks **presence and jurisdiction**, not whether the dollar amount itself is correct.
+
+### Checks implemented (7 automatic + 1 on-demand — 8 of Shopify's 9, see Product & price check below for the 8th)
+
+1. **Order status** — flags `Manual Verification Required`, `Declined`, or `Disputed`; treats `Cancelled`/`Refunded`/`Partially Refunded` as informational context rather than a problem
+2. **Excise tax line item presence** — if present, shows the state and amount; if absent, cross-references your compliance sheet for the ship-to state and flags it if that state's entry has substantive excise tax detail
+3. **Jurisdiction match** — compares the state named in the excise line (`"NC Excise Tax"` → North Carolina) against the actual ship-to state, same concept as Shopify's tax jurisdiction check
+4. **Payment method** — same manual/COD/bogus gateway flag as Shopify
+5. **Address mismatch** — compares billing vs. shipping state, same as Shopify. Both addresses use the same free-text block format, so this reuses the same state-extraction logic — verified against real data with an actual mismatch (order 567097350: billing North Carolina, shipping Iowa)
+6. **Coupons / discounts** — detects shipping-level coupon codes (`.shipping-discount`, e.g. `"$32.98 off using AMVFREESHIPPING code"`). Only confirmed for shipping-level discounts — no confirmed example yet of how a product-level line-item discount renders, so those may not be caught
+7. **Cart size / SKU count** — sums quantity across line items (excluding the excise tax line itself) and flags unusually large carts, same thresholds as Shopify
+
+**Vendor / product specific** — listed as informational (brand names per order), not a flag-worthy check, same as its Shopify counterpart
+
+### Checks that don't have a BigCommerce equivalent — real data-model gaps, not unfinished work
+
+- **Order modification (refund records/amounts)** — order status already surfaces `Refunded`/`Partially Refunded` as a broad signal, but the granular refund line-items/amounts Shopify's `refunds` array provides aren't present in this endpoint's data.
+
+### Bulk scan (beta)
+
+Scans a range of BigCommerce order IDs, flagging only the ones worth a closer look — same idea as Shopify's bulk scan, but a genuinely different architecture underneath, since BigCommerce has no single endpoint that returns full order detail for many orders at once.
+
+**The key discovery that makes this possible:** the legacy admin's `admin/index.php?ToDo=viewOrders&orderFrom={min}&orderTo={max}` endpoint (the same one single-order status lookup already used) treats `orderFrom`/`orderTo` as a genuine **range filter**, not just a single-order lookup with redundant params — confirmed directly: fetching a 4-order range returned all four orders' `data-order-id` and status `<select>` elements in one response, not just one. This is separate from BigCommerce's newer `/manage/orders` admin UI, which is a client-side app shell with no data in the initial HTML at all (confirmed via a real fetch returning nothing but `<div id="root"></div>`) — that path is a dead end for `fetch()` regardless of query params, since the actual content only exists after JavaScript runs in a real browser.
+
+**Usage:** enter a range in the format `768170-768173` (a continuous range only — unlike Shopify's bulk scan, no comma-separated list support, since BigCommerce's range filter only accepts a from/to pair) and click **Scan for issues**.
+
+**Why it's slower than Shopify's bulk scan:** the range fetch only gives status — not excise tax lines, addresses, or anything else needed for real diagnostics. So this is a genuine N+1 pattern: one fetch for the range's statuses, then one more `/admin/order/{id}/details` fetch per matched order to run the full check suite. Sequential with a small delay between orders (same reasoning as Product & price check — keeps load on BigCommerce's servers reasonable, and keeps failures traceable in the console rather than a burst of simultaneous requests).
+
+**Known limitation:** capped at 100 orders per range fetch (no automatic pagination for larger ranges yet) — a range spanning more than 100 orders would silently only scan the first 100 returned.
+
+### Product & price check (beta) — closes most of the PMD gap, plus a BigCommerce Live Price Check
+
+Order HTML alone doesn't expose per-item taxability (that was the original PMD blocker) — but BigCommerce's internal catalog API does, once you can map a line item's SKU to its catalog product. It's on the same `.mybigcommerce.com` domain already covered by `host_permissions`.
+
+**Line-item SKUs on an order are often variant SKUs, not base product SKUs** — e.g. an order's line item might read `litty-thca-thcp-hd9-afblend-cart-1g-rainbow-cotton-candy`, while the actual product's SKU is `litty-thca-thcp-hd9-afblend-cart-1g` (the trailing segment is a flavor/variant suffix). The exact-match lookup (`internalapi/v1/catalog/products/?sku={sku}`) only searches base SKUs, so a variant SKU comes back as a genuine, honest zero results — confirmed via a real order's raw response (`total: 0, too_many: false`), not an error or a block. Two-tier resolution handles this:
+1. Try the exact SKU match first (works directly for non-variant products)
+2. If empty, fall back to `internalapi/v1/controlpanel/search?q={sku}` — BigCommerce's own fuzzy admin search, which can resolve a variant SKU back to its parent product and returns a numeric product ID directly. A **prefix-match safety check** (the order's SKU must start with the search result's base SKU) guards against trusting a fuzzy top-scoring match that's actually a different, similarly-named product.
+
+This powers two checks, run on-demand (network calls per unique product on the order, not automatic — and processed sequentially with a small delay rather than in parallel, since a large order can mean many unique products):
+
+- **`product_tax_code` presence** — the closest BigCommerce equivalent to PMD. Confirmed via real data: a product TOT HQ's dashboard shows as actually taxed had a non-empty code (`"SPTXKW03"`); a comparison product had it empty. **Important caveat, direct from internal knowledge**: an empty code doesn't necessarily mean a bug — it can also mean the product is genuinely non-taxable, or simply hasn't been configured in TOT yet. Same as Shopify's PMD check, this surfaces something worth a human look, not a definitive verdict.
+- **Live price check equivalent** — compares the order's charged unit price (line total ÷ quantity) against the product's current `calculated_price`/`price`. Same "only meaningful for same-day orders" caveat as the Shopify version applies here too.
+
+**What ruled out `tax_class_id` as the taxability signal, worth knowing:** it looked like a plausible candidate at first, but checking multiple real products — including one confirmed taxed via the TOT dashboard — showed it's `0` across the board regardless of tax status. A field that never varies can't discriminate between taxable and non-taxable, so it was dropped in favor of `product_tax_code`, which does vary in a way that matches real confirmed cases.
+
+**Still-open limitation:** the search-fallback path hasn't been tested against a case where it *should* fail safely — e.g. a genuinely nonexistent SKU, or a variant suffix that happens to also prefix-match some unrelated product. The prefix-match guard is a real safeguard, not a formal guarantee.
+
+**Price check likely false-positives on wholesale/B2B orders.** Observed directly on a real order billed to a wholesale-looking account ("Infinity Wholesale Group Inc"): charged price was consistently ~$8.75 against a listed price of $29.99 across two different product variants — a consistent ratio, not a random discrepancy, which looks like a genuine wholesale pricing tier rather than a bug. The `internalapi` endpoint's `price`/`calculated_price` fields reflect the public catalog listing; they have no visibility into customer-group-specific negotiated pricing that BigCommerce B2B stores commonly use. Treat price-mismatch flags on B2B/wholesale orders with extra skepticism.
+
+### Known fragility, being upfront about it
+
+- **Ship-to state extraction is genuinely fragile.** BigCommerce's shipping address is free text (`<br>`-separated lines), not a structured field like Shopify's `province_code`. The parser regex-matches a state name/abbreviation immediately before a ZIP code on the last address line — verified against all three real samples (including a multi-word state, "North Carolina," which an earlier version of this regex silently failed to catch — worth knowing that class of bug is possible here in ways it isn't on the Shopify side).
+- **Compliance sheet cross-reference only checks whether text exists in that state's excise column** — it does not parse or apply the tax formula itself (e.g. "45% of wholesale cost"), so it can't verify the *amount* is correct, only that a line item exists when one plausibly should.
+- **Only three stores' status vocabulary has been confirmed.** A store TOT hasn't fully provisioned the same way, or a status label that's been manually edited, wouldn't be caught.
+
+### Not implemented
+
+- Customer-level **TOT Excise Tax Exemption Start Date** field — lives on the customer record, not the order, so an exempt customer with no excise line would currently be flagged as a false positive
+- Actual excise tax **amount correctness** — would require parsing and applying each state's specific tax formula per product/quantity, a substantially bigger undertaking than presence/jurisdiction checking
+- Worth-flagging note format matches Shopify's
+
+## WooCommerce diagnostics (beta — 4 checks)
+
+Only two known clients so far (Vape Society Supply, Vape Depot USA), fetched by directly requesting the order-edit admin page and parsing WordPress's generic custom-fields ("postmeta") editor plus a few structured form fields — no free-text address parsing needed here, unlike BigCommerce.
+
+**Genuinely different from Shopify/BigCommerce in two ways:**
+1. **No shared platform suffix.** WooCommerce is self-hosted — each client runs on their own domain, so there's no `*.myshopify.com`-style wildcard. Every new client needs its own `host_permissions` entry added to `manifest.json` manually, and the extension reloaded. Manageable at 2 clients; would need a different approach (or accepting a longer permissions list) if this scales to many.
+2. **Two incompatible URL structures exist for the exact same feature.** Vape Society Supply uses the classic order-edit screen (`post.php?post={id}&action=edit`); Vape Depot USA uses WooCommerce's newer HPOS order storage (`admin.php?page=wc-orders&action=edit&id={id}`). Both were confirmed to expose identical underlying markup (custom-fields editor, address fields, payment method select) — only the fetch URL differs, so this is tracked per-domain in the Storefront config table (domain → `classic`/`hpos`), not auto-detected.
+
+### Checks implemented
+
+1. **Verification status** — reads the `tot_status` custom field. `isCleared` → OK. If the field is entirely absent *and* no related quarantine fields exist either, that store simply doesn't use this module (Info, not a problem) — confirmed via the excise-focused store, which has none of these fields at all. If quarantine-related fields (`tot_quarantined`, `tot_quarantine_manually_removed`) are present but `tot_status` isn't cleanly `isCleared`, it's flagged — confirmed against a real order that was quarantined then manually released by staff. **No confirmed example yet of a clean rejected/pending case** — the flag fires correctly regardless, but the detail shown is the raw fields rather than a specific "why," same honesty as BigCommerce's `product_tax_code` ambiguity.
+2. **Excise tax collected** — reads `totTaxCollected`. **Important finding from real data:** `exciseTaxStatus` itself does *not* distinguish collected vs. not-required — both read `RECONCILED` on two real orders from the same store, one with tax collected and one without. The actual signal is whether `totTaxCollected` is `0` or a real amount. When `$0`, cross-references the compliance sheet by ship-to state (same sheet/logic as Shopify and BigCommerce) to decide whether that's expected or worth a flag.
+3. **Address mismatch** — direct comparison of `_billing_state` vs. `_shipping_state` form field values. These are clean, structured `<input>` values on both classic and HPOS stores — no regex/free-text parsing needed, unlike BigCommerce's shipping address block.
+4. **Payment method** — reads the `_payment_method` `<select>`'s selected option (value + label), flags COD/other/unset gateways same as Shopify/BigCommerce.
+
+**Not yet built:** anything beyond these four — no cart size, no vendor/product listing, no coupons check. This is a first real pass on two clients, not a full port of Shopify's 9.
+
 ## Roadmap ideas
 
 - Export current storefront config as a ready-to-paste `DEFAULT_CONFIG` block
 - Package/sign for the Chrome Web Store (internal or unlisted) so teammates don't need Developer Mode
+- BigCommerce: exemption field support, bulk scan equivalent, and validating the status vocabulary against more client stores
