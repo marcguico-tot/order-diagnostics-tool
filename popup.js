@@ -333,7 +333,7 @@ async function getComplianceRows(url){
   if(!url) return {rows:null, error:null};
   if(complianceCache && complianceCache.url === url) return complianceCache;
   try{
-    const res = await fetch(url);
+    const res = await fetch(url, {credentials:'include'});
     if(!res.ok) throw new Error('HTTP ' + res.status);
     const text = await res.text();
     complianceCache = {url, rows: parseCSV(text), error:null};
@@ -347,8 +347,22 @@ function findComplianceRow(rows, order){
   if(!rows) return null;
   const ship = order.shipping_address;
   if(!ship) return null;
-  let stateName = ship.province;
-  if(!stateName && ship.province_code) stateName = STATE_ABBR_TO_NAME[ship.province_code.toUpperCase()];
+  // Try converting province_code to its canonical full name first (most reliable). If that's
+  // missing/empty, also try converting the free-text province field AS an abbreviation before
+  // assuming it's already a full name — some orders populate province with the 2-letter code
+  // itself rather than the full name, with province_code left empty. Only fall back to using
+  // province literally if neither conversion path applies. Confirmed as a real false-negative
+  // on a real order where the naive "province_code first, else province as-is" logic missed this.
+  let stateName = null;
+  if(ship.province_code && STATE_ABBR_TO_NAME[ship.province_code.toUpperCase()]){
+    stateName = STATE_ABBR_TO_NAME[ship.province_code.toUpperCase()];
+  } else if(ship.province && STATE_ABBR_TO_NAME[ship.province.toUpperCase()]){
+    stateName = STATE_ABBR_TO_NAME[ship.province.toUpperCase()];
+  } else if(ship.province){
+    stateName = ship.province;
+  } else if(ship.province_code){
+    stateName = ship.province_code;
+  }
   if(!stateName) return null;
   return findComplianceRowByStateName(rows, stateName);
 }

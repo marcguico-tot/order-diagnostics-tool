@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TOT Order Diagnostics Tool",
-  "version": "3.5.0",
+  "version": "3.6.1",
   "description": "Look up Shopify, BigCommerce, or WooCommerce orders directly and run excise tax troubleshooting checks. Shopify: 9 checks incl. TOT tags, PMD, tax jurisdiction match, live price check. BigCommerce (beta): verification status, excise tax line item, jurisdiction match. WooCommerce (step 1): order fetch + raw custom-field display, diagnostics not yet built.",
   "action": {
     "default_title": "Order Diagnostics Tool",
@@ -25,5 +25,5 @@
     "128": "icon128.png"
   },
   "permissions": ["storage", "sidePanel"],
-  "host_permissions": ["https://admin.shopify.com/*", "https://docs.google.com/*", "https://*.myshopify.com/*", "https://*.mybigcommerce.com/*", "https://vapesocietysupplies.com/*", "https://vapedepotusa.com/*"]
+  "host_permissions": ["https://admin.shopify.com/*", "https://docs.google.com/*", "https://*.googleusercontent.com/*", "https://*.myshopify.com/*", "https://*.mybigcommerce.com/*", "https://vapesocietysupplies.com/*", "https://vapedepotusa.com/*"]
 }
