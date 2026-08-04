@@ -334,10 +334,15 @@ async function getComplianceRows(url){
   if(complianceCache && complianceCache.url === url) return complianceCache;
   try{
     const res = await fetch(url, {credentials:'include'});
+    console.log('[TOT DEBUG] compliance fetch status:', res.status, res.url);
     if(!res.ok) throw new Error('HTTP ' + res.status);
     const text = await res.text();
-    complianceCache = {url, rows: parseCSV(text), error:null};
+    console.log('[TOT DEBUG] first 300 chars of response:', text.slice(0,300));
+    const parsedRows = parseCSV(text);
+    console.log('[TOT DEBUG] parsed row count:', parsedRows.length, 'row 2 (first data row):', parsedRows[2], 'row 53 (should be Wisconsin):', parsedRows[53]);
+    complianceCache = {url, rows: parsedRows, error:null};
   }catch(e){
+    console.log('[TOT DEBUG] fetch threw:', e);
     complianceCache = {url, rows:null, error: e.message || 'fetch failed'};
   }
   return complianceCache;
@@ -364,7 +369,10 @@ function findComplianceRow(rows, order){
     stateName = ship.province_code;
   }
   if(!stateName) return null;
-  return findComplianceRowByStateName(rows, stateName);
+  console.log('[TOT DEBUG] ship.province_code:', ship.province_code, 'ship.province:', ship.province, '-> resolved stateName:', stateName);
+  const result = findComplianceRowByStateName(rows, stateName);
+  console.log('[TOT DEBUG] match found?', !!result, result);
+  return result;
 }
 
 function findComplianceRowByStateName(rows, stateName){
@@ -516,7 +524,7 @@ function findWrongStateTaxLines(order){
   return {shipStateName, taxLineStates, wrongStateTaxLines};
 }
 
-function analyzeOrder(order, compliance){
+function analyzeOrder(order, compliance, walletType){
   const checks = [];
   const lineItems = order.line_items || [];
 
@@ -593,15 +601,22 @@ function analyzeOrder(order, compliance){
   });
 
   const gateways = order.payment_gateway_names || [];
+  const gatewayText = gateways.join(', ');
   const unusual = gateways.some(g => ['manual','cash on delivery (cod)','bogus','free'].includes((g||'').toLowerCase()));
+  const expressWalletNames = {google_pay:'Google Pay', apple_pay:'Apple Pay', shopify_pay:'Shop Pay'};
+  const expressWallet = walletType && expressWalletNames[walletType];
   checks.push({
     label:'Payment method',
-    status: gateways.length===0 ? 'info' : (unusual ? 'flag' : 'ok'),
+    status: gateways.length===0 ? 'info' : (expressWallet ? 'flag' : (unusual ? 'flag' : 'ok')),
     summary: gateways.length===0 ? 'No payment gateway recorded on the order'
-      : unusual ? `Non-standard gateway: ${gateways.join(', ')}`
-      : `Gateway: ${gateways.join(', ')}`,
-    detail: unusual ? 'Manual / COD / bogus gateways sometimes bypass the checkout flow that triggers the tax app.' : null
+      : expressWallet ? `Express payment detected: ${expressWallet} (via ${gatewayText})`
+      : unusual ? `Non-standard gateway: ${gatewayText}`
+      : `Gateway: ${gatewayText}`,
+    detail: expressWallet
+      ? 'Confirmed root cause (2026-08-03, BV147374): express payment methods (Google Pay, Apple Pay) bypass the standard Shopify checkout process, which is what the excise tax app hooks into. Orders paid this way calculate tax correctly but the tax app never gets the chance to add it to the collected total. Recommend the merchant disable express payment methods, or flag to dev for a fix on the tax app side. (Wallet type read from the order\'s Transactions API — payment_details.credit_card_wallet — not from payment_gateway_names, which only shows the processor, e.g. "authorize.net", regardless of wallet used.)'
+      : unusual ? 'Manual / COD / bogus gateways sometimes bypass the checkout flow that triggers the tax app.' : null
   });
+
 
   const state = ship ? (ship.province_code || ship.province) : null;
   let stateCheck;
@@ -715,7 +730,7 @@ function generateAutoNotes(order){
   const {verification, excise} = parseTotTags(order);
 
   if(excise === 'incorrect'){
-    notes.push({level:'flag', text:'Excise tax incorrect (tot-excise-tax-incorrect tag)'});
+    notes.push({level:'flag', text:'Not charged', isExciseIncorrect:true});
   }
   if(verification === 'rejected'){
     notes.push({level:'flag', text:'TOT verification rejected — do not fulfill'});
@@ -775,8 +790,20 @@ function renderAutoNotes(order){
   const hasFlag = notes.some(n=>n.level==='flag');
   const emoji = hasFlag ? ':bangbang:' : ':+1:';
   const orderRef = order.order_number || order.name || order.id || '';
-  const noteText = ' - ' + notes.map(n=>n.text).join(' - ');
-  lineEl.value = `${orderRef}: Status: [${emoji}]${noteText}`;
+  const exciseNote = notes.find(n=>n.isExciseIncorrect);
+  const otherNotes = notes.filter(n=>!n.isExciseIncorrect);
+  let mainLine;
+  if(exciseNote){
+    // $ amount: collected tax is known (order.current_total_tax); the actual amount OWED
+    // requires the HQ excise calculator (separate origin/auth, not wired in yet) — using
+    // "$?.??" as an explicit placeholder rather than guessing a number.
+    const collected = order.current_total_tax != null ? `$${order.current_total_tax}` : '$?.??';
+    mainLine = `${orderRef} - ${collected} - Not charged`;
+  } else {
+    mainLine = `${orderRef}${otherNotes.length ? ' - ' + otherNotes.map(n=>n.text).join(' - ') : ''}`;
+  }
+  const trailingBullets = (exciseNote ? otherNotes : []).map(n=>`\n - ${n.text}`).join('');
+  lineEl.value = `Status: [${emoji}] ${mainLine}${trailingBullets}`;
 }
 
 document.getElementById('copyNoteBtn').addEventListener('click', async ()=>{
@@ -1074,6 +1101,23 @@ function renderDiagnostics(checks){
 
 let currentOrderData = null;
 
+async function fetchWalletType(handle, orderId){
+  try{
+    const url = `https://admin.shopify.com/store/${handle}/orders/${orderId}/transactions.json`;
+    const res = await fetch(url, {credentials:'include'});
+    if(!res.ok) return null;
+    const data = await res.json();
+    const txs = data.transactions || [];
+    // Prefer a successful sale transaction with wallet info; wallet type lives in
+    // payment_details.credit_card_wallet (e.g. "google_pay", "apple_pay", "shopify_pay").
+    // Confirmed against a real transactions.json response for BV147374 (2026-08-04).
+    const withWallet = txs.find(t => t.payment_details && t.payment_details.credit_card_wallet);
+    return withWallet ? withWallet.payment_details.credit_card_wallet : null;
+  }catch(e){
+    return null; // Non-fatal — payment method check just falls back to gateway-only info.
+  }
+}
+
 async function handleOrderData(order, opts){
   currentOrderData = order;
   document.getElementById('jsonPanel').style.display = 'block';
@@ -1083,8 +1127,10 @@ async function handleOrderData(order, opts){
 
   const sheetUrl = document.getElementById('sheetUrl').value.trim();
   const compliance = sheetUrl ? await getComplianceRows(sheetUrl) : null;
+  const handle = currentStoreHandle();
+  const walletType = (handle && order.id) ? await fetchWalletType(handle, order.id) : null;
   renderTotStatus(order);
-  renderDiagnostics(analyzeOrder(order, compliance));
+  renderDiagnostics(analyzeOrder(order, compliance, walletType));
   renderAutoNotes(order);
   resetLivePriceCheck();
 
