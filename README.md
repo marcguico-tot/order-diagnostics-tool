@@ -1,8 +1,8 @@
 # Order Diagnostics Tool
 
-A Chrome extension for Token of Trust ops/support that pulls a Shopify order's raw JSON directly from `admin.shopify.com` and checks it against the usual reasons excise tax fails to calculate.
+A Chrome extension for Token of Trust ops/support that pulls an order's data directly from the platform admin and checks it against the usual reasons excise tax fails to calculate.
 
-Shopify only, for now — BigCommerce and WordPress storefronts aren't supported.
+**Shopify** is the primary, most complete platform: pulls the order's raw JSON directly from `admin.shopify.com`, runs 9 diagnostic checks (plus 3 conditional ones) per order, and supports bulk scanning plus a separate HQ-side excise tax scan (see below). **BigCommerce** and **WooCommerce** (WordPress) are both supported too, in beta, with a smaller check set built against real client stores on each platform — see their own sections further down for exactly what's covered, what isn't yet, and the known fragility on each.
 
 ## TOT status (ground truth, from order tags)
 
