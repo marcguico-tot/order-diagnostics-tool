@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
   "name": "TOT Order Diagnostics Tool",
-  "version": "3.6.1",
-  "description": "Look up Shopify, BigCommerce, or WooCommerce orders directly and run excise tax troubleshooting checks. Shopify: 9 checks incl. TOT tags, PMD, tax jurisdiction match, live price check. BigCommerce (beta): verification status, excise tax line item, jurisdiction match. WooCommerce (step 1): order fetch + raw custom-field display, diagnostics not yet built.",
+  "version": "3.10.0",
+  "version_name": "3.10.0-proposed (HQ Excise Tax scan draft)",
+  "description": "Look up Shopify, BigCommerce, or WooCommerce orders directly and run excise tax troubleshooting checks. Shopify: 9 checks incl. TOT tags, PMD, tax jurisdiction match, live price check, plus 2 conditional checks (excise vs. compliance sheet, Net 30/B2B payment terms). BigCommerce (beta): verification status, excise tax line item incl. jurisdiction/compliance cross-check, payment/address/coupon/cart checks. WooCommerce (step 1): order fetch + raw custom-field display, diagnostics not yet built. HQ Excise Tax scan (proposed): automates the Active Monitoring order sweep against the internal Excise Tax Order API across multiple client orgs.",
   "action": {
     "default_title": "Order Diagnostics Tool",
     "default_icon": {
@@ -24,6 +25,6 @@
     "48": "icon48.png",
     "128": "icon128.png"
   },
-  "permissions": ["storage", "sidePanel"],
-  "host_permissions": ["https://admin.shopify.com/*", "https://docs.google.com/*", "https://*.googleusercontent.com/*", "https://*.myshopify.com/*", "https://*.mybigcommerce.com/*", "https://vapesocietysupplies.com/*", "https://vapedepotusa.com/*"]
+  "permissions": ["storage", "sidePanel", "scripting", "tabs"],
+  "host_permissions": ["https://admin.shopify.com/*", "https://docs.google.com/*", "https://*.googleusercontent.com/*", "https://*.myshopify.com/*", "https://*.mybigcommerce.com/*", "https://vapesocietysupplies.com/*", "https://vapedepotusa.com/*", "https://app.tokenoftrust.com/*"]
 }

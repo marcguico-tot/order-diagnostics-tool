@@ -390,6 +390,24 @@ function setStatus(msg, type){
   el.className = 'status-line show' + (type ? ' '+type : '');
 }
 
+// Gives immediate feedback right on the button that was clicked (label flips to
+// "Copied ✓" for a moment) instead of relying solely on a status line that may be
+// scrolled out of view — e.g. #fetchStatus sits near the top of the panel, far from
+// the Order JSON section's Copy button further down.
+function flashCopied(btn, label){
+  if(!btn) return;
+  if(btn._copyTimeout) clearTimeout(btn._copyTimeout);
+  if(!btn.dataset.originalLabel) btn.dataset.originalLabel = btn.textContent;
+  btn.textContent = label || 'Copied ✓';
+  btn.classList.add('copied');
+  btn.disabled = true;
+  btn._copyTimeout = setTimeout(()=>{
+    btn.textContent = btn.dataset.originalLabel;
+    btn.classList.remove('copied');
+    btn.disabled = false;
+  }, 1400);
+}
+
 function skeletonRows(count, widths){
   let html = '';
   for(let i=0;i<count;i++){
@@ -436,10 +454,12 @@ document.getElementById('analyzePastedBtn').addEventListener('click', async ()=>
   }
 });
 
-document.getElementById('copyJsonBtn').addEventListener('click', async ()=>{
+document.getElementById('copyJsonBtn').addEventListener('click', async (evt)=>{
   if(!currentOrderData){ setStatus('No order loaded yet.', 'err'); return; }
+  const btn = evt.currentTarget; // capture before the await — currentTarget is null once dispatch finishes
   try{
     await navigator.clipboard.writeText(JSON.stringify(currentOrderData, null, 2));
+    flashCopied(btn);
     setStatus('Copied order JSON to clipboard.', 'ok');
   }catch(e){
     setStatus('Could not copy automatically — select the text in the JSON panel and copy manually.', 'err');
@@ -543,6 +563,21 @@ function analyzeOrder(order, compliance, walletType){
       : null
   });
 
+  const exciseLines = lineItems.filter(li => (li.sku||'').startsWith('TOT_TAXLINE_'));
+  if(exciseLines.length > 1){
+    checks.push({
+      label:'Duplicate excise tax line items',
+      status:'flag',
+      summary:`${exciseLines.length} separate "Excise Taxes" line items found (expected 1)`,
+      detail: 'Confirmed root cause (GV143343, dev ticket "Double taxing of orders when customer logs in during checkout"): '
+        + 'if a customer logs into their Shopify account mid-checkout after tax was already calculated, a new cart token is '
+        + 'generated and the tax app can\'t find the original excise line, so it adds a second one. Look for a refund/adjustment '
+        + 'correcting the duplicate — but note the correcting refund transaction can itself fail (e.g. "Partial refunds are not '
+        + 'allowed until the transaction is settled"), so don\'t assume it\'s resolved just because an adjustment exists.\n'
+        + exciseLines.map(li=>`• ${li.title} — $${li.price} (SKU ${li.sku}, fulfillment_status: ${li.fulfillment_status||'null'})`).join('\n')
+    });
+  }
+
   const relevantItems = lineItems.filter(li=>!isAncillaryLineItem(li));
   const untaxed = relevantItems.filter(li => li.taxable === false || !li.tax_lines || li.tax_lines.length===0);
   checks.push({
@@ -555,6 +590,28 @@ function analyzeOrder(order, compliance, walletType){
       ? untaxed.map(li=>`• ${li.title}  (SKU ${li.sku||'n/a'}, product_id ${li.product_id})\n   taxable: ${li.taxable}, tax_lines: ${(li.tax_lines||[]).length}`).join('\n')
       : null
   });
+
+  // Tax exemption flag — surfaces order.tax_exempt (and customer.tax_exempt, if present)
+  // directly. Informational only: originally added as a flag on the hypothesis that TOT's
+  // excise tax engine might key off this same Shopify field to decide whether to skip excise tax.
+  // That hypothesis was tested and disproven on order MMS1099 (2026-08-06) — TOT's own HQ
+  // excise-tax-calculator trace showed customerExemption.isExempt: false (correctly determined,
+  // independently of Shopify) even though this Shopify customer had tax_exempt: true, and TOT
+  // still correctly calculated $40.26 owed. So Shopify's tax_exempt and TOT's own excise
+  // exemption tracking are separate, unrelated fields — this flag being true doesn't predict or
+  // explain an excise tax miss. Kept visible since it's still a real, occasionally-useful fact
+  // about the customer/order (e.g. for native sales-tax troubleshooting), just not evidence of
+  // this class of bug.
+  const orderTaxExempt = order.tax_exempt === true;
+  const customerTaxExempt = !!(order.customer && order.customer.tax_exempt === true);
+  if(orderTaxExempt || customerTaxExempt){
+    checks.push({
+      label:'Tax exemption flag',
+      status:'info',
+      summary: orderTaxExempt ? 'order.tax_exempt is true on this order' : "Customer is marked tax_exempt (order.tax_exempt itself is false/absent)",
+      detail: `This is Shopify's own tax_exempt field, unrelated to TOT's excise tax exemption tracking — confirmed independent on order MMS1099 (2026-08-06), where TOT's HQ excise-tax-calculator trace showed customerExemption.isExempt: false (correctly, and used in a correct $40.26 calculation) despite this same Shopify flag being true. Shown here as a fact about the customer/order, not as an explanation for a missed excise tax.\norder.tax_exempt: ${order.tax_exempt}, customer.tax_exempt: ${order.customer ? order.customer.tax_exempt : 'n/a (no customer object)'}`
+    });
+  }
 
   const editedItems = lineItems.filter(li => li.current_quantity !== undefined && li.current_quantity !== li.quantity);
   const refunds = order.refunds || [];
@@ -600,15 +657,59 @@ function analyzeOrder(order, compliance, walletType){
       : null
   });
 
+  // Excise tax vs. compliance sheet — catches wrong-state geocoding on TOT's *excise* tax
+  // specifically (separate from the native tax_lines check above, since TOT's injected
+  // TOT_TAXLINE_ line item doesn't encode a state name in its title the way "___ State Tax"
+  // does). Works backward from ground truth: does the ship-to state's compliance-sheet entry
+  // say excise tax applies at all, versus whether excise tax was actually charged.
+  //
+  // Confirmed real-world case this would have caught: vaperanger.com order 567097775 (ship-to
+  // Holden, MO) was charged $217.52 in Massachusetts excise tax; Missouri has no excise tax
+  // requirement. Root cause per dev (Charlie, 2026-08-05): TOT's api/exciseTax/calculate
+  // endpoint ignores `postalCode` entirely when the request has no `stateCode`, and geocodes
+  // off street + city alone — landing in the wrong state. That request payload isn't visible
+  // in the Shopify order JSON (the order's own shipping_address was correct throughout), so this
+  // check can't detect the bug's trigger directly. It instead flags the downstream symptom —
+  // excise tax charged where the ship-to state's compliance entry says none should apply —
+  // which would catch this regardless of root cause, including future regressions.
+  //
+  // Not run during bulk scan, same as "State-specific rate config" above (would mean fetching
+  // the compliance sheet per-order there) — this is single-order diagnostics only.
+  const exciseLineTotal = exciseLines.reduce((s,li)=>s + num(li.price) * (li.quantity||1), 0);
+  let exciseComplianceCheck = null;
+  if(exciseLineTotal > 0){
+    if(!shipStateName){
+      exciseComplianceCheck = { label:'Excise tax vs. compliance sheet', status:'info', summary:`$${exciseLineTotal.toFixed(2)} excise tax charged, but no ship-to state to check it against`, detail:null };
+    } else if(!compliance || (!compliance.rows && !compliance.error)){
+      exciseComplianceCheck = { label:'Excise tax vs. compliance sheet', status:'info', summary:`$${exciseLineTotal.toFixed(2)} excise tax charged to ${shipStateName} — add a compliance sheet CSV URL below to auto-check`, detail:null };
+    } else if(compliance.error){
+      exciseComplianceCheck = { label:'Excise tax vs. compliance sheet', status:'info', summary:`$${exciseLineTotal.toFixed(2)} excise tax charged to ${shipStateName} — couldn't load compliance sheet to verify`, detail:null };
+    } else {
+      const complianceMatch = findComplianceRowByStateName(compliance.rows, shipStateName);
+      const hasExciseRequirement = !!(complianceMatch && (complianceMatch[9]||'').trim());
+      exciseComplianceCheck = hasExciseRequirement
+        ? { label:'Excise tax vs. compliance sheet', status:'ok', summary:`$${exciseLineTotal.toFixed(2)} excise tax charged — ${shipStateName} does have an excise tax requirement on file`, detail:null }
+        : {
+            label:'Excise tax vs. compliance sheet',
+            status:'flag',
+            summary:`$${exciseLineTotal.toFixed(2)} excise tax charged, but ${shipStateName} has no excise tax requirement per the compliance sheet`,
+            detail:`Same failure signature as the confirmed vaperanger.com MO/MA incident (order 567097775, 2026-08-05) — wrong-state tax resolution, not a coupon or PMD issue. The excise line item's title doesn't say which state it actually calculated for, so confirm by hand which state this amount corresponds to elsewhere in the PACT & Excise sheet.\nShip-to: ${[ship.address1, ship.city, ship.province_code, ship.zip].filter(Boolean).join(', ')}`
+          };
+    }
+  }
+  if(exciseComplianceCheck) checks.push(exciseComplianceCheck);
+
   const gateways = order.payment_gateway_names || [];
   const gatewayText = gateways.join(', ');
   const unusual = gateways.some(g => ['manual','cash on delivery (cod)','bogus','free'].includes((g||'').toLowerCase()));
   const expressWalletNames = {google_pay:'Google Pay', apple_pay:'Apple Pay', shopify_pay:'Shop Pay'};
   const expressWallet = walletType && expressWalletNames[walletType];
+  const paymentTerms = order.payment_terms || null; // Shopify B2B/Companies deferred-payment orders (e.g. Net 30) carry this instead of/alongside a gateway
   checks.push({
     label:'Payment method',
     status: gateways.length===0 ? 'info' : (expressWallet ? 'flag' : (unusual ? 'flag' : 'ok')),
-    summary: gateways.length===0 ? 'No payment gateway recorded on the order'
+    summary: gateways.length===0
+      ? (paymentTerms ? `No payment gateway recorded — expected for a deferred-payment (${paymentTerms.payment_terms_name || paymentTerms.payment_terms_type || 'net terms'}) order, see Payment terms check below` : 'No payment gateway recorded on the order')
       : expressWallet ? `Express payment detected: ${expressWallet} (via ${gatewayText})`
       : unusual ? `Non-standard gateway: ${gatewayText}`
       : `Gateway: ${gatewayText}`,
@@ -616,6 +717,27 @@ function analyzeOrder(order, compliance, walletType){
       ? 'Confirmed root cause (2026-08-03, BV147374): express payment methods (Google Pay, Apple Pay) bypass the standard Shopify checkout process, which is what the excise tax app hooks into. Orders paid this way calculate tax correctly but the tax app never gets the chance to add it to the collected total. Recommend the merchant disable express payment methods, or flag to dev for a fix on the tax app side. (Wallet type read from the order\'s Transactions API — payment_details.credit_card_wallet — not from payment_gateway_names, which only shows the processor, e.g. "authorize.net", regardless of wallet used.)'
       : unusual ? 'Manual / COD / bogus gateways sometimes bypass the checkout flow that triggers the tax app.' : null
   });
+
+  // Payment terms (Net 30 / B2B) — conditional, only appears when the order actually carries
+  // Shopify's payment_terms object (Shopify Companies / B2B deferred-payment orders). This is a
+  // genuinely different field than payment_gateway_names above and wasn't previously surfaced by
+  // this tool at all, even though it's visible in the front-end (the order's Timeline shows
+  // "New payment terms were added to this order" with the term name, e.g. Net 30).
+  //
+  // Deliberately informational, not a flag: dev has directly replicated the Net 30 + Shopify
+  // Companies + "Login as Customer" workflow in testing and gotten correct excise tax calculation
+  // every time (2026-08-06) — so Net 30 by itself is not a confirmed cause of missed excise tax.
+  // This exists for correlation/visibility (e.g. cross-referencing against the open wholesale/B2B
+  // transactionType pattern) so the "was this a Net 30 order" question never again requires a
+  // separate manual look at the order timeline.
+  if(paymentTerms){
+    checks.push({
+      label:'Payment terms (Net 30 / B2B)',
+      status:'info',
+      summary:`${paymentTerms.payment_terms_name || paymentTerms.payment_terms_type || 'Deferred payment terms'} on this order${paymentTerms.due_in_days!=null ? ` — due ${paymentTerms.due_in_days} days from issue` : ''}`,
+      detail:`This is a Shopify Companies / B2B order with deferred payment terms, not a standard checkout. Net 30 alone has been tested and ruled out as a standalone cause of missed excise tax (dev replicated the full Net 30 + Login-as-Customer workflow, 2026-08-06, and tax calculated correctly both times) — shown here for correlation tracking, not as a confirmed root cause.\nRaw payment_terms: ${JSON.stringify(paymentTerms)}`
+    });
+  }
 
 
   const state = ship ? (ship.province_code || ship.province) : null;
@@ -716,15 +838,23 @@ function renderTotStatus(order){
   const vMeta = VERIFICATION_META[verification];
   const eMeta = EXCISE_META[excise];
 
+  const exciseLineCount = (order.line_items||[]).filter(li => (li.sku||'').startsWith('TOT_TAXLINE_')).length;
+  const dupeWarning = exciseLineCount > 1
+    ? `\n    <div class=\"diag-summary\" style=\"padding:3px 0;display:flex;align-items:center;gap:8px;\">
+      <span class=\"badge flag\">${badgeLabel('flag')}</span>
+      <span><strong>Taxed twice:</strong> ${exciseLineCount} separate excise tax line items found on this order — see "Duplicate excise tax line items" below.</span>
+    </div>`
+    : '';
+
   const row = (label, meta) => `
     <div class="diag-summary" style="padding:3px 0;display:flex;align-items:center;gap:8px;">
       <span class="badge ${meta.status}">${badgeLabel(meta.status)}</span>
       <span><strong>${label}:</strong> ${meta.text}</span>
     </div>`;
-  list.innerHTML = row('Verification', vMeta) + row('Excise tax', eMeta);
+  list.innerHTML = row('Verification', vMeta) + row('Excise tax', eMeta) + dupeWarning;
 }
 
-function generateAutoNotes(order){
+function generateAutoNotes(order, compliance){
   const lineItems = order.line_items || [];
   const notes = []; // {level:'flag'|'info', text}
   const {verification, excise} = parseTotTags(order);
@@ -744,9 +874,30 @@ function generateAutoNotes(order){
     notes.push({level:'flag', text:`Missing PMD on ${untaxed.length} item(s): ${untaxed.map(li=>li.title).join(', ')}`});
   }
 
+  // Note: a tax_exempt-based note used to appear here. Removed — confirmed on order MMS1099
+  // (2026-08-06) that Shopify's tax_exempt field is unrelated to TOT's own excise exemption
+  // tracking, so it isn't evidence of an excise tax problem and doesn't belong in the
+  // action-oriented "Worth flagging" note. Still visible, correctly downgraded to info, in the
+  // Tax exemption flag diagnostics check above for anyone reviewing the full order.
+
   const {wrongStateTaxLines, shipStateName} = findWrongStateTaxLines(order);
   if(wrongStateTaxLines.length){
     notes.push({level:'flag', text:`Tax calculated for ${wrongStateTaxLines.join(', ')} but ships to ${shipStateName} — check for a city/place name collision`});
+  }
+
+  // Only checked when a compliance object is passed in — bulk scan intentionally skips this
+  // (same documented limitation as the "State-specific rate config" diagnostics check, which
+  // would mean re-fetching/matching the CSV per order). Single-order view passes it.
+  if(compliance && compliance.rows && shipStateName){
+    const exciseLinesForNotes = lineItems.filter(li => (li.sku||'').startsWith('TOT_TAXLINE_'));
+    const exciseLineTotalForNotes = exciseLinesForNotes.reduce((s,li)=>s+num(li.price)*(li.quantity||1), 0);
+    if(exciseLineTotalForNotes > 0){
+      const complianceMatch = findComplianceRowByStateName(compliance.rows, shipStateName);
+      const hasExciseRequirement = !!(complianceMatch && (complianceMatch[9]||'').trim());
+      if(!hasExciseRequirement){
+        notes.push({level:'flag', text:`$${exciseLineTotalForNotes.toFixed(2)} excise tax charged, but ${shipStateName} has no excise tax requirement on file — same signature as the confirmed vaperanger.com MO/MA wrong-state incident (order 567097775)`});
+      }
+    }
   }
 
   const gateways = (order.payment_gateway_names || []).map(g=>(g||'').toLowerCase());
@@ -757,6 +908,13 @@ function generateAutoNotes(order){
     notes.push({level:'info', text:'Store credit used as (part of) payment'});
   }
 
+  // Informational only — Net 30 alone has been tested and ruled out as a standalone cause of
+  // missed excise tax (dev replicated Net 30 + Login-as-Customer, 2026-08-06, tax calculated
+  // correctly). Surfaced for quick correlation against the wholesale/B2B pattern, not a verdict.
+  if(order.payment_terms){
+    notes.push({level:'info', text:`${order.payment_terms.payment_terms_name || order.payment_terms.payment_terms_type || 'Deferred payment terms'} order (Shopify Companies / B2B)`});
+  }
+
   const refunds = order.refunds || [];
   if(refunds.length){
     notes.push({level:'info', text:`${refunds.length} refund(s) on record`});
@@ -765,8 +923,8 @@ function generateAutoNotes(order){
   return notes;
 }
 
-function renderAutoNotes(order){
-  const notes = generateAutoNotes(order);
+function renderAutoNotes(order, compliance){
+  const notes = generateAutoNotes(order, compliance);
   const panel = document.getElementById('notesPanel');
 
   if(!notes.length){
@@ -1131,7 +1289,7 @@ async function handleOrderData(order, opts){
   const walletType = (handle && order.id) ? await fetchWalletType(handle, order.id) : null;
   renderTotStatus(order);
   renderDiagnostics(analyzeOrder(order, compliance, walletType));
-  renderAutoNotes(order);
+  renderAutoNotes(order, compliance);
   resetLivePriceCheck();
 
   if(!(opts && opts.skipPersist)){
@@ -1409,13 +1567,42 @@ function bcAnalyze(parsed, statusText, compliance){
   });
 
   if(parsed.exciseItem){
+    // Was previously always status:'ok' here even when the excise line's own title named a
+    // different state than ship-to — the mismatch only showed up in the detail text, easy to
+    // miss without expanding the row. Now actually flags it, same severity as Shopify's Tax
+    // jurisdiction match check.
+    const jurisdictionMismatch = !!(parsed.exciseState && parsed.shipState && parsed.exciseState !== parsed.shipState);
+
+    // Second, independent check: even when the excise line's title matches ship-to (or the
+    // title didn't parse to a state at all), confirm against the compliance sheet that ship-to
+    // even requires excise tax. Catches the case where the wrong-state resolution corrupted the
+    // whole line item (title included), not just a title/ship-to naming mismatch — same failure
+    // signature as the confirmed vaperanger.com MO/MA incident (order 567097775, 2026-08-05):
+    // TOT's api/exciseTax/calculate endpoint ignored postalCode when stateCode was missing on
+    // the request and geocoded off street+city alone. That request payload isn't visible here
+    // either, so this works backward from the compliance sheet like the Shopify equivalent does.
+    let complianceMismatch = false, complianceDetail = null;
+    if(!jurisdictionMismatch && parsed.shipState && compliance && compliance.rows){
+      const complianceRow = findComplianceRowByStateName(compliance.rows, parsed.shipState);
+      const exciseText = complianceRow ? (complianceRow[9]||'').trim() : null;
+      const looksLikeExciseRequired = exciseText && !/^(n\/a|none|no excise)/i.test(exciseText);
+      if(!looksLikeExciseRequired){
+        complianceMismatch = true;
+        complianceDetail = `Ships to ${parsed.shipState}, which has no excise tax requirement per the compliance sheet, but an excise line item (${parsed.exciseItem.total}) was charged. Same failure signature as the confirmed vaperanger.com MO/MA incident (order 567097775, 2026-08-05) — wrong-state tax resolution, not a coupon or PMD issue.`;
+      }
+    }
+
     checks.push({
       label: 'Excise tax line item',
-      status: 'ok',
-      summary: `Present: ${parsed.exciseItem.name} — ${parsed.exciseItem.total}`,
-      detail: parsed.exciseState && parsed.shipState && parsed.exciseState !== parsed.shipState
+      status: (jurisdictionMismatch || complianceMismatch) ? 'flag' : 'ok',
+      summary: jurisdictionMismatch
+        ? `Present: ${parsed.exciseItem.name} — ${parsed.exciseItem.total}, but ships to ${parsed.shipState}`
+        : complianceMismatch
+        ? `Present: ${parsed.exciseItem.name} — ${parsed.exciseItem.total}, but ${parsed.shipState} has no excise tax requirement per the compliance sheet`
+        : `Present: ${parsed.exciseItem.name} — ${parsed.exciseItem.total}`,
+      detail: jurisdictionMismatch
         ? `Ships to ${parsed.shipState}, but excise line is for ${parsed.exciseState} — possible jurisdiction mismatch, same pattern as Shopify's city/state name collisions.`
-        : null
+        : complianceMismatch ? complianceDetail : null
     });
   } else {
     const complianceRow = compliance && compliance.rows && parsed.shipState
@@ -2313,9 +2500,912 @@ function switchPlatformTab(platform){
   document.getElementById('platformShopify').classList.toggle('active', platform === 'shopify');
   document.getElementById('platformBigCommerce').classList.toggle('active', platform === 'bigcommerce');
   document.getElementById('platformWooCommerce').classList.toggle('active', platform === 'woocommerce');
+  document.getElementById('platformHQ').classList.toggle('active', platform === 'hq');
 }
 document.querySelectorAll('.platform-tab').forEach(btn=>{
   btn.addEventListener('click', ()=> switchPlatformTab(btn.dataset.platform));
 });
 
 init();
+
+// =====================================================================
+// HQ Excise Tax scan (PROPOSED — see README "HQ Excise Tax scan" section)
+// =====================================================================
+// Automates the manual Active Monitoring sweep: for each org in the queue,
+// drive a real HQ tab through "Choose App Domain" -> API docs -> mint a
+// fresh Try-It-Now token -> verify it's scoped to the right org -> pull
+// recent orders and flag the wholesale error.incorrectCollection mismatch
+// pattern (excise tax owed but exciseTaxCollected === "0").
+//
+// This intentionally does NOT try to call the Excise Tax Order API directly
+// from this side panel via fetch(). Selecting an org in "Choose App Domain"
+// and minting a token on the API docs page both happen through in-page app
+// state (a Vue Select component's internal state, and an in-page token-mint
+// flow) that isn't exposed as a documented, callable endpoint we've found —
+// so this drives the real pages via chrome.scripting.executeScript instead,
+// exactly like a person clicking through would, just automated.
+//
+// Needs "scripting" + "tabs" permissions and https://app.tokenoftrust.com/*
+// in host_permissions (see manifest.json) — new capability classes for this
+// extension, flagged for deliberate review rather than silently added.
+
+const HQ_QUEUE_KEY = 'totHqQueue';
+const HQ_RESULTS_KEY = 'totHqResults';
+const HQ_DOMAINS_KEY = 'totHqDomains';
+const HQ_RATE_DIRECTORY_KEY = 'totHqRateDirectory'; // learned tax-rate-per-jurisdiction+SKU-type directory — see overcharge $ estimate, 2026-08-20
+const HQ_SCAN_HOURS = 24; // fixed — "last N hours" mode always means the last 24h, not a typed number
+const HQ_ORIGIN = 'https://app.tokenoftrust.com';
+
+// Known HQ "Choose App Domain" org names — confirmed exact spellings from
+// today's session. Note some of these differ from the Shopify storefront
+// config elsewhere in this extension (e.g. bigdvapor.net here vs
+// bigdvapor.com in the Shopify config) — HQ's app domain and a store's public
+// storefront domain aren't always the same string, so this is kept as its
+// own list rather than reusing DEFAULT_CONFIG. Manage via "Known domains"
+// below the queue table.
+const HQ_DEFAULT_DOMAINS = [
+  'justcbdstore.com',
+  'thevaporsupplier.com',
+  'thevaporshoppeusa.com',
+  'bigdvapor.net',
+  'fistdistro.com',
+  'fullsend.com',
+  'vapedepotusa.com',
+  'alternativepods.com',
+  'zuluvape.com',
+  'giantvapes.com',
+  'kangerwholesaleusa.com',
+  'mmschainportal.com',
+  'vaperanger.com',
+  'vapesocietysupplies.com',
+];
+
+// Seeded from the Active Monitoring list orgs still pending a re-check as of
+// today's session — edit freely, this is just a starting point.
+const HQ_DEFAULT_QUEUE = [
+  { domain: 'thevaporshoppeusa.com', idStart: 100694, idEnd: 100715 },
+  { domain: 'vapedepotusa.com', idStart: 29032, idEnd: 29033 },
+  { domain: 'alternativepods.com', idStart: 303497, idEnd: 303525 },
+  { domain: 'zuluvape.com', idStart: 408147, idEnd: 408190 },
+  { domain: 'giantvapes.com', idStart: 157401, idEnd: 157456 },
+  { domain: 'kangerwholesaleusa.com', idStart: 770485, idEnd: 770572 },
+];
+
+let HQ_QUEUE = [];
+let HQ_RESULTS = [];
+let HQ_DOMAINS = [];
+let HQ_RUN_STATE = 'idle'; // idle | running | paused-login | stopped
+let HQ_TAB_ID = null;
+
+async function loadHqQueue() {
+  const stored = await chrome.storage.local.get([HQ_QUEUE_KEY]);
+  HQ_QUEUE = stored[HQ_QUEUE_KEY] || JSON.parse(JSON.stringify(HQ_DEFAULT_QUEUE));
+}
+async function saveHqQueue() {
+  await chrome.storage.local.set({ [HQ_QUEUE_KEY]: HQ_QUEUE });
+}
+async function loadHqResults() {
+  const stored = await chrome.storage.local.get([HQ_RESULTS_KEY]);
+  HQ_RESULTS = stored[HQ_RESULTS_KEY] || [];
+}
+async function saveHqResults() {
+  await chrome.storage.local.set({ [HQ_RESULTS_KEY]: HQ_RESULTS });
+}
+async function loadHqDomains() {
+  const stored = await chrome.storage.local.get([HQ_DOMAINS_KEY]);
+  HQ_DOMAINS = stored[HQ_DOMAINS_KEY] || JSON.parse(JSON.stringify(HQ_DEFAULT_DOMAINS));
+}
+async function saveHqDomains() {
+  await chrome.storage.local.set({ [HQ_DOMAINS_KEY]: HQ_DOMAINS });
+}
+
+function setHqStatus(msg, type) {
+  const el = document.getElementById('hqStatus');
+  el.textContent = msg;
+  el.className = 'status-line show' + (type ? ' ' + type : '');
+}
+
+function domainOptionsHtml(selected) {
+  // Union in the row's current value even if it's since been removed from the
+  // known-domains list, so an existing queue row never silently gets swapped
+  // to whatever the dropdown happens to default to.
+  const options = HQ_DOMAINS.slice();
+  if (selected && !options.includes(selected)) options.push(selected);
+  return options.map(d => `<option value="${escapeAttr(d)}" ${d === selected ? 'selected' : ''}>${escapeAttr(d)}</option>`).join('');
+}
+
+function renderHqQueueTable() {
+  const body = document.getElementById('hqQueueBody');
+  body.innerHTML = '';
+  HQ_QUEUE.forEach((row, i) => {
+    const last24 = row.sinceHoursAgo != null;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><select data-i="${i}" data-f="domain" style="width:150px;">
+        <option value="" ${row.domain ? '' : 'selected'} disabled>Select a domain...</option>
+        ${domainOptionsHtml(row.domain)}
+      </select></td>
+      <td><input type="text" data-i="${i}" data-f="idStart" value="${row.idStart ?? ''}" placeholder="idStart" style="width:70px;" ${last24 ? 'disabled' : ''}></td>
+      <td><input type="text" data-i="${i}" data-f="idEnd" value="${row.idEnd ?? ''}" placeholder="blank = auto" title="Leave blank to auto-detect the end — the scan walks forward from ID start until it stops finding real orders." style="width:80px;" ${last24 ? 'disabled' : ''}></td>
+      <td style="text-align:center;"><input type="checkbox" data-i="${i}" data-f="last24" ${last24 ? 'checked' : ''} title="Scan the last ${HQ_SCAN_HOURS} hours instead of a fixed ID range"></td>
+      <td><button class="row-del" data-i="${i}" title="Remove">✕</button></td>`;
+    body.appendChild(tr);
+  });
+  body.querySelectorAll('select[data-f="domain"]').forEach(sel => {
+    sel.addEventListener('change', async e => {
+      const i = +e.target.dataset.i;
+      HQ_QUEUE[i].domain = e.target.value;
+      await saveHqQueue();
+    });
+  });
+  body.querySelectorAll('input[data-f="idStart"], input[data-f="idEnd"]').forEach(inp => {
+    inp.addEventListener('change', async e => {
+      const i = +e.target.dataset.i, f = e.target.dataset.f;
+      const val = e.target.value.trim();
+      HQ_QUEUE[i][f] = val === '' ? null : Number(val);
+      await saveHqQueue();
+    });
+  });
+  body.querySelectorAll('input[data-f="last24"]').forEach(cb => {
+    cb.addEventListener('change', async e => {
+      const i = +e.target.dataset.i;
+      if (e.target.checked) {
+        HQ_QUEUE[i].sinceHoursAgo = HQ_SCAN_HOURS;
+        HQ_QUEUE[i].idStart = null;
+        HQ_QUEUE[i].idEnd = null;
+      } else {
+        HQ_QUEUE[i].sinceHoursAgo = null;
+      }
+      await saveHqQueue();
+      renderHqQueueTable();
+    });
+  });
+  body.querySelectorAll('.row-del').forEach(btn => {
+    btn.addEventListener('click', async e => {
+      HQ_QUEUE.splice(+e.target.dataset.i, 1);
+      await saveHqQueue();
+      renderHqQueueTable();
+    });
+  });
+}
+
+document.getElementById('hqAddRowBtn').addEventListener('click', async () => {
+  HQ_QUEUE.push({ domain: '', idStart: null, idEnd: null, sinceHoursAgo: null });
+  await saveHqQueue();
+  renderHqQueueTable();
+});
+document.getElementById('hqResetQueueBtn').addEventListener('click', async () => {
+  if (!confirm('Reset the scan queue to defaults? Any edits you made, and all current results, will be cleared.')) return;
+  HQ_QUEUE = JSON.parse(JSON.stringify(HQ_DEFAULT_QUEUE));
+  HQ_RESULTS = [];
+  HQ_RUN_STATE = 'idle';
+  await saveHqQueue();
+  await saveHqResults();
+  renderHqQueueTable();
+  renderHqProgress();
+  renderHqResults();
+  setHqStatus('Reset to defaults — queue and results cleared.', 'ok');
+});
+
+// ---- Known HQ org domains (used to populate the queue's domain dropdown) ----
+function renderHqDomainsTable() {
+  const body = document.getElementById('hqDomainsBody');
+  if (!body) return;
+  body.innerHTML = '';
+  HQ_DOMAINS.forEach((d, i) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><input type="text" data-i="${i}" value="${escapeAttr(d)}" placeholder="example.com"></td>
+      <td><button class="row-del" data-i="${i}" title="Remove">✕</button></td>`;
+    body.appendChild(tr);
+  });
+  body.querySelectorAll('input').forEach(inp => {
+    inp.addEventListener('change', async e => {
+      HQ_DOMAINS[+e.target.dataset.i] = e.target.value.trim();
+      await saveHqDomains();
+      renderHqQueueTable(); // dropdown options need refreshing
+    });
+  });
+  body.querySelectorAll('.row-del').forEach(btn => {
+    btn.addEventListener('click', async e => {
+      HQ_DOMAINS.splice(+e.target.dataset.i, 1);
+      await saveHqDomains();
+      renderHqDomainsTable();
+      renderHqQueueTable();
+    });
+  });
+}
+document.getElementById('hqDomainsAddRowBtn').addEventListener('click', async () => {
+  HQ_DOMAINS.push('');
+  await saveHqDomains();
+  renderHqDomainsTable();
+});
+document.getElementById('hqDomainsResetBtn').addEventListener('click', async () => {
+  if (!confirm('Reset the known-domains list to defaults?')) return;
+  HQ_DOMAINS = JSON.parse(JSON.stringify(HQ_DEFAULT_DOMAINS));
+  await saveHqDomains();
+  renderHqDomainsTable();
+  renderHqQueueTable();
+});
+
+function renderHqProgress() {
+  const list = document.getElementById('hqProgressList');
+  if (!HQ_QUEUE.length) { list.innerHTML = '<div class="hint">Queue is empty — nothing left to scan.</div>'; return; }
+  list.innerHTML = HQ_QUEUE.map((row, i) => {
+    const label = row.idStart != null
+      ? (row.idEnd != null ? `orders ${row.idStart}-${row.idEnd}` : `orders ${row.idStart} onward (auto-detect end)`)
+      : (row.sinceHoursAgo != null ? `last ${row.sinceHoursAgo}h` : '(no range set)');
+    const isCurrent = i === 0 && HQ_RUN_STATE === 'running';
+    return `<div class="hint">${isCurrent ? '▶' : '⏳'} ${escapeAttr(row.domain || '(no domain)')} — ${label}${isCurrent ? ' (in progress...)' : ''}</div>`;
+  }).join('');
+}
+
+function renderMismatchTable(mismatches) {
+  const rows = mismatches.map(m => `
+    <tr>
+      <td>${escapeAttr(String(m.id))}</td>
+      <td>${escapeAttr(m.shippingRegion || '—')}</td>
+      <td>${escapeAttr(m.transactionType || '—')}</td>
+      <td>$${escapeAttr(String(m.exciseTaxCollected ?? '0'))}</td>
+      <td>$${escapeAttr(String(m.recalculatedTaxSum ?? 0))}</td>
+      <td>${escapeAttr((m.ruleKeys || []).join(', ') || '—')}</td>
+    </tr>`).join('');
+  return `
+    <table class="cfg" style="margin-top:0;">
+      <thead><tr><th>Order ID</th><th>Region</th><th>Type</th><th>Collected</th><th>Should've collected</th><th>Rule(s) applied</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function renderOverchargeTable(overcharged) {
+  const rows = [];
+  (overcharged || []).forEach(o => {
+    (o.overchargeLines || []).forEach(l => {
+      const hasEstimate = l.estimatedOvertaxTotal != null;
+      rows.push(`
+    <tr>
+      <td>${escapeAttr(String(o.id))}</td>
+      <td>${escapeAttr(o.shippingRegion || '—')}</td>
+      <td>${escapeAttr(l.sku)}</td>
+      <td>${escapeAttr(l.productName || '—')}</td>
+      <td>${escapeAttr(String(l.qty))}</td>
+      <td>$${escapeAttr(String(l.actualPrice))}</td>
+      <td>$${escapeAttr(String(l.catalogPrice))}</td>
+      <td>$${escapeAttr(String(l.delta))}</td>
+      <td>${hasEstimate ? `~$${escapeAttr(String(l.estimatedOvertaxTotal))} <span style="opacity:0.65;" title="${l.rateSource === 'confirmed' ? 'Rate sourced directly from the State Tax Rules page, not inferred.' : 'Rate inferred from calc-detail samples on other orders — less certain than a sourced rate.'}">(rate ${escapeAttr(String(Math.round(l.rateUsed * 1000) / 10))}%${l.rateSource === 'confirmed' ? ', confirmed' : `, learned, n=${escapeAttr(String(l.rateSamples))}`})</span>` : '<span style="opacity:0.55;" title="This line is on the retail-price-based allowlist but has no rate yet — shouldn\'t normally happen since every allowlisted state has a documented rate; worth a second look if seen.">no rate available</span>'}</td>
+    </tr>`);
+    });
+  });
+  return `
+    <table class="cfg" style="margin-top:0;">
+      <thead><tr><th>Order ID</th><th>Region</th><th>SKU</th><th>Product</th><th>Qty</th><th>Actual price</th><th>Catalog price</th><th>Delta/unit</th><th>Est. tax overcharged</th></tr></thead>
+      <tbody>${rows.join('')}</tbody>
+    </table>`;
+}
+
+function renderHqResults() {
+  const panel = document.getElementById('hqResultsPanel');
+  const summary = document.getElementById('hqResultsSummary');
+  const list = document.getElementById('hqResultsList');
+  if (!HQ_RESULTS.length) { panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+
+  const flagged = HQ_RESULTS.filter(r => r.mismatchCount > 0);
+  const overchargedOrgs = HQ_RESULTS.filter(r => r.overchargedCount > 0);
+  const errored = HQ_RESULTS.filter(r => r.error);
+  summary.textContent = `Scanned ${HQ_RESULTS.length} org(s) — ${flagged.length} with mismatches, ${overchargedOrgs.length} with a stale catalog price (possible overcharge), ${errored.length} couldn't be scanned.`;
+
+  list.innerHTML = '';
+  HQ_RESULTS.forEach((r, i) => {
+    const item = document.createElement('div');
+    item.className = 'diag-item';
+    if (r.error) {
+      item.innerHTML = `
+        <div class="diag-head">
+          <div class="diag-title">${escapeAttr(r.domain)}</div>
+          <span class="badge err">Error</span>
+        </div>
+        <div class="diag-summary">Could not complete: ${escapeAttr(r.error)}</div>`;
+    } else {
+      const badge = r.mismatchCount > 0 ? 'flag' : 'ok';
+      const badgeText = r.mismatchCount > 0 ? `${r.mismatchCount} mismatch(es)` : 'Clean';
+      const overchargeBadge = r.overchargedCount > 0 ? `<span class="badge flag" style="margin-left:6px;">${r.overchargedCount} order(s) w/ stale price</span>` : '';
+      item.innerHTML = `
+        <div class="diag-head">
+          <div class="diag-title">${escapeAttr(r.domain)}</div>
+          <span class="badge ${badge}">${badgeText}</span>${overchargeBadge}
+        </div>
+        <div class="diag-summary">${r.checked} order(s) found and checked (${r.notFound} in the range didn't exist / 404'd) — ${r.mismatchCount} of those ${r.checked} show the mismatch pattern.${r.highestFoundId != null ? ` Newest order found: <strong>${r.highestFoundId}</strong> — use this as next cycle's start ID.` : ''}</div>
+        ${r.notRequired != null ? `<div class="diag-summary" style="margin-top:4px;">${r.checked} checked:<div style="margin-top:2px;padding-left:14px;font-family:monospace;line-height:1.6;">${r.notRequired} tot-excise-tax-not-required<br>${r.collected} tot-excise-tax-collected<br>${r.incorrect} tot-excise-tax-incorrect</div></div>` : ''}
+        ${r.mismatchCount > 0 ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><div style="font-weight:600;margin-bottom:4px;">Order IDs tagged tot-excise-tax-incorrect:</div>${renderMismatchTable(r.mismatches)}</div>` : ''}
+        ${r.overchargedCount > 0 ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><div style="font-weight:600;margin-bottom:4px;">${r.overchargedCount} order(s) with a line where TOT's saved catalog price is above what was actually charged:</div><div class="diag-summary" style="margin-bottom:6px;">Estimated tax overcharged so far: <strong>~$${r.estimatedOverchargeTotal}</strong>. Only jurisdiction+SKU-type combos confirmed retail-price-based on TaxOps Portal's State Tax Rules page are checked at all (currently NY::vape and WA::vape/nicotinePouch) — everything else is skipped by default, since most states tax by wholesale cost/price, a flat per-mL/per-unit amount, or not at all, where a stale catalog retail price is irrelevant to the tax owed. This is still an estimate, not a confirmed dollar amount — always double-check against HQ's "How was this tax calculated" tool before acting on it.</div>${renderOverchargeTable(r.overcharged)}</div>` : ''}`;
+    }
+    list.appendChild(item);
+  });
+}
+
+document.getElementById('hqClearResultsBtn').addEventListener('click', async () => {
+  HQ_RESULTS = [];
+  await saveHqResults();
+  renderHqResults();
+  setHqStatus('Results cleared.', 'ok');
+});
+
+// ---- functions injected into the real HQ tab via chrome.scripting.executeScript ----
+// These run in the PAGE's own context (same-origin as app.tokenoftrust.com), so
+// fetch() calls here are ordinary same-origin requests — no CORS/host_permissions
+// gymnastics needed for the actual API calls, only for injecting this code at all.
+// Must be fully self-contained (no references to outer popup.js scope).
+
+function hqStageSelectOrg(domain) {
+  return (async () => {
+    function setNativeValue(el, value) {
+      const proto = Object.getPrototypeOf(el);
+      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+      desc.set.call(el, value);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    const input = document.querySelector('input.vs__search');
+    if (!input) return { ok: false, reason: 'logged-out' };
+    input.click();
+    input.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    setNativeValue(input, domain);
+    await new Promise(r => setTimeout(r, 900));
+    const opts = Array.from(document.querySelectorAll('li'));
+    const match = opts.find(l => l.textContent.trim() === domain);
+    if (!match) return { ok: false, reason: 'not-found', opts: opts.map(o => o.textContent.trim()) };
+    match.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    match.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    match.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await new Promise(r => setTimeout(r, 1000));
+    return { ok: true };
+  })();
+}
+
+function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
+  return (async () => {
+    function findButtonByText(txt) {
+      return Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === txt);
+    }
+
+    // 2026-08-21: the docs page's Vue app can still be rendering when this
+    // runs (same class of issue as the org-switch timing bug fixed earlier —
+    // a fixed delay assumes the page is ready, but doesn't confirm it). Poll
+    // for either token-related button, or the token element itself, to
+    // actually exist before touching anything, instead of hoping 1s was
+    // enough. Bounded so a truly broken page still fails instead of hanging.
+    async function waitForTokenUiReady(timeoutMs) {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        if (findButtonByText('Reset token') || findButtonByText('Generate a new access token') ||
+            findButtonByText('Create a new access token') || document.getElementById('collapsed-token-value')) {
+          return true;
+        }
+        await new Promise(r => setTimeout(r, 300));
+      }
+      return false;
+    }
+    await waitForTokenUiReady(8000);
+    await new Promise(r => setTimeout(r, 1000)); // let the docs app finish its own auto-token attempt
+
+    const resetBtn = findButtonByText('Reset token');
+    if (resetBtn) { resetBtn.click(); await new Promise(r => setTimeout(r, 500)); }
+    const createBtn = findButtonByText('Generate a new access token') || findButtonByText('Create a new access token');
+    if (createBtn) { createBtn.click(); await new Promise(r => setTimeout(r, 1800)); }
+
+    const codeEl = document.getElementById('collapsed-token-value');
+    let full = codeEl && codeEl.getAttribute('data-full-token');
+    if (!full || full === 'No token') {
+      // Minting itself can lag behind the click — give it a bit more room
+      // before declaring no-token, rather than failing on the first check.
+      const start2 = Date.now();
+      while ((!full || full === 'No token') && Date.now() - start2 < 4000) {
+        await new Promise(r => setTimeout(r, 400));
+        const el2 = document.getElementById('collapsed-token-value');
+        full = el2 && el2.getAttribute('data-full-token');
+      }
+    }
+    if (!full || full === 'No token') return { ok: false, reason: 'no-token' };
+
+    let decoded;
+    try { decoded = JSON.parse(atob(full)); } catch (e) { return { ok: false, reason: 'decode-failed: ' + e.message }; }
+    if (decoded.referrerOrigin !== domain) return { ok: false, reason: `wrong-scope (token was for ${decoded.referrerOrigin})` };
+
+    // Learned tax-rate directory (2026-08-20): whenever calc-detail happens to
+    // be populated for an order, it shows the actual per-unit tax charged
+    // AND the catalog price it was computed against — dividing the two gives
+    // an effective rate for that jurisdiction+SKU-type combo (e.g.
+    // "US.regionCode.PA::vape"). We persist this across scans/orgs so it
+    // keeps improving over time, and use it to convert a price-gap flag
+    // (see overchargeLines below) into an estimated tax dollar amount even
+    // on orders where calc-detail itself is empty — the order lookup alone
+    // still gives us the jurisdiction (shippingLocation.regionCode) and the
+    // SKU type (products[sku].type, confirmed to match calc-detail's
+    // ruleSet, e.g. "vape"/"nicotinePouch") needed to look a rate up.
+    // Loaded once per hqStageScan call, updated in memory as orders are
+    // scanned, and written back once at the end (not per-order, to keep
+    // storage writes cheap).
+    const rateDirStored = await chrome.storage.local.get(['totHqRateDirectory']);
+    const rateDirectory = rateDirStored.totHqRateDirectory || {};
+
+    // 2026-08-24: replaced the old denylist approach (CONFIRMED_NON_PRICE_BASED,
+    // populated one state at a time as false positives got manually found —
+    // VA, OH, CO in one afternoon, three-for-three) with an allowlist
+    // sourced from TaxOps Portal's "State Tax Rules" page (Vapor Products /
+    // Nicotine Pouches tabs, kept current via that page's "Refresh from
+    // sheet"). That page shows the actual tax basis for every state, and
+    // the picture it gives is stark: the overwhelming majority of states
+    // tax vapor/nicotine products by wholesale cost, wholesale price, a
+    // flat per-mL/per-unit/per-container amount, or not at all — NOT as a
+    // percentage of retail price. The retailPrice-vs-actual-price
+    // comparison this heuristic relies on is only meaningful for the
+    // handful of states where retail price genuinely is the basis, with no
+    // wholesale/per-volume component mixed in by sub-type. Rather than
+    // continue discovering non-retail-based states one false positive at a
+    // time, default to skipping every state and only check the ones
+    // confirmed retail-based. See the README changelog for the full
+    // state-by-state transcription and every caveat (compound rules this
+    // can't yet split by SKU sub-type, "local rules only" states, and a
+    // gap in the nicotine-pouch data for AL–HI that wasn't available in
+    // the screenshots reviewed).
+    const RETAIL_PRICE_BASED = new Set([
+      'US.regionCode.NY::vape',          // 20% of retail price of all vapor products — clean, no wholesale/per-unit component mixed in
+      'US.regionCode.WA::vape',          // 95% of "selling price" — empirically confirmed via the original vaperanger.com WA investigation (catalog retailPrice matched the reported overcharge exactly)
+      'US.regionCode.WA::nicotinePouch'  // same 95%/"selling price" rule shown on the pouches tab — carried over cautiously, not independently confirmed the way vape was
+    ]);
+    // A few states have a rate that's simply KNOWN from the compliance
+    // sheet rather than needing to be learned from calc-detail samples —
+    // use it directly when present, in preference to whatever's in
+    // rateDirectory, so these show a sourced rate instead of "estimated
+    // from other orders." (WA's "selling price" wording is a bit different
+    // from "retail price" — if that turns out to mean something other than
+    // the catalog retailPrice field this tool already reads, this rate
+    // would need revisiting, but it's the best documented rate available.)
+    const AUTHORITATIVE_RATES = {
+      'US.regionCode.NY::vape': 0.20,
+      'US.regionCode.WA::vape': 0.95,
+      'US.regionCode.WA::nicotinePouch': 0.95
+    };
+
+    // One-time cleanup: purge any previously-learned rate for a key that
+    // isn't on the new allowlist — almost everything learned before this
+    // fix (e.g. the old OH::vape 27.3%/n=145 entry) was learned under the
+    // wrong assumption that the combo was retail-price-based at all.
+    // Without this, those stale/spurious rates would just sit unused in
+    // storage forever; with it, storage stays a true reflection of what
+    // this tool currently trusts to estimate from.
+    for (const key of Object.keys(rateDirectory)) {
+      if (!RETAIL_PRICE_BASED.has(key)) delete rateDirectory[key];
+    }
+
+    async function scanOneOrder(id, token) {
+      const orderRes = await fetch(`/api/exciseTax/order/${id}`, { headers: { Accept: 'application/json', Authorization: 'Bearer ' + token } });
+      if (orderRes.status !== 200) return null;
+      const orderBody = await orderRes.json();
+      const calcRes = await fetch(`/api/exciseTax/orders/${id}/calc-detail`, { headers: { Accept: 'application/json', Authorization: 'Bearer ' + token } });
+      const calcBody = calcRes.status === 200 ? await calcRes.json() : null;
+      const order = orderBody?.content?.order;
+      const events = calcBody?.content?.events || [];
+      const calcEvent = events.find(e => e.eventType === 'calculation') || events[0] || {};
+      const cd = calcEvent.calcDetail || {};
+      const taxSum = (cd.products || []).reduce((s, p) => s + ((p.appliedRules || []).reduce((s2, r) => s2 + (r.taxForQty || 0), 0)), 0);
+
+      // Learn effective tax rates from calc-detail whenever it's populated
+      // (regardless of whether this particular order is overcharged) — key
+      // on ruleId+ruleSet (e.g. "US.regionCode.PA::vape") so it can be looked
+      // up later using only regionCode + product type, no calc-detail
+      // needed at lookup time. Running average across samples; skips
+      // zero-tax rules (exempt items) since a 0 rate would pollute the
+      // average rather than reflect a real jurisdiction rate.
+      (cd.products || []).forEach(p => {
+        if (p.retailPrice == null || !(p.retailPrice > 0)) return;
+        (p.appliedRules || []).forEach(rule => {
+          if (!rule.ruleId || !rule.ruleSet || !(rule.unitTax > 0)) return;
+          const key = rule.ruleId + '::' + rule.ruleSet;
+          // 2026-08-24: only learn a rate for a combo the State Tax Rules
+          // page confirms is actually retail-price-based (see
+          // RETAIL_PRICE_BASED above). Learning indiscriminately is what
+          // produced the old OH::vape 27.3%/n=145 entry — a confident-
+          // looking rate from 145 samples that turned out to be a spurious
+          // price/volume correlation, not a real tax rate, once checked
+          // against HQ's own rule text. Most states already have a known
+          // AUTHORITATIVE_RATES value anyway; this mainly guards against
+          // silently re-accumulating junk for anything not yet allowlisted.
+          if (!RETAIL_PRICE_BASED.has(key)) return;
+          const observedRate = rule.unitTax / p.retailPrice;
+          const existing = rateDirectory[key];
+          if (existing) {
+            const newSamples = existing.samples + 1;
+            existing.rate = Math.round((((existing.rate * existing.samples) + observedRate) / newSamples) * 100000) / 100000;
+            existing.samples = newSamples;
+            existing.taxLabel = rule.taxLabel || existing.taxLabel || null;
+            existing.lastOrderId = id;
+          } else {
+            rateDirectory[key] = { rate: Math.round(observedRate * 100000) / 100000, samples: 1, taxLabel: rule.taxLabel || null, lastOrderId: id };
+          }
+        });
+      });
+
+      // Overcharge detection (2026-08-20): the order endpoint embeds a per-SKU
+      // "products" catalog snapshot (retailPrice/wholesalePrice/msrp) right
+      // alongside the real transaction line price (unitSalesPrice /
+      // unitDiscountedPrice) — no calc-detail call needed for this part, and
+      // it still works even when calc-detail comes back empty (seen on a real
+      // vaperanger.com order). If TOT's saved catalog price for a SKU is
+      // higher than what was actually charged, tax on that line was very
+      // likely computed off the inflated catalog price — see the
+      // vaperanger.com investigation in the README changelog below for the
+      // case that surfaced this. This only flags the price gap; it does NOT
+      // assert a specific tax dollar amount overcharged, since that depends
+      // on the tax rule/rate in effect for that SKU+jurisdiction, which isn't
+      // always derivable (calc-detail, which does show the rate, isn't
+      // reliably available — see the same changelog entry).
+      const catalog = order?.products || {};
+      const regionCode = order?.shippingLocation?.regionCode;
+      // 2026-08-21: a second false-positive class, distinct from the
+      // per-line isExempt one above — found on a real PA order
+      // (vapesocietysupplies.com #2447753) where NO rule matched any line
+      // at all (confirmed via HQ's own "How was this tax calculated" tool:
+      // jurisdictionResolution showed `rules: {}` for every product, and
+      // both collected and recalculated tax were $0.00). A stale catalog
+      // price can't cause an overcharge on an order where $0 tax was ever
+      // collected in the first place — there's no charged amount to have
+      // been inflated. We can't reliably tell "no rule applies to this
+      // order" apart from "calc-detail came back empty due to the known
+      // bug" from calc-detail alone (both look like an empty rules object),
+      // so this checks the order's own `exciseTaxCollected` instead, which
+      // is always present regardless of calc-detail availability and is
+      // the same field the under-collection mismatch check below already
+      // relies on. Orders with genuine nonzero collected tax (like the
+      // vaperanger.com WA case, where calc-detail was empty but real
+      // overcharge was later confirmed) are unaffected by this guard.
+      const orderHasAnyCollectedTax = order?.exciseTaxCollected != null && order.exciseTaxCollected !== '0';
+      const overchargeLines = !orderHasAnyCollectedTax ? [] : (order?.transactionLines || []).map(l => {
+        const p = catalog[l.sku];
+        if (!p || p.retailPrice == null) return null;
+        // 2026-08-21: an exempt SKU (p.isExempt true — e.g. a kit "part"
+        // that's excluded from tax rather than a standalone taxable
+        // product) contributes zero tax regardless of which price is used,
+        // so a stale catalog price on an exempt line can never actually
+        // cause an overcharge. Confirmed via a real HQ order where the
+        // manual "How was this tax calculated" tool showed appliedRules:[]
+        // and tax:0 for exactly this kind of line despite a genuine
+        // retailPrice-vs-actual gap — this flag was a false positive until
+        // this check was added. Skip exempt lines before even computing a
+        // delta.
+        if (p.isExempt) return null;
+        // "US.regionCode.<state>" matches the ruleId format calc-detail uses
+        // for state-level rules; product.type (confirmed to equal calc-
+        // detail's ruleSet, e.g. "vape"/"nicotinePouch") supplies the rest of
+        // the key.
+        const rateKey = (regionCode && p.type) ? `US.regionCode.${regionCode}::${p.type}` : null;
+        // 2026-08-24: only proceed for a jurisdiction+type combo the State
+        // Tax Rules page confirms is retail-price-based (see
+        // RETAIL_PRICE_BASED above) — everything else defaults to skipped,
+        // rather than flagged-until-manually-disproven. This replaces the
+        // three one-off exclusions (VA, OH, CO) found the hard way on
+        // 2026-08-22/24; those states just aren't on the allowlist at all
+        // now, same as the ~45 others that were never individually checked
+        // but are almost certainly not retail-based either per that page.
+        if (!rateKey || !RETAIL_PRICE_BASED.has(rateKey)) return null;
+        const actualPrice = parseFloat(l.unitSalesPrice);
+        const delta = Math.round((p.retailPrice - actualPrice) * 100) / 100;
+        if (!(delta > 0.01)) return null;
+        // Prefer a known rate straight from the compliance sheet
+        // (AUTHORITATIVE_RATES) over one inferred from calc-detail samples
+        // — it's sourced rather than estimated. Falls back to the learned
+        // rate if a combo is on the allowlist but doesn't have a
+        // documented rate yet (shouldn't currently happen, since every
+        // allowlisted key has one, but kept as a safety net).
+        const learned = rateDirectory[rateKey];
+        const authoritativeRate = AUTHORITATIVE_RATES[rateKey];
+        const rate = authoritativeRate != null ? authoritativeRate : (learned ? learned.rate : null);
+        const rateSource = authoritativeRate != null ? 'confirmed' : (learned ? 'learned' : null);
+        const qty = parseFloat(l.quantity) || 0;
+        return {
+          sku: l.sku,
+          productName: p.productName || null,
+          qty: l.quantity,
+          actualPrice,
+          catalogPrice: p.retailPrice,
+          delta,
+          estimatedOvertaxPerUnit: rate != null ? Math.round(delta * rate * 100) / 100 : null,
+          estimatedOvertaxTotal: rate != null ? Math.round(delta * rate * qty * 100) / 100 : null,
+          rateUsed: rate,
+          rateSamples: learned ? learned.samples : null,
+          rateSource
+        };
+      }).filter(Boolean);
+
+      return {
+        id,
+        exciseTaxCollected: order?.exciseTaxCollected,
+        shippingRegion: order?.shippingLocation?.regionCode,
+        transactionType: cd.transactionType,
+        ruleKeys: Object.keys(cd.rules || {}),
+        recalculatedTaxSum: Math.round(taxSum * 100) / 100,
+        mismatch: (order?.exciseTaxCollected === '0' && taxSum > 0),
+        overchargeLineCount: overchargeLines.length,
+        overchargeLines
+      };
+    }
+
+    const token = full;
+    let results = [];
+    let notFound = 0;
+    let lastIdChecked = null;
+
+    if (idStart != null && idEnd != null) {
+      for (let id = idStart; id <= idEnd; id++) {
+        const r = await scanOneOrder(id, token);
+        if (r === null) notFound++; else results.push(r);
+        lastIdChecked = id;
+      }
+    } else if (idStart != null && idEnd == null) {
+      // Open-ended: no known ending order ID, so walk forward from idStart
+      // until a run of consecutive misses suggests we've passed the newest
+      // order, or a safety cap is hit. A single miss isn't treated as "the
+      // end" since order IDs can have small legitimate gaps (e.g. a
+      // cancelled/test order never landing in this API) — MISS_STREAK_LIMIT
+      // consecutive misses in a row is the actual stop condition.
+      const MISS_STREAK_LIMIT = 15;
+      const MAX_CHECKED = 3000; // runaway-loop backstop, not expected to be hit in normal use
+      let missStreak = 0;
+      let id = idStart;
+      while (missStreak < MISS_STREAK_LIMIT && (results.length + notFound) < MAX_CHECKED) {
+        const r = await scanOneOrder(id, token);
+        if (r === null) { notFound++; missStreak++; } else { results.push(r); missStreak = 0; }
+        lastIdChecked = id;
+        id++;
+      }
+    } else if (sinceHoursAgo != null) {
+      const until = new Date().toISOString();
+      const since = new Date(Date.now() - sinceHoursAgo * 3600 * 1000).toISOString();
+      const listRes = await fetch(`/api/exciseTax/orders?since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}&limit=1000`, {
+        headers: { Accept: 'application/json', Authorization: 'Bearer ' + token }
+      });
+      if (listRes.status !== 200) return { ok: false, reason: `list-orders failed (status ${listRes.status})` };
+      const body = await listRes.json();
+      const orders = body?.content?.orders || body?.content || [];
+      for (const o of orders) {
+        const id = o.orderId || o.id;
+        const r = await scanOneOrder(id, token);
+        if (r === null) notFound++; else results.push(r);
+      }
+    } else {
+      return { ok: false, reason: 'no range configured for this row' };
+    }
+
+    const mismatches = results.filter(r => r.mismatch);
+    const highestFoundId = results.length ? Math.max(...results.map(r => r.id)) : null;
+    // Derived status breakdown (see README changelog "2026-08-19, tag breakdown"):
+    // no literal API field for this exists (confirmed via CalcDetailEvent.status
+    // inspection), so these three are inferred from data already pulled per order.
+    // notRequired: no excise tax rule applied to this order at all.
+    // incorrect: a rule applied AND the known under-collection pattern was hit.
+    // collected: a rule applied and that specific pattern was NOT hit (does not
+    // guarantee the exact amount collected was correct — only that this one
+    // failure mode wasn't detected).
+    const notRequired = results.filter(r => (r.ruleKeys || []).length === 0).length;
+    const incorrect = results.filter(r => (r.ruleKeys || []).length > 0 && r.mismatch).length;
+    const collected = results.filter(r => (r.ruleKeys || []).length > 0 && !r.mismatch).length;
+
+    // Orders with at least one line where TOT's saved catalog price is above
+    // what was actually charged — see overchargeLines above for how this is
+    // derived per line. overchargeLines is carried per order so the results
+    // panel can show exactly which SKUs/orders to hand off.
+    const overcharged = results.filter(r => r.overchargeLineCount > 0);
+    const estimatedOverchargeTotal = Math.round(
+      overcharged.reduce((s, r) => s + (r.overchargeLines || []).reduce((s2, l) => s2 + (l.estimatedOvertaxTotal || 0), 0), 0) * 100
+    ) / 100;
+    const overchargeLinesWithEstimate = overcharged.reduce((s, r) => s + (r.overchargeLines || []).filter(l => l.estimatedOvertaxTotal != null).length, 0);
+    const overchargeLinesTotal = overcharged.reduce((s, r) => s + (r.overchargeLines || []).length, 0);
+
+    // Persist the (possibly updated) rate directory once, at the end of this
+    // call, rather than per-order — keeps storage writes cheap while still
+    // letting later orders/orgs in the same run (and future runs) benefit
+    // from whatever got learned here.
+    await chrome.storage.local.set({ totHqRateDirectory: rateDirectory });
+
+    return {
+      ok: true, checked: results.length, notFound, mismatchCount: mismatches.length, mismatches, allResults: results,
+      lastIdChecked, highestFoundId, notRequired, collected, incorrect,
+      overchargedCount: overcharged.length,
+      overcharged: overcharged.map(r => ({ id: r.id, shippingRegion: r.shippingRegion, overchargeLines: r.overchargeLines })),
+      estimatedOverchargeTotal, overchargeLinesWithEstimate, overchargeLinesTotal
+    };
+  })();
+}
+
+// ---- orchestration, running in the side panel's own context ----
+
+function waitForTabLoad(tabId, matchUrlSubstr) {
+  return new Promise((resolve) => {
+    function listener(id, info, tab) {
+      if (id === tabId && info.status === 'complete' && (!matchUrlSubstr || (tab.url || '').includes(matchUrlSubstr))) {
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    }
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+}
+
+async function ensureHqTab() {
+  if (HQ_TAB_ID) {
+    try { await chrome.tabs.get(HQ_TAB_ID); return HQ_TAB_ID; } catch (e) { HQ_TAB_ID = null; }
+  }
+  const tab = await chrome.tabs.create({ url: HQ_ORIGIN + '/hq/choose-app', active: true });
+  HQ_TAB_ID = tab.id;
+  await waitForTabLoad(HQ_TAB_ID, '/hq/choose-app');
+  return HQ_TAB_ID;
+}
+
+async function navigateHqTab(tabId, url, matchUrlSubstr) {
+  await chrome.tabs.update(tabId, { url });
+  await waitForTabLoad(tabId, matchUrlSubstr);
+  await new Promise(r => setTimeout(r, 300));
+}
+
+// Polls the tab's ACTUAL url (via chrome.tabs.get, not injected script — this
+// needs to see real navigations, including client-side route changes the app
+// makes on its own) until it moves away from `fromUrlSubstr`, or times out.
+async function pollUntilUrlChangesAway(tabId, fromUrlSubstr, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.url && !tab.url.includes(fromUrlSubstr)) return tab.url;
+    await new Promise(r => setTimeout(r, 300));
+  }
+  return null;
+}
+
+// Selecting an org in "Choose App Domain" doesn't commit immediately — HQ
+// auto-redirects to a "Checking your configuration" gate page first, which
+// needs its own Continue click, and only THEN lands on the org's home with
+// the backend's "current org" pointer actually updated. Skipping this gate
+// (which the first version of this tool did) mints a token still scoped to
+// whatever org was previously committed, not the one just selected — this
+// was confirmed directly: the docs page's "(domain)" label updates instantly
+// and looks correct, but the minted token's referrerOrigin doesn't match
+// until this gate is actually cleared. This function drives that whole
+// hand-off before it's safe to navigate to the API docs page.
+async function settleOrgSwitch(tabId) {
+  let url = await pollUntilUrlChangesAway(tabId, '/hq/choose-app', 6000);
+  if (url && url.includes('/hq/configuration-check')) {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const btn = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === 'Continue');
+        if (btn) btn.click();
+      }
+    });
+    url = await pollUntilUrlChangesAway(tabId, '/hq/configuration-check', 6000);
+  }
+  // Small buffer even after the UI has moved on, in case the org-switch call
+  // that page redirect depends on is still finishing server-side.
+  await new Promise(r => setTimeout(r, 600));
+  return url;
+}
+
+// Runs the full "select org -> clear the configuration-check gate -> mint +
+// verify a token -> scan" sequence for one queue entry. Returns the scan
+// result object (either {ok:true, ...} or {ok:false, reason}) or a
+// {ok:false, reason:'logged-out'|'not-found', ...} if it couldn't even get
+// the org selected.
+async function scanOneOrg(tabId, current) {
+  await navigateHqTab(tabId, HQ_ORIGIN + '/hq/choose-app', '/hq/choose-app');
+
+  const [selectInjection] = await chrome.scripting.executeScript({ target: { tabId }, func: hqStageSelectOrg, args: [current.domain] });
+  const sel = selectInjection.result;
+  if (!sel.ok) return sel;
+
+  await settleOrgSwitch(tabId);
+
+  await navigateHqTab(tabId, HQ_ORIGIN + '/hq/api-docs/excise-tax-order#/operations/createAccessToken', '/hq/api-docs/excise-tax-order');
+
+  const [scanInjection] = await chrome.scripting.executeScript({
+    target: { tabId }, func: hqStageScan,
+    args: [current.domain, current.idStart ?? null, current.idEnd ?? null, current.sinceHoursAgo ?? null]
+  });
+  return scanInjection.result;
+}
+
+async function runHqScan() {
+  if (HQ_RUN_STATE === 'running') return;
+  HQ_RUN_STATE = 'running';
+  renderHqProgress();
+
+  let tabId;
+  try {
+    tabId = await ensureHqTab();
+  } catch (e) {
+    setHqStatus('Could not open an HQ tab: ' + e.message, 'err');
+    HQ_RUN_STATE = 'idle';
+    return;
+  }
+
+  while (HQ_QUEUE.length && HQ_RUN_STATE === 'running') {
+    const current = HQ_QUEUE[0];
+    if (!current.domain || (current.idStart == null && current.sinceHoursAgo == null)) {
+      setHqStatus(`Skipping incomplete row (needs a domain and either an ID range or hours-ago).`, 'err');
+      HQ_QUEUE.shift(); await saveHqQueue(); renderHqProgress();
+      continue;
+    }
+
+    setHqStatus(`Switching to ${current.domain}...`);
+
+    let scanResult;
+    let loggedOut = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        scanResult = await scanOneOrg(tabId, current);
+      } catch (e) {
+        setHqStatus('Lost the HQ tab (closed?) — click Start / Resume to reopen it.', 'err');
+        HQ_TAB_ID = null; HQ_RUN_STATE = 'idle'; renderHqProgress();
+        return;
+      }
+
+      if (scanResult.ok) break;
+
+      if (scanResult.reason === 'logged-out') { loggedOut = true; break; }
+      if (scanResult.reason === 'not-found') break; // retrying won't fix a real "not in HQ" result
+
+      // Any other failure (including a wrong-scope token) gets one full retry
+      // of the ENTIRE select-org sequence, not just re-minting on the same
+      // page — a wrong-scope token usually means the org switch itself didn't
+      // fully commit yet, which re-minting alone can't fix.
+      if (attempt === 0) setHqStatus(`${current.domain}: ${scanResult.reason} — retrying the full org-switch once...`, 'err');
+    }
+
+    if (loggedOut) {
+      HQ_RUN_STATE = 'paused-login';
+      setHqStatus(`Not signed into HQ. Sign in on the scan tab, then click "Start / Resume" again — ${current.domain} is still first in the queue.`, 'err');
+      renderHqProgress();
+      return;
+    }
+    if (!scanResult.ok && scanResult.reason === 'not-found') {
+      setHqStatus(`"${current.domain}" wasn't found in the org list — skipping it. (dropdown said: ${(scanResult.opts || []).join(', ') || 'nothing'})`, 'err');
+      HQ_RESULTS.push({ domain: current.domain, error: 'domain not found in HQ org search' });
+      await saveHqResults();
+      HQ_QUEUE.shift(); await saveHqQueue(); renderHqProgress(); renderHqResults();
+      continue;
+    }
+
+    if (scanResult.ok) {
+      HQ_RESULTS.push({ domain: current.domain, checked: scanResult.checked, notFound: scanResult.notFound, mismatchCount: scanResult.mismatchCount, mismatches: scanResult.mismatches, highestFoundId: scanResult.highestFoundId, openEnded: current.idStart != null && current.idEnd == null, notRequired: scanResult.notRequired, collected: scanResult.collected, incorrect: scanResult.incorrect, overchargedCount: scanResult.overchargedCount, overcharged: scanResult.overcharged, estimatedOverchargeTotal: scanResult.estimatedOverchargeTotal, overchargeLinesWithEstimate: scanResult.overchargeLinesWithEstimate, overchargeLinesTotal: scanResult.overchargeLinesTotal });
+      setHqStatus(`${current.domain}: checked ${scanResult.checked}, ${scanResult.mismatchCount} mismatch(es).`, scanResult.mismatchCount > 0 ? 'err' : 'ok');
+    } else {
+      HQ_RESULTS.push({ domain: current.domain, error: scanResult.reason });
+      setHqStatus(`${current.domain} failed after retry: ${scanResult.reason} — skipping.`, 'err');
+    }
+    await saveHqResults();
+    HQ_QUEUE.shift();
+    await saveHqQueue();
+    renderHqProgress();
+    renderHqResults();
+  }
+
+  if (HQ_RUN_STATE === 'running') {
+    HQ_RUN_STATE = 'idle';
+    const flaggedCount = HQ_RESULTS.filter(r => r.mismatchCount > 0).length;
+    setHqStatus(`Scan complete. ${flaggedCount} org(s) flagged out of ${HQ_RESULTS.length} scanned.`, 'ok');
+  }
+  renderHqProgress();
+}
+
+document.getElementById('hqStartBtn').addEventListener('click', () => { runHqScan(); });
+document.getElementById('hqStopBtn').addEventListener('click', () => {
+  if (HQ_RUN_STATE === 'running') { HQ_RUN_STATE = 'stopped'; setHqStatus('Stopping after the current org finishes...', 'ok'); }
+});
+
+async function initHq() {
+  await loadHqDomains();
+  await loadHqQueue();
+  await loadHqResults();
+  renderHqDomainsTable();
+  renderHqQueueTable();
+  renderHqProgress();
+  renderHqResults();
+}
+initHq();

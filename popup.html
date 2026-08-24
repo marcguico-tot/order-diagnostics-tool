@@ -78,6 +78,8 @@
   .btn.primary:hover{filter:brightness(1.08);}
   .btn.ghost{background:transparent;}
   .btn.small{padding:4px 8px;font-size:10.5px;}
+  .btn:disabled{cursor:default;opacity:.9;}
+  .btn.copied{background:var(--accent-dim);color:var(--accent);border-color:#1c5a3d;}
   .btn-row{display:flex;gap:7px;margin-top:12px;flex-wrap:wrap;}
 
   .status-line{
@@ -186,6 +188,7 @@
     <button class="platform-tab active" data-platform="shopify">Shopify</button>
     <button class="platform-tab" data-platform="bigcommerce">BigCommerce</button>
     <button class="platform-tab" data-platform="woocommerce">WooCommerce</button>
+    <button class="platform-tab" data-platform="hq">HQ Excise Tax <span style="text-transform:none;font-weight:400;color:var(--warn);">(proposed)</span></button>
   </div>
 
   <div class="platform-panel active" id="platformShopify">
@@ -439,6 +442,64 @@
         <button class="btn small" id="wcResetCfgBtn">Reset to defaults</button>
       </div>
     </details>
+  </div>
+
+  </div>
+
+  <div class="platform-panel" id="platformHQ">
+
+  <div class="panel">
+    <h2>HQ Excise Tax scan <span style="text-transform:none;font-weight:400;color:var(--warn);">(proposed — needs team review before real use)</span></h2>
+    <div class="hint" style="margin-bottom:10px;">
+      Automates the Active Monitoring sweep against HQ's internal Excise Tax Order API: opens a tab on HQ, switches to each org below, mints a Try-It-Now access token the same way the API docs page does, verifies it's actually scoped to that org before trusting it, then checks recent orders for the wholesale <code>error.incorrectCollection</code> pattern (excise tax owed but not collected). This rides your own logged-in HQ session — it does not create or store any separate credentials, and can't run unattended (no bearer token exists until a logged-in human has selected that org in HQ).
+    </div>
+    <div class="hint" style="margin-bottom:10px;color:var(--warn);">
+      Requires the <code>scripting</code> and <code>tabs</code> permissions plus <code>https://app.tokenoftrust.com/*</code> host access — new capability classes for this extension, worth a deliberate look before merging. See README for the full writeup.
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Scan queue</h2>
+    <div class="hint" style="margin-bottom:8px;">Each row is one org. Three ways to scope a row: an ID start + end (fixed range), an ID start with no end (scans forward from there and auto-stops once it stops finding real orders — use this when you know where to start but not what the newest order number is), or check "Last 24h" to scan by time window instead. "Last 24h" clears the ID range fields.</div>
+    <table class="cfg" id="hqQueueTable">
+      <thead><tr><th>Domain</th><th>ID start</th><th>ID end</th><th>Last 24h</th><th></th></tr></thead>
+      <tbody id="hqQueueBody"></tbody>
+    </table>
+    <div class="btn-row">
+      <button class="btn small" id="hqAddRowBtn">+ Add row</button>
+      <button class="btn small" id="hqResetQueueBtn">Reset to defaults</button>
+    </div>
+
+    <details class="config" id="hqDomainsDetails" style="margin-top:12px;">
+      <summary>Known domains (populates the dropdown above)</summary>
+      <div class="hint" style="margin-top:6px;">Add or fix org domains here — this is what the Domain dropdown in the queue table pulls from, so a typo only needs fixing in one place. Note HQ's "app domain" isn't always the same string as a store's public storefront domain (e.g. bigdvapor.net here vs. bigdvapor.com on the Shopify tab).</div>
+      <table class="cfg" id="hqDomainsTable">
+        <thead><tr><th>Domain</th><th></th></tr></thead>
+        <tbody id="hqDomainsBody"></tbody>
+      </table>
+      <div class="btn-row">
+        <button class="btn small" id="hqDomainsAddRowBtn">+ Add row</button>
+        <button class="btn small" id="hqDomainsResetBtn">Reset to defaults</button>
+      </div>
+    </details>
+  </div>
+
+  <div class="panel">
+    <h2>Run</h2>
+    <div class="hint" style="margin-bottom:8px;">Opens (or reuses) an HQ tab and runs it in the foreground so you can watch — background tabs get throttled by Chrome and make the timing here unreliable. If HQ logs you out mid-scan, it pauses and tells you to sign back in, then pick up with Start / Resume — nothing already scanned is lost.</div>
+    <div class="btn-row">
+      <button class="btn primary" id="hqStartBtn">Start / Resume scan</button>
+      <button class="btn ghost" id="hqStopBtn">Stop</button>
+      <button class="btn ghost small" id="hqClearResultsBtn">Clear results</button>
+    </div>
+    <div class="status-line" id="hqStatus"></div>
+    <div id="hqProgressList" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="panel" id="hqResultsPanel" style="display:none;">
+    <h2>Results</h2>
+    <div class="diag-summary" id="hqResultsSummary" style="margin-bottom:8px;"></div>
+    <div id="hqResultsList"></div>
   </div>
 
   </div>
