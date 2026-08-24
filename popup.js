@@ -724,18 +724,31 @@ function analyzeOrder(order, compliance, walletType){
   // this tool at all, even though it's visible in the front-end (the order's Timeline shows
   // "New payment terms were added to this order" with the term name, e.g. Net 30).
   //
-  // Deliberately informational, not a flag: dev has directly replicated the Net 30 + Shopify
-  // Companies + "Login as Customer" workflow in testing and gotten correct excise tax calculation
-  // every time (2026-08-06) — so Net 30 by itself is not a confirmed cause of missed excise tax.
-  // This exists for correlation/visibility (e.g. cross-referencing against the open wholesale/B2B
-  // transactionType pattern) so the "was this a Net 30 order" question never again requires a
-  // separate manual look at the order timeline.
+  // Net 30 alone has been tested and ruled out as a standalone cause of missed excise tax (dev
+  // replicated the full Net 30 + Shopify Companies + "Login as Customer" workflow, 2026-08-06, and
+  // tax calculated correctly both times) — so on its own this stays informational.
+  //
+  // 2026-08-24: escalated to a flag specifically when excise tax was actually charged on one of
+  // these orders (exciseLineTotal computed above). Reason: BigCommerce's totProductBuilder.node.js
+  // — read directly from source once Darrin granted Bitbucket access — shows wholesalePrice, msrp,
+  // and retailPrice are all sourced from the exact same single field (variant.calculated_price).
+  // TOT's BigCommerce catalog literally can't represent a customer-group/wholesale price distinct
+  // from standard retail, so a B2B/wholesale order in a catalog-price-based jurisdiction is a
+  // near-certain structural overcharge (or undercharge) risk on BigCommerce specifically. Whether
+  // Shopify/HQ's own product-catalog build has the same limitation is unconfirmed — that logic
+  // lives on HQ's backend, not in the shopify-app repo access granted so far (productSync.node.js
+  // there only pushes catalog fields HQ already computed). So on a Shopify order like this one,
+  // treat a hit as "worth checking the wholesale price against what tax was actually charged," not
+  // as a confirmed miss the way it would be on BigCommerce.
   if(paymentTerms){
+    const b2bExciseCharged = exciseLineTotal > 0;
     checks.push({
       label:'Payment terms (Net 30 / B2B)',
-      status:'info',
-      summary:`${paymentTerms.payment_terms_name || paymentTerms.payment_terms_type || 'Deferred payment terms'} on this order${paymentTerms.due_in_days!=null ? ` — due ${paymentTerms.due_in_days} days from issue` : ''}`,
-      detail:`This is a Shopify Companies / B2B order with deferred payment terms, not a standard checkout. Net 30 alone has been tested and ruled out as a standalone cause of missed excise tax (dev replicated the full Net 30 + Login-as-Customer workflow, 2026-08-06, and tax calculated correctly both times) — shown here for correlation tracking, not as a confirmed root cause.\nRaw payment_terms: ${JSON.stringify(paymentTerms)}`
+      status: b2bExciseCharged ? 'flag' : 'info',
+      summary:`${paymentTerms.payment_terms_name || paymentTerms.payment_terms_type || 'Deferred payment terms'} on this order${paymentTerms.due_in_days!=null ? ` — due ${paymentTerms.due_in_days} days from issue` : ''}${b2bExciseCharged ? ` — $${exciseLineTotal.toFixed(2)} excise tax charged` : ''}`,
+      detail: b2bExciseCharged
+        ? `This is a Shopify Companies / B2B order with deferred payment terms, AND excise tax was charged on it — worth confirming the tax was computed off this customer's actual wholesale price, not the standard catalog price. Confirmed root cause on BigCommerce (totProductBuilder.node.js): wholesalePrice/msrp/retailPrice all trace back to the same single field, so TOT's catalog can't distinguish wholesale from retail pricing there. Not confirmed on Shopify/HQ's side — that build logic isn't visible in any repo access granted so far — so treat this as a lead to check, not a proven miss. (Separately, Net 30 by itself has been tested and ruled out as a standalone cause of missed excise tax — dev replicated Net 30 + Login-as-Customer on 2026-08-06 and got correct tax both times — this flag is about the wholesale-pricing angle, not Net 30 itself.)\nRaw payment_terms: ${JSON.stringify(paymentTerms)}`
+        : `This is a Shopify Companies / B2B order with deferred payment terms, not a standard checkout. Net 30 alone has been tested and ruled out as a standalone cause of missed excise tax (dev replicated the full Net 30 + Login-as-Customer workflow, 2026-08-06, and tax calculated correctly both times) — shown here for correlation tracking, not as a confirmed root cause. No excise tax was charged on this order, so the wholesale-pricing angle doesn't apply here either.\nRaw payment_terms: ${JSON.stringify(paymentTerms)}`
     });
   }
 
@@ -908,11 +921,21 @@ function generateAutoNotes(order, compliance){
     notes.push({level:'info', text:'Store credit used as (part of) payment'});
   }
 
-  // Informational only — Net 30 alone has been tested and ruled out as a standalone cause of
-  // missed excise tax (dev replicated Net 30 + Login-as-Customer, 2026-08-06, tax calculated
-  // correctly). Surfaced for quick correlation against the wholesale/B2B pattern, not a verdict.
+  // Net 30 alone has been tested and ruled out as a standalone cause of missed excise tax (dev
+  // replicated Net 30 + Login-as-Customer, 2026-08-06, tax calculated correctly) — informational
+  // by default. Escalated to a flag when excise tax was actually charged on this B2B/wholesale
+  // order (2026-08-24) — see the "Payment terms (Net 30 / B2B)" diagnostics check for the full
+  // reasoning (BigCommerce's confirmed single-price-field collapse, unconfirmed on Shopify/HQ's
+  // own catalog build).
   if(order.payment_terms){
-    notes.push({level:'info', text:`${order.payment_terms.payment_terms_name || order.payment_terms.payment_terms_type || 'Deferred payment terms'} order (Shopify Companies / B2B)`});
+    const exciseLinesForB2B = lineItems.filter(li => (li.sku||'').startsWith('TOT_TAXLINE_'));
+    const exciseTotalForB2B = exciseLinesForB2B.reduce((s,li)=>s+num(li.price)*(li.quantity||1), 0);
+    const termsLabel = order.payment_terms.payment_terms_name || order.payment_terms.payment_terms_type || 'Deferred payment terms';
+    if(exciseTotalForB2B > 0){
+      notes.push({level:'flag', text:`${termsLabel} order (Shopify Companies / B2B) — $${exciseTotalForB2B.toFixed(2)} excise tax charged; worth confirming it was computed off this customer's actual wholesale price, not the standard catalog price`});
+    } else {
+      notes.push({level:'info', text:`${termsLabel} order (Shopify Companies / B2B)`});
+    }
   }
 
   const refunds = order.refunds || [];
@@ -2783,6 +2806,80 @@ function renderOverchargeTable(overcharged) {
     </table>`;
 }
 
+function renderPossiblyMissedTaxTable(flaggedOrders) {
+  const rows = [];
+  (flaggedOrders || []).forEach(o => {
+    (o.possiblyMissedTaxLines || []).forEach(l => {
+      rows.push(`
+    <tr>
+      <td>${escapeAttr(String(o.id))}</td>
+      <td>${escapeAttr(o.shippingRegion || '—')}</td>
+      <td>${escapeAttr(l.sku)}</td>
+      <td>${escapeAttr(l.productName || '—')}</td>
+      <td>${escapeAttr(String(l.qty))}</td>
+      <td>$${escapeAttr(String(l.catalogPrice))}</td>
+    </tr>`);
+    });
+  });
+  return `
+    <table class="cfg" style="margin-top:0;">
+      <thead><tr><th>Order ID</th><th>Region</th><th>SKU</th><th>Product</th><th>Qty</th><th>Catalog price</th></tr></thead>
+      <tbody>${rows.join('')}</tbody>
+    </table>`;
+}
+
+function renderWholesaleCostMismatchTable(flaggedOrders) {
+  const rows = [];
+  (flaggedOrders || []).forEach(o => {
+    (o.wholesaleCostMismatches || []).forEach(m => {
+      rows.push(`
+    <tr>
+      <td>${escapeAttr(String(o.id))}</td>
+      <td>${escapeAttr(o.shippingRegion || '—')}</td>
+      <td>${escapeAttr(m.sku || '—')}</td>
+      <td>${escapeAttr(m.productName || '—')}</td>
+      <td>${escapeAttr(m.ruleKey)}</td>
+      <td>$${escapeAttr(String(m.wholesaleCost))}</td>
+      <td>${escapeAttr(String(Math.round(m.rate * 1000) / 10))}%</td>
+      <td>$${escapeAttr(String(m.expectedUnitTax))}</td>
+      <td>$${escapeAttr(String(m.actualUnitTax))}</td>
+      <td><span class="badge flag">${escapeAttr(m.direction)}</span></td>
+    </tr>`);
+    });
+  });
+  return `
+    <table class="cfg" style="margin-top:0;">
+      <thead><tr><th>Order ID</th><th>Region</th><th>SKU</th><th>Product</th><th>Rule</th><th>Wholesale cost</th><th>Rate</th><th>Expected unit tax</th><th>Actual unit tax</th><th>Direction</th></tr></thead>
+      <tbody>${rows.join('')}</tbody>
+    </table>`;
+}
+
+function renderFlatRateMismatchTable(flaggedOrders) {
+  const rows = [];
+  (flaggedOrders || []).forEach(o => {
+    (o.flatRateMismatches || []).forEach(m => {
+      rows.push(`
+    <tr>
+      <td>${escapeAttr(String(o.id))}</td>
+      <td>${escapeAttr(o.shippingRegion || '—')}</td>
+      <td>${escapeAttr(m.sku || '—')}</td>
+      <td>${escapeAttr(m.productName || '—')}</td>
+      <td>${escapeAttr(m.ruleKey)}</td>
+      <td>${escapeAttr(String(m.volumeInMl))} mL</td>
+      <td>$${escapeAttr(String(m.rate))}/mL</td>
+      <td>$${escapeAttr(String(m.expectedUnitTax))}</td>
+      <td>$${escapeAttr(String(m.actualUnitTax))}</td>
+      <td><span class="badge flag">${escapeAttr(m.direction)}</span></td>
+    </tr>`);
+    });
+  });
+  return `
+    <table class="cfg" style="margin-top:0;">
+      <thead><tr><th>Order ID</th><th>Region</th><th>SKU</th><th>Product</th><th>Rule</th><th>Volume</th><th>Rate</th><th>Expected unit tax</th><th>Actual unit tax</th><th>Direction</th></tr></thead>
+      <tbody>${rows.join('')}</tbody>
+    </table>`;
+}
+
 function renderHqResults() {
   const panel = document.getElementById('hqResultsPanel');
   const summary = document.getElementById('hqResultsSummary');
@@ -2792,8 +2889,11 @@ function renderHqResults() {
 
   const flagged = HQ_RESULTS.filter(r => r.mismatchCount > 0);
   const overchargedOrgs = HQ_RESULTS.filter(r => r.overchargedCount > 0);
+  const possiblyMissedTaxOrgs = HQ_RESULTS.filter(r => r.possiblyMissedTaxCount > 0);
+  const wholesaleCostOrgs = HQ_RESULTS.filter(r => r.wholesaleCostFlaggedCount > 0);
+  const flatRateOrgs = HQ_RESULTS.filter(r => r.flatRateFlaggedCount > 0);
   const errored = HQ_RESULTS.filter(r => r.error);
-  summary.textContent = `Scanned ${HQ_RESULTS.length} org(s) — ${flagged.length} with mismatches, ${overchargedOrgs.length} with a stale catalog price (possible overcharge), ${errored.length} couldn't be scanned.`;
+  summary.textContent = `Scanned ${HQ_RESULTS.length} org(s) — ${flagged.length} with mismatches, ${overchargedOrgs.length} with a stale catalog price (possible overcharge), ${possiblyMissedTaxOrgs.length} with a possible missed tax (isExempt fallback), ${wholesaleCostOrgs.length} with a wholesale-cost-basis rate mismatch, ${flatRateOrgs.length} with a flat per-mL rate mismatch, ${errored.length} couldn't be scanned.`;
 
   list.innerHTML = '';
   HQ_RESULTS.forEach((r, i) => {
@@ -2810,15 +2910,21 @@ function renderHqResults() {
       const badge = r.mismatchCount > 0 ? 'flag' : 'ok';
       const badgeText = r.mismatchCount > 0 ? `${r.mismatchCount} mismatch(es)` : 'Clean';
       const overchargeBadge = r.overchargedCount > 0 ? `<span class="badge flag" style="margin-left:6px;">${r.overchargedCount} order(s) w/ stale price</span>` : '';
+      const possiblyMissedTaxBadge = r.possiblyMissedTaxCount > 0 ? `<span class="badge flag" style="margin-left:6px;">${r.possiblyMissedTaxCount} order(s) w/ possible missed tax</span>` : '';
+      const wholesaleCostBadge = r.wholesaleCostFlaggedCount > 0 ? `<span class="badge flag" style="margin-left:6px;">${r.wholesaleCostFlaggedCount} order(s) w/ wholesale-cost mismatch</span>` : '';
+      const flatRateBadge = r.flatRateFlaggedCount > 0 ? `<span class="badge flag" style="margin-left:6px;">${r.flatRateFlaggedCount} order(s) w/ flat-rate mismatch</span>` : '';
       item.innerHTML = `
         <div class="diag-head">
           <div class="diag-title">${escapeAttr(r.domain)}</div>
-          <span class="badge ${badge}">${badgeText}</span>${overchargeBadge}
+          <span class="badge ${badge}">${badgeText}</span>${overchargeBadge}${possiblyMissedTaxBadge}${wholesaleCostBadge}${flatRateBadge}
         </div>
         <div class="diag-summary">${r.checked} order(s) found and checked (${r.notFound} in the range didn't exist / 404'd) — ${r.mismatchCount} of those ${r.checked} show the mismatch pattern.${r.highestFoundId != null ? ` Newest order found: <strong>${r.highestFoundId}</strong> — use this as next cycle's start ID.` : ''}</div>
         ${r.notRequired != null ? `<div class="diag-summary" style="margin-top:4px;">${r.checked} checked:<div style="margin-top:2px;padding-left:14px;font-family:monospace;line-height:1.6;">${r.notRequired} tot-excise-tax-not-required<br>${r.collected} tot-excise-tax-collected<br>${r.incorrect} tot-excise-tax-incorrect</div></div>` : ''}
         ${r.mismatchCount > 0 ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><div style="font-weight:600;margin-bottom:4px;">Order IDs tagged tot-excise-tax-incorrect:</div>${renderMismatchTable(r.mismatches)}</div>` : ''}
-        ${r.overchargedCount > 0 ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><div style="font-weight:600;margin-bottom:4px;">${r.overchargedCount} order(s) with a line where TOT's saved catalog price is above what was actually charged:</div><div class="diag-summary" style="margin-bottom:6px;">Estimated tax overcharged so far: <strong>~$${r.estimatedOverchargeTotal}</strong>. Only jurisdiction+SKU-type combos confirmed retail-price-based on TaxOps Portal's State Tax Rules page are checked at all (currently NY::vape and WA::vape/nicotinePouch) — everything else is skipped by default, since most states tax by wholesale cost/price, a flat per-mL/per-unit amount, or not at all, where a stale catalog retail price is irrelevant to the tax owed. This is still an estimate, not a confirmed dollar amount — always double-check against HQ's "How was this tax calculated" tool before acting on it.</div>${renderOverchargeTable(r.overcharged)}</div>` : ''}`;
+        ${r.overchargedCount > 0 ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><div style="font-weight:600;margin-bottom:4px;">${r.overchargedCount} order(s) with a line where TOT's saved catalog price is above what was actually charged:</div><div class="diag-summary" style="margin-bottom:6px;">Estimated tax overcharged so far: <strong>~$${r.estimatedOverchargeTotal}</strong>. Only jurisdiction+SKU-type combos confirmed retail-price-based on TaxOps Portal's State Tax Rules page are checked at all (currently NY::vape and WA::vape/nicotinePouch) — everything else is skipped by default, since most states tax by wholesale cost/price, a flat per-mL/per-unit amount, or not at all, where a stale catalog retail price is irrelevant to the tax owed. This is still an estimate, not a confirmed dollar amount — always double-check against HQ's "How was this tax calculated" tool before acting on it.</div>${renderOverchargeTable(r.overcharged)}</div>` : ''}
+        ${r.possiblyMissedTaxCount > 0 ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><div style="font-weight:600;margin-bottom:4px;">${r.possiblyMissedTaxCount} order(s) with a nicotine vape line marked exempt but missing its volume classification:</div><div class="diag-summary" style="margin-bottom:6px;">Speculative, unconfirmed lead — not a proven miss. Per BigCommerce's own totProductBuilder.node.js source, a vape product's isExempt gets set to true automatically whenever it's missing volumeInMl or a classifiable vapeSystemType, which is a fallback for incomplete product data rather than a genuine exemption. These lines match that pattern (isExempt, hasNicotine, no volumeInMl on file, non-trivial catalog price) but haven't been checked against a real order the way the overcharge findings above were. Verify each one manually via HQ's "How was this tax calculated" tool before treating it as a real missed tax.</div>${renderPossiblyMissedTaxTable(r.possiblyMissedTax)}</div>` : ''}
+        ${r.wholesaleCostFlaggedCount > 0 ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><div style="font-weight:600;margin-bottom:4px;">${r.wholesaleCostFlaggedCount} order(s) with a wholesale-cost-basis tax mismatch:</div><div class="diag-summary" style="margin-bottom:6px;">These states (CO, DC, HI, ME, MA, NV, OR, TN, UT, VT, WY) tax as a percentage of wholesaleCost — a field distinct from retailPrice/wholesalePrice/msrp, so this is a direct expected-vs-actual comparison, not a price-gap estimate. Only CO is confirmed against a real order; the rest are transcribed from the TaxOps sheet and unverified — and it's unconfirmed whether calc-detail always exposes wholesaleCost the way it exposes retailPrice, so a quiet run isn't proof of a clean one either. "Direction" shows whether the actual unit tax charged was above or below the expected amount. Verify each hit via HQ's "How was this tax calculated" tool before acting on it.</div>${renderWholesaleCostMismatchTable(r.wholesaleCostFlagged)}</div>` : ''}
+        ${r.flatRateFlaggedCount > 0 ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><div style="font-weight:600;margin-bottom:4px;">${r.flatRateFlaggedCount} order(s) with a flat per-mL rate mismatch:</div><div class="diag-summary" style="margin-bottom:6px;">These states (VA, OH, DE, IA, KS, LA, NC, WV, WI) tax a flat dollar amount per mL, with no price/cost field involved at all — the most reliable check in this tool, since there's no price-field ambiguity to get wrong. VA and OH are confirmed against real orders (2447866, 2447910); the rest are transcribed from the TaxOps sheet and unverified. "Direction" shows whether the actual unit tax charged was above or below the expected amount. Verify each hit via HQ's "How was this tax calculated" tool before acting on it.</div>${renderFlatRateMismatchTable(r.flatRateFlagged)}</div>` : ''}`;
     }
     list.appendChild(item);
   });
@@ -2967,6 +3073,80 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
       'US.regionCode.WA::nicotinePouch': 0.95
     };
 
+    // Wholesale-cost-basis verification (2026-08-24). Most of the states the
+    // two allowlists above skip entirely tax as a percentage of wholesale
+    // cost, per the same TaxOps Portal State Tax Rules page — see the README
+    // changelog for the full transcription. Unlike retailPrice/wholesalePrice/
+    // msrp, which are all confirmed (via direct source read of BigCommerce's
+    // totProductBuilder.node.js) to trace back to the exact same underlying
+    // field, wholesaleCost is sourced from a genuinely distinct one
+    // (variant.cost_price / product.cost_price) — so a wholesale-cost-basis
+    // state doesn't carry the "which price field" ambiguity the overcharge
+    // heuristic above is limited by. Where the correct rate is known, the
+    // correct per-unit tax is fully knowable, so a mismatch here can be
+    // flagged outright — in EITHER direction, not just "possible overcharge."
+    //
+    // Rates below are transcribed straight from the sheet; only CO is
+    // confirmed against a real order (2447918). The rest are unverified
+    // against a live order the way CO, NY, and WA are — treat hits as leads
+    // to confirm via HQ's "How was this tax calculated" tool, same caution
+    // as the possiblyMissedTaxLines check elsewhere in this function.
+    //
+    // Deliberately excluded from this list:
+    // - CA: compound (51.08% wholesale + a separate 12.5% retail component on
+    //   the same sale) — a single rate can't represent two stacked taxes.
+    // - MN: sheet shows 95%, which looks like it's missing a "%" sign per the
+    //   README's note on it — rate itself isn't trusted.
+    // - PA: sheet says wholesale-basis, but the original vaperanger.com
+    //   investigation found TOT's real PA tax tracking catalog retailPrice
+    //   almost exactly — a confirmed contradiction between the sheet and
+    //   TOT's actual behavior for this state specifically. Left off both
+    //   allowlists until that discrepancy is resolved with whoever owns the
+    //   rule engine.
+    //
+    // Also unconfirmed: whether calc-detail's per-product entries (cd.products
+    // below) actually expose a wholesaleCost field the same way they expose
+    // retailPrice — this hasn't been checked against a live order this
+    // session. If they don't, this check simply never finds anything to flag
+    // (guarded below), rather than erroring — but it means an empty result
+    // here isn't yet proof that everything's fine, only that either nothing
+    // reached this rate table or the field itself isn't present. Worth
+    // confirming on a real CO/DC/HI/etc. order before trusting a clean run.
+    const WHOLESALE_COST_BASED = {
+      'US.regionCode.CO::vape': 0.56, // confirmed via order 2447918
+      'US.regionCode.DC::vape': 0.64,
+      'US.regionCode.HI::vape': 0.70,
+      'US.regionCode.ME::vape': 0.75,
+      'US.regionCode.MA::vape': 0.75,
+      'US.regionCode.NV::vape': 0.30,
+      'US.regionCode.OR::vape': 0.65,
+      'US.regionCode.TN::vape': 0.10,
+      'US.regionCode.UT::vape': 0.71,
+      'US.regionCode.VT::vape': 0.92,
+      'US.regionCode.WY::vape': 0.15
+    };
+
+    // Flat per-mL-basis verification (2026-08-24) — same idea as
+    // WHOLESALE_COST_BASED just above, for states where price/cost isn't an
+    // input to the tax at all: a flat dollar amount per mL of e-liquid. VA
+    // and OH are confirmed via real orders (2447866, 2447910); the rest are
+    // transcribed from the same TaxOps sheet and unverified. volumeInMl is
+    // confirmed present on the ORDER endpoint's per-SKU catalog snapshot (see
+    // possiblyMissedTaxLines below) — whether calc-detail's per-product
+    // entries carry the same field the way they carry retailPrice hasn't
+    // been directly confirmed, same open question as wholesaleCost above.
+    const FLAT_RATE_PER_ML = {
+      'US.regionCode.VA::vape': 0.11, // confirmed via order 2447866
+      'US.regionCode.OH::vape': 0.10, // confirmed via order 2447910
+      'US.regionCode.DE::vape': 0.05,
+      'US.regionCode.IA::vape': 0.05,
+      'US.regionCode.KS::vape': 0.05,
+      'US.regionCode.LA::vape': 0.15,
+      'US.regionCode.NC::vape': 0.05,
+      'US.regionCode.WV::vape': 0.075,
+      'US.regionCode.WI::vape': 0.05
+    };
+
     // One-time cleanup: purge any previously-learned rate for a key that
     // isn't on the new allowlist — almost everything learned before this
     // fix (e.g. the old OH::vape 27.3%/n=145 entry) was learned under the
@@ -3023,6 +3203,67 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
           } else {
             rateDirectory[key] = { rate: Math.round(observedRate * 100000) / 100000, samples: 1, taxLabel: rule.taxLabel || null, lastOrderId: id };
           }
+        });
+      });
+
+      // Wholesale-cost-basis mismatch check (2026-08-24) — see
+      // WHOLESALE_COST_BASED above for the rate table and its caveats. Kept
+      // as its own pass over cd.products rather than folded into the
+      // retailPrice-rate-learning loop above, since it must not be gated on
+      // p.retailPrice being present (a product taxed on wholesaleCost has no
+      // reason to also carry a populated retailPrice). Flags a real
+      // over/under mismatch directly wherever the rate is known, rather than
+      // an estimate — see the caveats above on which of these rates are
+      // actually confirmed vs. just transcribed from the sheet.
+      const wholesaleCostMismatches = [];
+      (cd.products || []).forEach(p => {
+        if (p.wholesaleCost == null || !(p.wholesaleCost > 0)) return;
+        (p.appliedRules || []).forEach(rule => {
+          if (!rule.ruleId || !rule.ruleSet || rule.unitTax == null) return;
+          const wKey = rule.ruleId + '::' + rule.ruleSet;
+          const wRate = WHOLESALE_COST_BASED[wKey];
+          if (wRate == null) return;
+          const expectedUnitTax = Math.round(p.wholesaleCost * wRate * 100) / 100;
+          const actualUnitTax = Math.round(rule.unitTax * 100) / 100;
+          if (Math.abs(expectedUnitTax - actualUnitTax) <= 0.02) return; // within rounding tolerance
+          wholesaleCostMismatches.push({
+            sku: p.sku || null,
+            productName: p.productName || null,
+            ruleKey: wKey,
+            wholesaleCost: p.wholesaleCost,
+            rate: wRate,
+            expectedUnitTax,
+            actualUnitTax,
+            direction: actualUnitTax > expectedUnitTax ? 'overcharged' : 'undercharged'
+          });
+        });
+      });
+
+      // Flat per-mL-basis mismatch check (2026-08-24) — see FLAT_RATE_PER_ML
+      // above. Same structure as the wholesaleCost pass just above, gated on
+      // volumeInMl instead so it doesn't depend on retailPrice or
+      // wholesaleCost being present either.
+      const flatRateMismatches = [];
+      (cd.products || []).forEach(p => {
+        if (p.volumeInMl == null || !(p.volumeInMl > 0)) return;
+        (p.appliedRules || []).forEach(rule => {
+          if (!rule.ruleId || !rule.ruleSet || rule.unitTax == null) return;
+          const fKey = rule.ruleId + '::' + rule.ruleSet;
+          const fRate = FLAT_RATE_PER_ML[fKey];
+          if (fRate == null) return;
+          const expectedUnitTax = Math.round(p.volumeInMl * fRate * 100) / 100;
+          const actualUnitTax = Math.round(rule.unitTax * 100) / 100;
+          if (Math.abs(expectedUnitTax - actualUnitTax) <= 0.02) return; // within rounding tolerance
+          flatRateMismatches.push({
+            sku: p.sku || null,
+            productName: p.productName || null,
+            ruleKey: fKey,
+            volumeInMl: p.volumeInMl,
+            rate: fRate,
+            expectedUnitTax,
+            actualUnitTax,
+            direction: actualUnitTax > expectedUnitTax ? 'overcharged' : 'undercharged'
+          });
         });
       });
 
@@ -3117,6 +3358,40 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
         };
       }).filter(Boolean);
 
+      // Possible missed tax (2026-08-24) — the opposite failure mode from the
+      // overcharge check above. Per BigCommerce's totProductBuilder.node.js
+      // (confirmed by directly reading the source on Bitbucket once Darrin
+      // granted access), a vape-type product's isExempt gets set to true
+      // automatically whenever it's missing volumeInMl or a classifiable
+      // vapeSystemType — that's a fallback for incomplete product data, not
+      // a real tax exemption. A line whose SKU is marked isExempt but also
+      // has hasNicotine:true, no volumeInMl on file, and a real (non-trivial)
+      // catalog price looks exactly like that fallback rather than a
+      // genuinely exempt line (e.g. a $0.01 kit accessory that's correctly
+      // exempt). Unlike the overcharge checks above, this hasn't been
+      // confirmed against a real order yet — it's a lead derived from
+      // BigCommerce's source, not independently verified for Shopify/HQ's
+      // own product-sync path — so every hit here needs manual confirmation
+      // via HQ's "How was this tax calculated" tool before treating it as a
+      // real miss. Scoped to type:'vape' only for now: nicotine pouches use
+      // a different pair of required fields (weightInOz/pouchesPerContainer)
+      // that haven't been confirmed present in this order endpoint's per-SKU
+      // catalog snapshot the way hasNicotine/volumeInMl have been.
+      const possiblyMissedTaxLines = (order?.transactionLines || []).map(l => {
+        const p = catalog[l.sku];
+        if (!p || !p.isExempt) return null;
+        if (p.type !== 'vape' || !p.hasNicotine) return null;
+        if (p.volumeInMl != null) return null; // has the field a fully-classified vape product would have
+        const price = p.retailPrice ?? p.wholesalePrice ?? p.msrp;
+        if (price == null || price <= 1) return null; // skip trivial/kit-filler-priced lines
+        return {
+          sku: l.sku,
+          productName: p.productName || null,
+          qty: l.quantity,
+          catalogPrice: price
+        };
+      }).filter(Boolean);
+
       return {
         id,
         exciseTaxCollected: order?.exciseTaxCollected,
@@ -3126,7 +3401,13 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
         recalculatedTaxSum: Math.round(taxSum * 100) / 100,
         mismatch: (order?.exciseTaxCollected === '0' && taxSum > 0),
         overchargeLineCount: overchargeLines.length,
-        overchargeLines
+        overchargeLines,
+        possiblyMissedTaxLineCount: possiblyMissedTaxLines.length,
+        possiblyMissedTaxLines,
+        wholesaleCostMismatchCount: wholesaleCostMismatches.length,
+        wholesaleCostMismatches,
+        flatRateMismatchCount: flatRateMismatches.length,
+        flatRateMismatches
       };
     }
 
@@ -3201,6 +3482,26 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
     const overchargeLinesWithEstimate = overcharged.reduce((s, r) => s + (r.overchargeLines || []).filter(l => l.estimatedOvertaxTotal != null).length, 0);
     const overchargeLinesTotal = overcharged.reduce((s, r) => s + (r.overchargeLines || []).length, 0);
 
+    // Orders with at least one line flagged as a possible missed tax (isExempt
+    // fallback due to incomplete product data) — see possiblyMissedTaxLines
+    // above. Unconfirmed/heuristic, same caveats as noted there.
+    const possiblyMissedTax = results.filter(r => r.possiblyMissedTaxLineCount > 0);
+
+    // Orders with at least one wholesale-cost-basis rate mismatch — see
+    // WHOLESALE_COST_BASED and the wholesaleCostMismatches pass above. Unlike
+    // the overcharge/possiblyMissedTax checks, a hit here is a direct
+    // over/under mismatch against a known rate, not a price-gap estimate —
+    // though the rate itself, and whether wholesaleCost is even present on
+    // calc-detail's per-product entries, are less battle-tested than the
+    // CO/NY/WA checks (see the caveats on WHOLESALE_COST_BASED above).
+    const wholesaleCostFlagged = results.filter(r => r.wholesaleCostMismatchCount > 0);
+
+    // Orders with at least one flat per-mL-basis rate mismatch — see
+    // FLAT_RATE_PER_ML and the flatRateMismatches pass above. Same
+    // confidence profile as the wholesale-cost check: VA/OH are confirmed,
+    // the rest are transcribed and unverified.
+    const flatRateFlagged = results.filter(r => r.flatRateMismatchCount > 0);
+
     // Persist the (possibly updated) rate directory once, at the end of this
     // call, rather than per-order — keeps storage writes cheap while still
     // letting later orders/orgs in the same run (and future runs) benefit
@@ -3212,7 +3513,13 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
       lastIdChecked, highestFoundId, notRequired, collected, incorrect,
       overchargedCount: overcharged.length,
       overcharged: overcharged.map(r => ({ id: r.id, shippingRegion: r.shippingRegion, overchargeLines: r.overchargeLines })),
-      estimatedOverchargeTotal, overchargeLinesWithEstimate, overchargeLinesTotal
+      estimatedOverchargeTotal, overchargeLinesWithEstimate, overchargeLinesTotal,
+      possiblyMissedTaxCount: possiblyMissedTax.length,
+      possiblyMissedTax: possiblyMissedTax.map(r => ({ id: r.id, shippingRegion: r.shippingRegion, possiblyMissedTaxLines: r.possiblyMissedTaxLines })),
+      wholesaleCostFlaggedCount: wholesaleCostFlagged.length,
+      wholesaleCostFlagged: wholesaleCostFlagged.map(r => ({ id: r.id, shippingRegion: r.shippingRegion, wholesaleCostMismatches: r.wholesaleCostMismatches })),
+      flatRateFlaggedCount: flatRateFlagged.length,
+      flatRateFlagged: flatRateFlagged.map(r => ({ id: r.id, shippingRegion: r.shippingRegion, flatRateMismatches: r.flatRateMismatches }))
     };
   })();
 }
@@ -3373,7 +3680,7 @@ async function runHqScan() {
     }
 
     if (scanResult.ok) {
-      HQ_RESULTS.push({ domain: current.domain, checked: scanResult.checked, notFound: scanResult.notFound, mismatchCount: scanResult.mismatchCount, mismatches: scanResult.mismatches, highestFoundId: scanResult.highestFoundId, openEnded: current.idStart != null && current.idEnd == null, notRequired: scanResult.notRequired, collected: scanResult.collected, incorrect: scanResult.incorrect, overchargedCount: scanResult.overchargedCount, overcharged: scanResult.overcharged, estimatedOverchargeTotal: scanResult.estimatedOverchargeTotal, overchargeLinesWithEstimate: scanResult.overchargeLinesWithEstimate, overchargeLinesTotal: scanResult.overchargeLinesTotal });
+      HQ_RESULTS.push({ domain: current.domain, checked: scanResult.checked, notFound: scanResult.notFound, mismatchCount: scanResult.mismatchCount, mismatches: scanResult.mismatches, highestFoundId: scanResult.highestFoundId, openEnded: current.idStart != null && current.idEnd == null, notRequired: scanResult.notRequired, collected: scanResult.collected, incorrect: scanResult.incorrect, overchargedCount: scanResult.overchargedCount, overcharged: scanResult.overcharged, estimatedOverchargeTotal: scanResult.estimatedOverchargeTotal, overchargeLinesWithEstimate: scanResult.overchargeLinesWithEstimate, overchargeLinesTotal: scanResult.overchargeLinesTotal, possiblyMissedTaxCount: scanResult.possiblyMissedTaxCount, possiblyMissedTax: scanResult.possiblyMissedTax, wholesaleCostFlaggedCount: scanResult.wholesaleCostFlaggedCount, wholesaleCostFlagged: scanResult.wholesaleCostFlagged, flatRateFlaggedCount: scanResult.flatRateFlaggedCount, flatRateFlagged: scanResult.flatRateFlagged });
       setHqStatus(`${current.domain}: checked ${scanResult.checked}, ${scanResult.mismatchCount} mismatch(es).`, scanResult.mismatchCount > 0 ? 'err' : 'ok');
     } else {
       HQ_RESULTS.push({ domain: current.domain, error: scanResult.reason });
