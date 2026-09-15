@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "TOT Order Diagnostics Tool",
-  "version": "3.10.0",
-  "version_name": "3.10.0-proposed (HQ Excise Tax scan draft)",
-  "description": "Look up Shopify, BigCommerce, or WooCommerce orders directly and run excise tax troubleshooting checks. Shopify: 9 checks incl. TOT tags, PMD, tax jurisdiction match, live price check, plus 2 conditional checks (excise vs. compliance sheet, Net 30/B2B payment terms). BigCommerce (beta): verification status, excise tax line item incl. jurisdiction/compliance cross-check, payment/address/coupon/cart checks. WooCommerce (step 1): order fetch + raw custom-field display, diagnostics not yet built. HQ Excise Tax scan (proposed): automates the Active Monitoring order sweep against the internal Excise Tax Order API across multiple client orgs.",
+  "version": "3.17.37",
+  "version_name": "3.17.37 (Order Investigation tab: added a 'Show per-product breakdown' button next to Investigate, calling GET /exciseTax/orders/{id}/calc-detail directly and rendering the SKU-level tax breakdown per HQ's own 'Excise Tax Per-Product Breakdown API' doc — same doc Charlie sent frepouch.com. Built for the frepouch.com Trello card: Charlie says the feature already ships with no work needed, and asked Marc to confirm by pulling a real giantvapes.com order through it. Reuses the existing ops token (invGetToken) and Order ID/Target app domain fields already on the Investigate panel — no separate credentials. Sums appliedRules[].taxForQty per line, shows skippedProducts with their reason (per the doc: an empty/missing breakdown is a documented 'not stored' success case, not proof no tax was charged), and an order total. NOTE: whether the ops key's cross-tenant access (proven for Investigate via targetAppDomain) also applies to calc-detail is unverified — passed through defensively but not assumed; this is the actual live test to run, not a confirmed-working feature)",
+  "description": "Look up Shopify, BigCommerce, or WooCommerce orders directly and run excise tax troubleshooting checks. Shopify: 9 checks incl. TOT tags, PMD, tax jurisdiction match, live price check, plus 2 conditional checks. BigCommerce: verification status, excise tax line item incl. jurisdiction/compliance cross-check, payment/address/coupon/cart checks. WooCommerce: order fetch + raw custom-field display. Also includes an HQ Excise Tax scan across client orgs, a Taxlines CSV export by date range, a Product Data Backfill tool for missing BigCommerce catalog data, an Order Investigation deep-dive via HQ's API, and inline Sentry event search.",
   "action": {
     "default_title": "Order Diagnostics Tool",
     "default_icon": {
@@ -26,5 +26,5 @@
     "128": "icon128.png"
   },
   "permissions": ["storage", "sidePanel", "scripting", "tabs"],
-  "host_permissions": ["https://admin.shopify.com/*", "https://docs.google.com/*", "https://*.googleusercontent.com/*", "https://*.myshopify.com/*", "https://*.mybigcommerce.com/*", "https://vapesocietysupplies.com/*", "https://vapedepotusa.com/*", "https://app.tokenoftrust.com/*"]
+  "host_permissions": ["https://admin.shopify.com/*", "https://docs.google.com/*", "https://*.googleusercontent.com/*", "https://*.myshopify.com/*", "https://*.mybigcommerce.com/*", "https://vapesocietysupplies.com/*", "https://vapedepotusa.com/*", "https://app.tokenoftrust.com/*", "https://taxes.tokenoftrust.com/*", "https://sentry.io/*"]
 }

@@ -91,6 +91,13 @@
   .status-line.err{color:var(--danger);border-color:#5a2626;background:var(--danger-dim);}
   .status-line.ok{color:var(--accent);border-color:#1c5a3d;background:var(--accent-dim);}
 
+  .progress-track{
+    height:6px;border-radius:4px;background:var(--panel2);border:1px solid var(--border);
+    overflow:hidden;margin-top:6px;display:none;
+  }
+  .progress-track.show{display:block;}
+  .progress-fill{height:100%;background:var(--accent);width:0%;transition:width .25s ease;}
+
   details.config{margin-top:8px;}
   details.config summary{
     cursor:pointer;font-size:11.5px;color:var(--muted);list-style:none;display:flex;align-items:center;gap:6px;
@@ -107,12 +114,36 @@
   table.cfg td{padding:3px 5px;border-bottom:1px solid var(--border);}
   table.cfg input{padding:4px 5px;font-size:11px;}
   table.cfg tr:last-child td{border-bottom:none;}
+
+  /* Fixed 2026-09-03: wide results tables (flat-rate mismatch, wholesale-cost
+     mismatch, Tax Ops cross-check, etc.) were forced into the panel's fixed
+     width via table.cfg's own width:100%, squeezing every column until the
+     rightmost one (usually the Direction badge) got clipped at the panel edge
+     with no visible affordance to see the rest. Any wide results table should
+     be wrapped in <div class="table-scroll">...</div> (see popup.js) so it
+     scrolls horizontally on its own, independent of the rest of the panel,
+     instead of squeezing or clipping. Not applied to the shorter editable
+     config tables (renderCfgTable/renderHqQueueTable/renderHqDomainsTable),
+     which don't have this problem. */
+  .table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+  .table-scroll table.cfg{width:max-content;min-width:100%;}
+  .table-scroll table.cfg th, .table-scroll table.cfg td{white-space:nowrap;}
   .row-del{color:var(--danger);cursor:pointer;font-size:13px;background:none;border:none;padding:0 3px;}
 
   .diag-item{border:1px solid var(--border);border-radius:7px;padding:10px 11px;margin-bottom:8px;background:var(--panel2);}
   .diag-head{display:flex;align-items:center;justify-content:space-between;gap:8px;cursor:pointer;}
   .diag-title{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;}
   .diag-num{font-family:var(--mono);font-size:10px;color:var(--muted);width:18px;text-align:right;}
+  /* Fixed 2026-09-03: when an org has 2+ status badges (e.g. CLEAN plus a
+     flat-rate-mismatch flag), each badge was its own direct child of
+     .diag-head, so justify-content:space-between spread them evenly across
+     the FULL row width instead of clustering them together — the first
+     badge sat right after the domain name, the next one landed way out at
+     the row's right edge with a huge gap in between. All badges are now
+     wrapped in a single .diag-badges flex group so .diag-head only ever
+     has two children (title, badge group) and space-between just pushes
+     that whole group to the right, tightly clustered internally via gap. */
+  .diag-badges{display:flex;align-items:center;flex-wrap:wrap;gap:6px;}
   .badge{
     font-family:var(--mono);font-size:9.5px;font-weight:700;padding:2px 7px;border-radius:20px;
     letter-spacing:.04em;text-transform:uppercase;white-space:nowrap;
@@ -188,7 +219,9 @@
     <button class="platform-tab active" data-platform="shopify">Shopify</button>
     <button class="platform-tab" data-platform="bigcommerce">BigCommerce</button>
     <button class="platform-tab" data-platform="woocommerce">WooCommerce</button>
-    <button class="platform-tab" data-platform="hq">HQ Excise Tax <span style="text-transform:none;font-weight:400;color:var(--warn);">(proposed)</span></button>
+    <button class="platform-tab" data-platform="hq">HQ Excise Tax</button>
+    <button class="platform-tab" data-platform="backfill">Product Backfill</button>
+    <button class="platform-tab" data-platform="investigate">Order Investigation</button>
   </div>
 
   <div class="platform-panel active" id="platformShopify">
@@ -325,6 +358,8 @@
     <div class="hint" style="margin-bottom:10px;">Scans a range of BigCommerce order IDs using the store's subdomain entered above, and flags only the ones worth a closer look. Unlike Shopify's bulk scan, this only supports a continuous numeric range (not a comma-separated list) — BigCommerce's order-list range filter (<code>orderFrom</code>/<code>orderTo</code>) works on a from/to range, confirmed against real data to return every order in between in one fetch, not just the endpoints.</div>
     <label for="bcBulkRangeInput">Order ID range</label>
     <input type="text" id="bcBulkRangeInput" placeholder="e.g. 768170-768173">
+    <label for="bcBulkEmailInput">Find order by email <span style="text-transform:none;font-weight:400;color:var(--warn);">(optional, beta — email parsing not yet confirmed against a real order)</span></label>
+    <input type="text" id="bcBulkEmailInput" placeholder="e.g. purchasing@vapesocietysupplies.com">
     <div class="btn-row">
       <button class="btn primary" id="bcBulkScanBtn">Scan for issues</button>
       <button class="btn ghost small" id="bcBulkClearBtn">Clear</button>
@@ -339,7 +374,7 @@
       <div class="diag-summary" id="bcBulkSummary" style="margin-bottom:8px;"></div>
       <div id="bcBulkResultsList"></div>
     </div>
-    <div class="hint" style="margin-top:8px;">Fetches the order list once (capped at 100 orders per fetch — larger ranges aren't paginated automatically yet), then fetches each matched order's full details sequentially to run diagnostics. This is slower than Shopify's bulk scan, which gets everything in one call — BigCommerce has no single endpoint with both status and excise/address detail together.</div>
+    <div class="hint" style="margin-top:8px;">Fetches the order list once (capped at 100 orders per fetch — larger ranges aren't paginated automatically yet), then fetches each matched order's full details sequentially to run diagnostics. This is slower than Shopify's bulk scan, which gets everything in one call — BigCommerce has no single endpoint with both status and excise/address detail together. If "Find order by email" is filled in, every order in the range is checked against that email (not just ones with other issues) and shown separately below, so you can locate a specific order (e.g. from a support case) and see its verification status even when nothing else about it looks wrong.</div>
   </div>
 
   <div class="panel" id="bcStatusPanel" style="display:none;">
@@ -412,6 +447,18 @@
     <div id="wcDiagList"></div>
   </div>
 
+  <div class="panel" id="wcProductPanel" style="display:none;">
+    <h2>Product & price check <span style="text-transform:none;font-weight:400;color:var(--muted);">(beta)</span></h2>
+    <div class="hint" style="margin-bottom:10px;">Compares each line item's charged price against the product's <em>current</em> WooCommerce price (<code>_regular_price</code> / <code>_sale_price</code>) — same idea as BigCommerce's and Shopify's live-price checks. This does NOT check TOT's own retailPrice/wholesalePrice/msrp fields: those are pushed to/pulled from HQ's API directly and aren't stored as WooCommerce postmeta, so there's nothing on this page to read them from. Variable products are skipped (informational only) since the parent product's page doesn't expose the specific variation's price. A mismatch can also mean the price changed since the order, a coupon was applied, or the order used wholesale pricing this check can't see — use judgment, same as the other platforms' product checks.</div>
+    <div class="btn-row"><button class="btn small" id="wcCheckProductsBtn">Check products & prices</button></div>
+    <div id="wcProductProgressWrap" style="display:none;margin-top:8px;">
+      <div style="height:5px;border-radius:3px;background:var(--panel2);overflow:hidden;">
+        <div id="wcProductProgressBar" style="height:100%;width:0%;background:var(--accent);transition:width .15s ease;"></div>
+      </div>
+    </div>
+    <div id="wcProductResults" style="margin-top:10px;"></div>
+  </div>
+
   <div class="panel" id="wcNotesPanel" style="display:none;">
     <h2>Worth flagging</h2>
     <div id="wcNotesList"></div>
@@ -449,12 +496,12 @@
   <div class="platform-panel" id="platformHQ">
 
   <div class="panel">
-    <h2>HQ Excise Tax scan <span style="text-transform:none;font-weight:400;color:var(--warn);">(proposed — needs team review before real use)</span></h2>
+    <h2>HQ Excise Tax scan</h2>
     <div class="hint" style="margin-bottom:10px;">
-      Automates the Active Monitoring sweep against HQ's internal Excise Tax Order API: opens a tab on HQ, switches to each org below, mints a Try-It-Now access token the same way the API docs page does, verifies it's actually scoped to that org before trusting it, then checks recent orders for the wholesale <code>error.incorrectCollection</code> pattern (excise tax owed but not collected). This rides your own logged-in HQ session — it does not create or store any separate credentials, and can't run unattended (no bearer token exists until a logged-in human has selected that org in HQ).
+      Automates the Active Monitoring sweep against HQ's Excise Tax Order API: opens a tab on HQ, switches to each org below, verifies it's scoped to that org, then checks recent orders for the <code>error.incorrectCollection</code> pattern (tax owed but not collected). Rides your own logged-in HQ session — doesn't create or store separate credentials, and can't run unattended.
     </div>
     <div class="hint" style="margin-bottom:10px;color:var(--warn);">
-      Requires the <code>scripting</code> and <code>tabs</code> permissions plus <code>https://app.tokenoftrust.com/*</code> host access — new capability classes for this extension, worth a deliberate look before merging. See README for the full writeup.
+      Requires the <code>scripting</code> and <code>tabs</code> permissions plus <code>https://app.tokenoftrust.com/*</code> host access.
     </div>
   </div>
 
@@ -496,10 +543,175 @@
     <div id="hqProgressList" style="margin-top:10px;"></div>
   </div>
 
+  <div class="panel">
+    <h2>Export Taxlines CSV for a date range</h2>
+    <div class="hint" style="margin-bottom:8px;">Fetches directly by date instead of guessing a starting order ID. Uses the Excise Tax Order API's <code>since</code>/<code>until</code> endpoint (auto-paginates for ranges over 1,000 orders), pulls order + calc-detail for each, and downloads a Full/Filtered CSV pair when done. This is the standard way to pull the taxlines report, and runs independently of the scan queue above.</div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
+      <div style="min-width:170px;">
+        <label style="margin:0;">Domain</label>
+        <select id="hqTaxlinesDomain" style="width:100%;"></select>
+      </div>
+      <div>
+        <label style="margin:0;">Since</label>
+        <input type="date" id="hqTaxlinesSince" style="width:150px;">
+      </div>
+      <div>
+        <label style="margin:0;">Until <span class="hint" style="display:inline;">(blank = now)</span></label>
+        <input type="date" id="hqTaxlinesUntil" style="width:150px;">
+      </div>
+      <button class="btn primary small" id="hqTaxlinesRangeBtn">Fetch &amp; Export CSV</button>
+    </div>
+    <div class="status-line" id="hqTaxlinesStatus" style="margin-top:8px;"></div>
+    <div class="progress-track" id="hqTaxlinesProgressTrack"><div class="progress-fill" id="hqTaxlinesProgressFill"></div></div>
+  </div>
+
   <div class="panel" id="hqResultsPanel" style="display:none;">
     <h2>Results</h2>
     <div class="diag-summary" id="hqResultsSummary" style="margin-bottom:8px;"></div>
     <div id="hqResultsList"></div>
+  </div>
+
+  </div>
+
+  <div class="platform-panel" id="platformBackfill">
+
+  <div class="panel">
+    <h2>Product data backfill</h2>
+    <div class="hint" style="margin-bottom:10px;">
+      Cross-references HQ's excise-tax "missing data" list against the store's real BigCommerce catalog <em>and</em> TOT's already-completed records for the same product family, fills in whatever's genuinely derivable (never guessed from titles/descriptions), and exports a CSV in HQ's upload format for you to review and upload yourself — it never uploads anything automatically. Misclassified items (e.g. a "Nicotine Pouches" product filed as "vape") go to a separate review list instead of being marked complete under the wrong type. A value derived from a sibling product is filled in but flagged in NOTES for a quick check, never silently confirmed. Anything it can't derive gets a note in a trailing NOTES column instead of a guess. Items with no name/SKU anywhere are skipped by default.
+    </div>
+    <div class="hint" style="margin-bottom:10px;color:var(--warn);">
+      Needs a fresh access token pasted from DevTools each run (see README for the steps) — this is a separate auth system from the Product Sync API.
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Inputs</h2>
+    <label>HQ missing-data URL <span class="hint" style="display:inline;">(DevTools → Network → Fetch/XHR, on <code>/hq/excise-tax/products</code> with "Missing Data" selected — copy the <code>products?accessToken=...</code> request URL)</span></label>
+    <textarea id="pbUrlInput" rows="3" placeholder="https://app.tokenoftrust.com/hq/endpoint/excise/products?accessToken=...&quickView=missingData" style="width:100%;font-family:var(--mono);font-size:11px;"></textarea>
+    <label style="margin-top:10px;">BigCommerce subdomain <span class="hint" style="display:inline;">(the part before .mybigcommerce.com)</span></label>
+    <input type="text" id="pbSubdomain" placeholder="store-xxxxxxxxxx" style="width:100%;">
+  </div>
+
+  <div class="panel">
+    <h2>Run</h2>
+    <div class="hint" style="margin-bottom:8px;">Pulls TOT's full excise-tax product catalog (not just the missing-data slice — needed to find already-completed sibling products), splits out anything that looks misclassified by name, and cross-references the rest against BigCommerce sequentially with a small delay (same pattern as the product & price check elsewhere in this extension). Completely unclassified records are skipped, not checked — see the note above.</div>
+    <div class="btn-row">
+      <button class="btn primary" id="pbRunBtn">Fetch &amp; cross-reference</button>
+      <button class="btn ghost small" id="pbClearBtn">Clear results</button>
+    </div>
+    <div id="pbProgressWrap" style="display:none;margin-top:8px;">
+      <div style="height:5px;border-radius:3px;background:var(--panel2);overflow:hidden;">
+        <div id="pbProgressBar" style="height:100%;width:0%;background:var(--accent);transition:width .15s ease;"></div>
+      </div>
+    </div>
+    <div class="status-line" id="pbStatus" style="margin-top:8px;"></div>
+  </div>
+
+  <div class="panel" id="pbResultsPanel" style="display:none;">
+    <h2>Results</h2>
+    <div class="diag-summary" id="pbResultsSummary" style="margin-bottom:10px;"></div>
+    <div class="btn-row" style="margin-bottom:10px;">
+      <button class="btn small" id="pbDownloadVapeBtn">Download CSV</button>
+      <button class="btn small" id="pbDownloadReviewBtn">Download re-type review list</button>
+    </div>
+    <div id="pbResultsList"></div>
+  </div>
+
+  </div>
+
+  <div class="platform-panel" id="platformInvestigate">
+
+  <div class="panel">
+    <h2>Order Investigation</h2>
+    <div class="hint" style="margin-bottom:10px;">
+      Calls HQ's <code>GET /api/exciseTax/orders/{appTransactionId}/investigation</code> — one read-only call that returns the full evidence for an order: what was collected vs. what TOT calculated at checkout, at record time, and under current rules; the resolved jurisdiction; which rules fired; per-product metadata drift; and a verdict. Replaces the manual calc-detail parsing and state rate table lookups from the HQ Excise Tax Scan tab — use it for one-off "why was this order wrong" investigations, like the 2448091 case.
+    </div>
+    <div class="hint" style="margin-bottom:0;color:var(--warn);">
+      Uses a separate, more sensitive credential: an <code>ops.tokenoftrust.com</code> API key/secret pair with <code>api:opsAdmin</code>, gated behind <code>diagnostic:investigate</code> (a regular signed-in HQ session can't mint this). Stored only in local extension storage, never logged or exported, and sent only as the Authorization header to <code>app.tokenoftrust.com</code>.
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>API credentials</h2>
+    <label>totApiKey <span class="hint" style="display:inline;">(e.g. <code>public_live_...</code> / <code>public_test_...</code>)</span></label>
+    <input type="text" id="invApiKey" placeholder="public_live_..." style="width:100%;font-family:var(--mono);font-size:11px;" autocomplete="off">
+    <label style="margin-top:10px;">totSecretKey <span class="hint" style="display:inline;">(e.g. <code>secret_live_...</code> / <code>secret_test_...</code>)</span></label>
+    <input type="password" id="invSecretKey" placeholder="secret_live_..." style="width:100%;font-family:var(--mono);font-size:11px;" autocomplete="off">
+    <label style="margin-top:10px;">appDomain <span class="hint" style="display:inline;">(confirmed: <code>ops.tokenoftrust.com</code> — get your key pair from HQ &rarr; select <strong>ops</strong> as the vendor &rarr; <strong>Integration</strong> tab, not from any API docs page's example values; this is the accessToken's <em>home</em> domain, separate from whichever order's appDomain/targetAppDomain you investigate below)</span></label>
+    <input type="text" id="invAppDomain" placeholder="ops.tokenoftrust.com" style="width:100%;font-family:var(--mono);font-size:11px;" autocomplete="off">
+    <div class="btn-row" style="margin-top:8px;">
+      <button class="btn primary small" id="invSaveCredsBtn">Save &amp; test credentials</button>
+      <button class="btn ghost small" id="invClearCredsBtn">Clear saved credentials</button>
+    </div>
+    <div class="status-line" id="invCredsStatus" style="margin-top:8px;"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Investigate an order</h2>
+    <label>Order ID (appTransactionId) <span class="hint" style="display:inline;">(the order-of-record id — Shopify order_number, BigCommerce order.id, WooCommerce transaction id)</span></label>
+    <input type="text" id="invOrderId" placeholder="2448091" style="width:100%;">
+    <label style="margin-top:10px;">Target app domain <span class="hint" style="display:inline;">(the client store the order actually belongs to, e.g. <code>vapesocietysupplies.com</code> — almost always required: it defaults to your <em>key's own</em> domain, <code>ops.tokenoftrust.com</code>, which has no real client orders on it, so leaving this blank 404s for any real order. Needs diagnostic:crossTenant, which this ops key has — returns 403 otherwise. List is shared with the HQ Excise Tax Scan tab's <strong>Known domains</strong> — add or fix domains there.)</span></label>
+    <select id="invTargetDomainSelect" style="width:100%;"></select>
+    <input type="text" id="invTargetDomain" placeholder="vapesocietysupplies.com" style="width:100%;margin-top:6px;display:none;">
+    <div style="display:flex;gap:16px;margin-top:10px;flex-wrap:wrap;">
+      <label style="display:flex;align-items:center;gap:6px;font-weight:400;"><input type="checkbox" id="invIncludeHistory" checked style="width:auto;"> Include per-SKU product history</label>
+      <div style="flex:1;min-width:160px;">
+        <label style="margin:0;">Region what-if <span class="hint" style="display:inline;">(optional — 2-3 letter region code, doesn't affect the verdict)</span></label>
+        <input type="text" id="invRegionCode" placeholder="CA" style="width:100%;">
+      </div>
+    </div>
+    <div class="btn-row" style="margin-top:10px;">
+      <button class="btn primary" id="invRunBtn">Investigate</button>
+      <button class="btn ghost" id="invCalcDetailBtn">Show per-product breakdown</button>
+    </div>
+    <div class="status-line" id="invStatus" style="margin-top:8px;"></div>
+  </div>
+
+  <div class="panel" id="invResultsPanel" style="display:none;">
+    <h2>Investigation dossier</h2>
+    <div id="invResultsBody"></div>
+  </div>
+
+  <div class="panel" id="invCalcDetailPanel" style="display:none;">
+    <h2>Per-product excise breakdown <span style="text-transform:none;font-weight:400;color:var(--muted);">(GET /exciseTax/orders/{id}/calc-detail)</span></h2>
+    <div class="hint" style="margin-bottom:10px;">
+      Raw line-item breakdown — same endpoint HQ's own "Excise Tax Orders" API doc describes for client-side reconciliation (e.g. line-item excise amounts for a client's own ERP). Uses the Order ID and Target app domain fields above, and the same ops token as Investigate. Not yet confirmed whether the ops key's cross-tenant access (proven for Investigate via targetAppDomain) also applies here — this is the actual live test, not an assumption baked in ahead of it.
+    </div>
+    <div id="invCalcDetailBody"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Sentry credentials</h2>
+    <div class="hint" style="margin-bottom:10px;">
+      Queries Sentry's API directly using this extension's existing <code>excise.appDomain</code> / <code>excise.appTransactionId</code> tags — the same tags the "Sentry links" section already generates clickable links for. Shows matching events inline instead of clicking out to Sentry. Needs a Sentry auth token with <code>event:read</code> + <code>org:read</code> scope — create one at Sentry &rarr; Settings &rarr; Auth Tokens. Stored only in this browser's local extension storage.
+    </div>
+    <label>Sentry auth token</label>
+    <input type="password" id="sentryAuthToken" placeholder="sntrys_..." style="width:100%;font-family:var(--mono);font-size:11px;" autocomplete="off">
+    <label style="margin-top:10px;">Sentry org slug</label>
+    <input type="text" id="sentryOrg" placeholder="token-of-trust" style="width:100%;font-family:var(--mono);font-size:11px;" autocomplete="off">
+    <label style="margin-top:10px;">Sentry project <span class="hint" style="display:inline;">(optional — narrows results to one project)</span></label>
+    <input type="text" id="sentryProject" placeholder="tot-server" style="width:100%;font-family:var(--mono);font-size:11px;" autocomplete="off">
+    <div class="btn-row" style="margin-top:8px;">
+      <button class="btn primary small" id="sentrySaveCredsBtn">Save &amp; test credentials</button>
+      <button class="btn ghost small" id="sentryClearCredsBtn">Clear saved credentials</button>
+    </div>
+    <div class="status-line" id="sentryCredsStatus" style="margin-top:8px;"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Sentry event search</h2>
+    <div class="hint" style="margin-bottom:10px;">Standalone — doesn't require running a full investigation first, same as the script's own <code>--sentry-only</code> mode.</div>
+    <label>App domain <span class="hint" style="display:inline;">(same list as the Investigate tab's Target app domain and the HQ Excise Tax Scan tab's Known domains — add or fix domains there)</span></label>
+    <select id="sentryAppDomainSelect" style="width:100%;"></select>
+    <input type="text" id="sentryAppDomain" placeholder="vapesocietysupplies.com" style="width:100%;margin-top:6px;display:none;">
+    <label style="margin-top:10px;">Order ID <span class="hint" style="display:inline;">(optional — narrows to one order's events)</span></label>
+    <input type="text" id="sentryOrderId" placeholder="2448091" style="width:100%;">
+    <div class="btn-row" style="margin-top:10px;">
+      <button class="btn primary small" id="sentrySearchStandaloneBtn">Search Sentry</button>
+    </div>
+    <div class="status-line" id="sentryStandaloneStatus" style="margin-top:8px;"></div>
+    <div id="sentryStandaloneResults" style="margin-top:8px;"></div>
   </div>
 
   </div>

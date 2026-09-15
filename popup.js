@@ -544,7 +544,7 @@ function findWrongStateTaxLines(order){
   return {shipStateName, taxLineStates, wrongStateTaxLines};
 }
 
-function analyzeOrder(order, compliance, walletType){
+function analyzeOrder(order, compliance, walletType, rawTxGateways){
   const checks = [];
   const lineItems = order.line_items || [];
 
@@ -616,18 +616,67 @@ function analyzeOrder(order, compliance, walletType){
   const editedItems = lineItems.filter(li => li.current_quantity !== undefined && li.current_quantity !== li.quantity);
   const refunds = order.refunds || [];
   const wasModified = editedItems.length>0 || refunds.length>0;
+
+  // Gap found 2026-09-08 on fistdistro.com order 5280: this order's own Timeline showed two
+  // "[staff] edited this order" entries (Shopify's Order Editor — added/changed line items,
+  // adjusted pricing, etc.), but this check still reported "OK — no edits or refunds detected."
+  // Root cause: this check only ever looks at two REST fields — line_items[].current_quantity
+  // (which only moves on a refund/removal) and order.refunds — and Order Editor changes don't
+  // necessarily touch either one (e.g. adding a new line item, or a price adjustment, moves
+  // neither). The Timeline/edit-history itself isn't in this payload at all: fetchOrderById()
+  // above rides the admin session's own order.json (the classic REST-shaped Order resource),
+  // and that resource has never carried timeline/comment-event data — that's a GraphQL-only
+  // view (Order.events) that would need a separate authenticated call with its own scope, which
+  // this tool doesn't currently request (by design — everything else here rides the existing
+  // session instead of requiring separate API credentials).
+  //
+  // Until that GraphQL upgrade happens, order.updated_at is the best proxy available in data we
+  // already have: it moves on real edits even when current_quantity/refunds don't. It's noisy on
+  // its own (fulfillment/tag/note/risk-analysis writes bump it too), so this is deliberately kept
+  // to 'info' (not 'flag') and only surfaces when nothing more precise already fired, with a
+  // >1hr gap from creation to avoid flagging near-immediate automated post-processing. It cannot
+  // say what changed — only that something did — so the fix is still "go look at the Timeline,"
+  // not a replacement for the real fix (reading order.events via GraphQL).
+  const createdAt = order.created_at ? new Date(order.created_at) : null;
+  const updatedAt = order.updated_at ? new Date(order.updated_at) : null;
+  const updateGapMs = (createdAt && updatedAt) ? (updatedAt - createdAt) : 0;
+  const possiblyEditedLater = !wasModified && updateGapMs > 60*60*1000; // >1hr, arbitrary but conservative
+
+  // 2026-09-09: tested against fistdistro.com order 5280, whose real Timeline shows two Order
+  // Editor edits ~24h after creation — a gap that should trivially clear the >1hr threshold above.
+  // possiblyEditedLater still came back false, meaning order.updated_at in this payload (from the
+  // admin-session order.json endpoint) did NOT move to reflect those edits. So this proxy is
+  // confirmed NOT reliable — updated_at apparently isn't bumped by Order Editor activity in the
+  // data this tool can see, at least not in a way this endpoint returns. Downgraded to a diagnostic
+  // aid rather than a detection method: created_at/updated_at are now always shown below so a
+  // mismatch like this one is visible on inspection, but a real fix needs order.events via
+  // GraphQL — treat 'OK' here as "nothing this check can see," not "confirmed unedited."
+  const timestampNote = (createdAt && updatedAt)
+    ? `created_at: ${order.created_at}, updated_at: ${order.updated_at} (gap: ${Math.round(updateGapMs/60000)}min)`
+    : 'created_at/updated_at not both present on this order';
+
+  // Status: 'flag' when real evidence was found (refund/quantity change). Otherwise always
+  // 'info', never 'ok' — this check cannot confirm a clean order, only that two narrow fields
+  // (order.refunds, current_quantity) didn't show anything. Confirmed 2026-09-09 on fistdistro.com
+  // order 5280 that this can genuinely miss a real edit, so a green 'OK' here would overstate what
+  // was actually verified. See timestampNote/detail below for what was actually checked.
   checks.push({
     label:'Order modification',
-    status: wasModified ? 'flag' : 'ok',
+    status: wasModified ? 'flag' : 'info',
     summary: wasModified
       ? `${editedItems.length} line item(s) edited, ${refunds.length} refund(s) on record`
-      : 'No edits or refunds detected',
-    detail: wasModified
+      : possiblyEditedLater
+      ? `No refund/quantity changes on record, but order was last updated ${updatedAt.toISOString()} — ${Math.round(updateGapMs/3600000)}h after it was created`
+      : 'No edits or refunds detected in the fields this check can see',
+    detail: (wasModified
       ? [
           editedItems.length ? editedItems.map(li=>`• ${li.title}: qty ${li.quantity} → current ${li.current_quantity}`).join('\n') : null,
           refunds.length ? refunds.map(r=>`• Refund ${r.id} on ${r.created_at}`).join('\n') : null
         ].filter(Boolean).join('\n') + '\nTax apps sometimes calculate at original-order time and don\'t re-run on later edits.'
-      : null
+      : possiblyEditedLater
+      ? 'This check can only see refund-driven quantity changes and order.refunds — it can\'t see Order Editor activity (added line items, price adjustments) because that lives in the order\'s Timeline/events, which this tool doesn\'t fetch. The update-time gap above is a proxy, not proof — open the order in Shopify and check its Timeline tab directly to see what actually changed. Tax apps sometimes calculate at original-order time and don\'t re-run on later edits.'
+      : 'This check only sees refund-driven quantity changes (order.refunds, line_items current_quantity) and a created_at/updated_at gap over 1hr — none of that fired here. This is NOT proof the order is unedited: tested on fistdistro.com order 5280, whose Timeline showed real edits ~24h after creation that this check missed entirely (updated_at didn\'t reflect them in this payload). Always check the order\'s Timeline tab directly for anything that actually matters.'
+    ) + `\n${timestampNote}`
   });
 
   const ship = order.shipping_address, bill = order.billing_address;
@@ -701,10 +750,27 @@ function analyzeOrder(order, compliance, walletType){
 
   const gateways = order.payment_gateway_names || [];
   const gatewayText = gateways.join(', ');
-  const unusual = gateways.some(g => ['manual','cash on delivery (cod)','bogus','free'].includes((g||'').toLowerCase()));
+  // Name-list check: catches known DISPLAY labels. 'manual' is Shopify's own unrenamed default;
+  // 'pay over the phone' added 2026-09-08 (fistdistro.com order 5280) is that store's custom
+  // relabeling of the same underlying Manual Payment Methods feature.
+  //
+  // Tried and removed 2026-09-09: a name-agnostic supplement that checked transactions[].gateway
+  // for a fixed 'manual' value, on the theory that Shopify keeps an unrenamable identifier
+  // separate from the merchant's display label. Tested live on fistdistro.com order 5280:
+  // transactions[].gateway came back as "Pay Over the Phone" too — the custom label propagates
+  // all the way down, there's no hidden fixed value to key off. So this list will always be
+  // incomplete (merchants can rename a manual payment method to anything), and the practical
+  // backstop is the raw gateway name being visible in the summary line below on every order —
+  // if something looks like an obviously custom/manual label, add it here. A truly name-agnostic
+  // fix would need to read the store's actual Payment Settings (which manual methods are
+  // configured) rather than infer it from transaction shape — a separate API surface, not
+  // pursued here for the same reason the order.events/GraphQL fix wasn't: bigger lift than the
+  // problem (hit once so far) currently justifies.
+  const unusual = gateways.some(g => ['manual','cash on delivery (cod)','bogus','free','pay over the phone'].includes((g||'').toLowerCase()));
   const expressWalletNames = {google_pay:'Google Pay', apple_pay:'Apple Pay', shopify_pay:'Shop Pay'};
   const expressWallet = walletType && expressWalletNames[walletType];
   const paymentTerms = order.payment_terms || null; // Shopify B2B/Companies deferred-payment orders (e.g. Net 30) carry this instead of/alongside a gateway
+  const paymentMethodHasFinding = !!expressWallet || unusual;
   checks.push({
     label:'Payment method',
     status: gateways.length===0 ? 'info' : (expressWallet ? 'flag' : (unusual ? 'flag' : 'ok')),
@@ -713,9 +779,14 @@ function analyzeOrder(order, compliance, walletType){
       : expressWallet ? `Express payment detected: ${expressWallet} (via ${gatewayText})`
       : unusual ? `Non-standard gateway: ${gatewayText}`
       : `Gateway: ${gatewayText}`,
-    detail: expressWallet
-      ? 'Confirmed root cause (2026-08-03, BV147374): express payment methods (Google Pay, Apple Pay) bypass the standard Shopify checkout process, which is what the excise tax app hooks into. Orders paid this way calculate tax correctly but the tax app never gets the chance to add it to the collected total. Recommend the merchant disable express payment methods, or flag to dev for a fix on the tax app side. (Wallet type read from the order\'s Transactions API — payment_details.credit_card_wallet — not from payment_gateway_names, which only shows the processor, e.g. "authorize.net", regardless of wallet used.)'
-      : unusual ? 'Manual / COD / bogus gateways sometimes bypass the checkout flow that triggers the tax app.' : null
+    detail: paymentMethodHasFinding
+      ? [
+          expressWallet
+            ? 'Confirmed root cause (2026-08-03, BV147374): express payment methods (Google Pay, Apple Pay) bypass the standard Shopify checkout process, which is what the excise tax app hooks into. Orders paid this way calculate tax correctly but the tax app never gets the chance to add it to the collected total. Recommend the merchant disable express payment methods, or flag to dev for a fix on the tax app side. (Wallet type read from the order\'s Transactions API — payment_details.credit_card_wallet — not from payment_gateway_names, which only shows the processor, e.g. "authorize.net", regardless of wallet used.)'
+            : 'Manual / COD / bogus / pay-over-the-phone gateways sometimes bypass the checkout flow that triggers the tax app — same underlying mechanism as the confirmed express-wallet bug (BV147374): the order completes without the standard payment-processing step the tax app hooks into. Confirm by checking whether an order using a standard gateway on this same store got a TOT_TAXLINE where this one didn\'t. If you see a gateway name here that looks like another custom manual-payment label (not yet on this tool\'s list), flag it to get it added.',
+          `payment_gateway_names: [${gateways.join(', ')}] · transactions[].gateway: [${(rawTxGateways||[]).join(', ')}]`
+        ].join('\n')
+      : null
   });
 
   // Payment terms (Net 30 / B2B) — conditional, only appears when the order actually carries
@@ -987,10 +1058,12 @@ function renderAutoNotes(order, compliance){
   lineEl.value = `Status: [${emoji}] ${mainLine}${trailingBullets}`;
 }
 
-document.getElementById('copyNoteBtn').addEventListener('click', async ()=>{
+document.getElementById('copyNoteBtn').addEventListener('click', async (evt)=>{
+  const btn = evt.currentTarget;
   const text = document.getElementById('slackNoteLine').value;
   try{
     await navigator.clipboard.writeText(text);
+    flashCopied(btn);
     setStatus('Copied monitoring note to clipboard.', 'ok');
   }catch(e){
     setStatus('Could not copy automatically — select the text and copy manually.', 'err');
@@ -1282,20 +1355,35 @@ function renderDiagnostics(checks){
 
 let currentOrderData = null;
 
-async function fetchWalletType(handle, orderId){
+async function fetchTransactionSignals(handle, orderId){
+  const empty = {walletType:null, rawGateways:[]};
   try{
     const url = `https://admin.shopify.com/store/${handle}/orders/${orderId}/transactions.json`;
     const res = await fetch(url, {credentials:'include'});
-    if(!res.ok) return null;
+    if(!res.ok) return empty;
     const data = await res.json();
     const txs = data.transactions || [];
     // Prefer a successful sale transaction with wallet info; wallet type lives in
     // payment_details.credit_card_wallet (e.g. "google_pay", "apple_pay", "shopify_pay").
     // Confirmed against a real transactions.json response for BV147374 (2026-08-04).
     const withWallet = txs.find(t => t.payment_details && t.payment_details.credit_card_wallet);
-    return withWallet ? withWallet.payment_details.credit_card_wallet : null;
+
+    // rawGateways: shown in the Payment method check's detail for transparency, not used for
+    // auto-detection. Tried and removed 2026-09-09: a name-agnostic 'isManualGateway' signal that
+    // checked this for a fixed 'manual' value, on the theory Shopify keeps an unrenamable
+    // identifier separate from the merchant's display label. Tested live on fistdistro.com order
+    // 5280: this came back as "Pay Over the Phone" too, same as payment_gateway_names — no hidden
+    // fixed value to key off, the custom label propagates all the way down. Kept here only so the
+    // raw value stays visible for manually spotting a new label worth adding to the name list in
+    // analyzeOrder.
+    const rawGateways = txs.map(t => (t.gateway || '')).filter(Boolean);
+
+    return {
+      walletType: withWallet ? withWallet.payment_details.credit_card_wallet : null,
+      rawGateways
+    };
   }catch(e){
-    return null; // Non-fatal — payment method check just falls back to gateway-only info.
+    return empty; // Non-fatal — payment method check just falls back to gateway-name-only info.
   }
 }
 
@@ -1309,9 +1397,9 @@ async function handleOrderData(order, opts){
   const sheetUrl = document.getElementById('sheetUrl').value.trim();
   const compliance = sheetUrl ? await getComplianceRows(sheetUrl) : null;
   const handle = currentStoreHandle();
-  const walletType = (handle && order.id) ? await fetchWalletType(handle, order.id) : null;
+  const txSignals = (handle && order.id) ? await fetchTransactionSignals(handle, order.id) : {walletType:null, rawGateways:[]};
   renderTotStatus(order);
-  renderDiagnostics(analyzeOrder(order, compliance, walletType));
+  renderDiagnostics(analyzeOrder(order, compliance, txSignals.walletType, txSignals.rawGateways));
   renderAutoNotes(order, compliance);
   resetLivePriceCheck();
 
@@ -1466,9 +1554,27 @@ function setBcStatus(msg, type, isHtml){
   statusEl.className = 'status-line show' + (type ? ' '+type : '');
 }
 
+// BigCommerce stores that have been switched to the newer "Orders V2" admin redirect classic
+// /admin/... order URLs straight into the React-based /manage/orders UI, which serves an app
+// shell — not the server-rendered search-results/order-details markup bcParseStatus,
+// bcParseOrderList, and bcParseDetails all expect. Confirmed directly on a live store
+// (VapeRanger, 2026-08-24): navigating to /admin/index.php?searchId=...&ToDo=viewOrders landed
+// on /manage/orders?viewId=... instead. Left unchecked, that HTML still parses "successfully" —
+// every selector below just comes back empty/null, which upstream code was reading as a clean
+// "nothing here" rather than "this store couldn't be read at all." fetch() exposes the
+// post-redirect URL as res.url (standard behavior, same-origin here since both paths are on the
+// same subdomain) — checking that against the requested /admin/ path catches this reliably
+// without having to sniff the HTML itself for shell-vs-classic markers, which would risk false
+// positives on stores that are genuinely fine. Not yet confirmed whether the /admin/order/{id}
+// /details endpoint specifically (as opposed to the /admin/index.php search page) ever redirects
+// this way too — it didn't on the one live Orders V2 store checked — but this guard covers it
+// automatically either way since it only fires on an actual observed redirect.
 async function fetchBcHtml(url, extraHeaders){
   const res = await fetch(url, {credentials:'include', headers: extraHeaders || {}});
   if(!res.ok) throw new Error('HTTP ' + res.status);
+  if(url.includes('/admin/') && /\/manage\//.test(res.url)){
+    throw new Error('This store\'s admin looks like it\'s on BigCommerce\'s newer Orders UI — the classic page this fetch expects redirected to /manage/orders instead, so status/order-details can\'t be trusted for this store. Needs a different approach (likely the same internal API pattern the product & price check uses) for stores upgraded to the new admin.');
+  }
   return res.text();
 }
 
@@ -1558,6 +1664,18 @@ function bcParseDetails(detailsHtml){
   const discountEl = doc.querySelector('.shipping-discount');
   const discountText = discountEl ? discountEl.textContent.trim() : null;
 
+  // Customer email (added 2026-09-14, NOT yet confirmed against a real order — ships as a
+  // best-effort parse, same spirit as other speculative-but-caveated checks in this file).
+  // Tries the same dt/dd label-match pattern already proven for "Payment Method" first (BC's
+  // quick-view customer panel plausibly uses the same dl/dt/dd shape), then falls back to a
+  // plain regex scan of the whole fragment's text in case email isn't under its own labeled
+  // dt at all. If both come back empty on an order you know has one, that's a signal the
+  // selector/label guess is wrong for this store's admin theme — worth flagging back rather
+  // than assuming the order simply has no email.
+  const emailFromLabel = bcGetDdByLabel(doc, 'Email');
+  const emailMatch = (doc.body.textContent || '').match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+  const email = (emailFromLabel && /@/.test(emailFromLabel)) ? emailFromLabel.trim() : (emailMatch ? emailMatch[0] : null);
+
   const realItems = lineItems.filter(li => li !== exciseItem);
   const totalQty = realItems.reduce((s,li)=> s + (li.qty||0), 0);
   const brands = [...new Set(realItems.map(li=>li.brand).filter(Boolean))];
@@ -1573,7 +1691,8 @@ function bcParseDetails(detailsHtml){
     shipState,
     billState,
     paymentMethod,
-    discountText
+    discountText,
+    email
   };
 }
 
@@ -1761,9 +1880,11 @@ function bcRenderNotes(notes, orderNumber){
   document.getElementById('bcSlackNoteLine').value = `${orderNumber}: Status: [${emoji}] - ${notes.map(n=>n.text).join(' - ')}`;
 }
 
-document.getElementById('bcCopyNoteBtn').addEventListener('click', async ()=>{
+document.getElementById('bcCopyNoteBtn').addEventListener('click', async (evt)=>{
+  const btn = evt.currentTarget;
   try{
     await navigator.clipboard.writeText(document.getElementById('bcSlackNoteLine').value);
+    flashCopied(btn);
     setBcStatus('Copied monitoring note to clipboard.', 'ok');
   }catch(e){
     setBcStatus('Could not copy automatically — select the text and copy manually.', 'err');
@@ -2008,6 +2129,7 @@ function bcParseOrderList(listHtml){
 
 document.getElementById('bcBulkClearBtn').addEventListener('click', ()=>{
   document.getElementById('bcBulkRangeInput').value = '';
+  document.getElementById('bcBulkEmailInput').value = '';
   document.getElementById('bcBulkResultsPanel').style.display = 'none';
   document.getElementById('bcBulkResultsList').innerHTML = '';
   document.getElementById('bcBulkSummary').textContent = '';
@@ -2019,6 +2141,7 @@ document.getElementById('bcBulkScanBtn').addEventListener('click', async ()=>{
   if(!sub){ setBcBulkStatus('Enter the store subdomain in Look up order above first.', 'err'); return; }
   const range = bcParseIdRange(document.getElementById('bcBulkRangeInput').value);
   if(!range){ setBcBulkStatus('Enter a range like 768170-768173.', 'err'); return; }
+  const emailFilter = document.getElementById('bcBulkEmailInput').value.trim().toLowerCase();
 
   const btn = document.getElementById('bcBulkScanBtn');
   const progressWrap = document.getElementById('bcBulkProgressWrap');
@@ -2044,6 +2167,13 @@ document.getElementById('bcBulkScanBtn').addEventListener('click', async ()=>{
     progressBar.style.width = '0%';
 
     const flagged = [];
+    // Only populated when emailFilter is set. Every order in the range is checked against it
+    // (not just ones bcGenerateNotes would otherwise flag), since the point here is finding a
+    // specific order, not surfacing problems. emailsSeen collects whatever the parser actually
+    // found across the range, win or not, so a "no match" result can still show Marc real
+    // parsed emails to sanity-check the label/selector guess in bcParseDetails against.
+    const emailMatches = [];
+    const emailsSeen = [];
     for(let i=0;i<orderRows.length;i++){
       const {orderId, statusText} = orderRows[i];
       setBcBulkStatus(`<span class="spinner">⟳</span> Checking order ${i+1} of ${orderRows.length} (#${orderId})…`, null, true);
@@ -2058,6 +2188,21 @@ document.getElementById('bcBulkScanBtn').addEventListener('click', async ()=>{
         if(notes.some(n=>n.level==='flag')){
           flagged.push({orderId, orderNumber: parsed.orderNumber || orderId, notes});
         }
+        if(emailFilter){
+          if(parsed.email) emailsSeen.push({orderId, orderNumber: parsed.orderNumber || orderId, email: parsed.email});
+          if(parsed.email && parsed.email.toLowerCase() === emailFilter){
+            const statusCheck = checks.find(c=>c.label==='Order status');
+            emailMatches.push({
+              orderId,
+              orderNumber: parsed.orderNumber || orderId,
+              email: parsed.email,
+              statusText,
+              verificationSummary: statusCheck ? statusCheck.summary : (statusText || 'unknown'),
+              verificationStatus: statusCheck ? statusCheck.status : 'info',
+              flagNotes: notes.filter(n=>n.level==='flag')
+            });
+          }
+        }
       }catch(e){
         console.log(`[bulk scan] order ${orderId} failed:`, e.message);
       }
@@ -2066,33 +2211,74 @@ document.getElementById('bcBulkScanBtn').addEventListener('click', async ()=>{
     }
 
     document.getElementById('bcBulkResultsPanel').style.display = 'block';
-    document.getElementById('bcBulkSummary').textContent =
-      `Checked ${orderRows.length} order(s) in range ${range.min}-${range.max} — ${flagged.length} need attention.`;
-
     const list = document.getElementById('bcBulkResultsList');
     list.innerHTML = '';
-    if(!flagged.length){
-      list.innerHTML = '<div class="empty-state">Nothing flagged in this range.</div>';
-    } else {
-      flagged.forEach(r=>{
-        const item = document.createElement('div');
-        item.className = 'diag-item';
-        item.style.cursor = 'pointer';
-        item.innerHTML = `
-          <div class="diag-head">
-            <div class="diag-title">#${r.orderNumber}</div>
-            <span class="badge flag">Flag</span>
-          </div>
-          <div class="diag-summary">${r.notes.map(n=>n.text).join(' · ')}</div>
-        `;
-        item.addEventListener('click', async ()=>{
-          document.getElementById('bcOrderId').value = r.orderId;
-          await runBcTest();
+
+    if(emailFilter){
+      document.getElementById('bcBulkSummary').textContent =
+        `Checked ${orderRows.length} order(s) in range ${range.min}-${range.max} for ${emailFilter} — ${emailMatches.length} match(es).`;
+
+      if(emailMatches.length){
+        emailMatches.forEach(m=>{
+          const item = document.createElement('div');
+          item.className = 'diag-item';
+          item.style.cursor = 'pointer';
+          item.innerHTML = `
+            <div class="diag-head">
+              <div class="diag-title">#${m.orderNumber}</div>
+              <span class="badge ${m.verificationStatus}">Match</span>
+            </div>
+            <div class="diag-summary">Email: ${m.email}</div>
+            <div class="diag-summary">Verification: ${m.verificationSummary}</div>
+            ${m.flagNotes.length ? `<div class="diag-summary">${m.flagNotes.map(n=>n.text).join(' · ')}</div>` : ''}
+          `;
+          item.addEventListener('click', async ()=>{
+            document.getElementById('bcOrderId').value = m.orderId;
+            await runBcTest();
+          });
+          list.appendChild(item);
         });
-        list.appendChild(item);
-      });
+      } else if(emailsSeen.length){
+        list.innerHTML = `<div class="empty-state">No exact match for ${emailFilter}, but these emails were parsed in this range — worth eyeballing in case the address is slightly different, or click one to open that order:<br><br>${
+          emailsSeen.map(e=>`<div class="diag-summary" style="cursor:pointer;" data-order="${escapeAttr(String(e.orderId))}">#${escapeAttr(String(e.orderNumber))} — ${escapeAttr(e.email)}</div>`).join('')
+        }</div>`;
+        list.querySelectorAll('[data-order]').forEach(el=>{
+          el.addEventListener('click', async ()=>{
+            document.getElementById('bcOrderId').value = el.getAttribute('data-order');
+            await runBcTest();
+          });
+        });
+      } else {
+        list.innerHTML = '<div class="empty-state">No match, and no email address could be parsed from any order in this range — the email-parsing guess in bcParseDetails likely needs adjusting for this store\'s admin theme. Worth confirming by opening one order\'s details HTML directly and reporting back what the customer/email markup actually looks like.</div>';
+      }
+      setBcBulkStatus(emailMatches.length ? `Done — found ${emailMatches.length} matching order(s).` : 'Done — no exact match found.', emailMatches.length ? 'ok' : 'err');
+    } else {
+      document.getElementById('bcBulkSummary').textContent =
+        `Checked ${orderRows.length} order(s) in range ${range.min}-${range.max} — ${flagged.length} need attention.`;
+
+      if(!flagged.length){
+        list.innerHTML = '<div class="empty-state">Nothing flagged in this range.</div>';
+      } else {
+        flagged.forEach(r=>{
+          const item = document.createElement('div');
+          item.className = 'diag-item';
+          item.style.cursor = 'pointer';
+          item.innerHTML = `
+            <div class="diag-head">
+              <div class="diag-title">#${r.orderNumber}</div>
+              <span class="badge flag">Flag</span>
+            </div>
+            <div class="diag-summary">${r.notes.map(n=>n.text).join(' · ')}</div>
+          `;
+          item.addEventListener('click', async ()=>{
+            document.getElementById('bcOrderId').value = r.orderId;
+            await runBcTest();
+          });
+          list.appendChild(item);
+        });
+      }
+      setBcBulkStatus(bulkDoneMessage(flagged.length, orderRows.length), flagged.length ? 'err' : 'ok');
     }
-    setBcBulkStatus(bulkDoneMessage(flagged.length, orderRows.length), flagged.length ? 'err' : 'ok');
   }catch(err){
     setBcBulkStatus('Scan failed — ' + (err.message || 'unknown error') + '. Check the subdomain and that you\'re logged into this store.', 'err');
   } finally {
@@ -2135,6 +2321,7 @@ const WC_DEFAULT_CONFIG = [
   {domain:'vapedepotusa.com', system:'hpos'}
 ];
 let WC_CONFIG = [];
+let currentWcOrder = null; // {domain, parsed} — set after a successful order fetch, used by the on-demand product & price check
 
 async function wcLoadConfig(){
   const stored = await chrome.storage.local.get([WC_CONFIG_KEY]);
@@ -2242,6 +2429,41 @@ function wcParseMetaFields(html){
   return fields;
 }
 
+// NOT yet confirmed against a live order (unlike the rest of this file's WooCommerce parsing) —
+// this reads WooCommerce CORE's admin order-items markup (html-order-item.php), which is stable
+// across recent versions but hasn't been spot-checked against vapesocietysupplies.com or
+// vapedepotusa.com the way the meta-field/address/payment parsing below has. Worth diffing
+// wcRawPanel-equivalent output against a real order the first time this runs for real.
+// Per-row hidden inputs (order_item_qty[ID], line_total[ID]) are read directly rather than the
+// "view" display text, since those exist in the raw HTML regardless of edit/view mode.
+function wcParseLineItems(html){
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const rows = doc.querySelectorAll('table.woocommerce_order_items tbody tr.item');
+  const items = [];
+  rows.forEach(row=>{
+    const itemId = row.getAttribute('data-order_item_id');
+    const nameLink = row.querySelector('.name a[href*="post="]');
+    const nameCell = row.querySelector('.name');
+    const name = (nameLink || nameCell)?.textContent.trim().split('\n')[0].trim() || null;
+    const productIdMatch = nameLink ? (nameLink.getAttribute('href') || '').match(/post=(\d+)/) : null;
+    const skuEl = row.querySelector('.wc-order-item-sku');
+    const sku = skuEl ? skuEl.textContent.replace(/^SKU:\s*/i, '').trim() : null;
+    const qtyInput = itemId ? row.querySelector(`input[name="order_item_qty[${itemId}]"]`) : null;
+    const totalInput = itemId ? row.querySelector(`input[name="line_total[${itemId}]"]`) : null;
+    const qty = qtyInput ? parseFloat(qtyInput.value) : null;
+    const lineTotal = totalInput ? parseFloat(totalInput.value) : null;
+    items.push({
+      itemId,
+      productId: productIdMatch ? productIdMatch[1] : null,
+      name,
+      sku,
+      qty: isNaN(qty) ? null : qty,
+      lineTotal: isNaN(lineTotal) ? null : lineTotal
+    });
+  });
+  return items;
+}
+
 // Confirmed via real orders on both classic and HPOS stores: billing/shipping state and payment
 // method all live in clean, structured form fields (input value / select selected option) — no
 // free-text address parsing needed here, unlike BigCommerce's shipping address block.
@@ -2255,8 +2477,9 @@ function wcParseDetails(html){
   const paymentMethod = payOpt ? {value: payOpt.value, text: payOpt.textContent.trim()} : null;
   const orderNumMatch = (doc.querySelector('title')?.textContent || '').match(/Order #?(\d+)/) ||
                          (doc.querySelector('h1')?.textContent || '').match(/#(\d+)/);
+  const lineItems = wcParseLineItems(html);
   return {
-    fields, billingState, shippingState, paymentMethod,
+    fields, billingState, shippingState, paymentMethod, lineItems,
     orderNumber: orderNumMatch ? orderNumMatch[1] : null
   };
 }
@@ -2403,9 +2626,11 @@ function wcRenderNotes(notes, orderNumber){
   document.getElementById('wcSlackNoteLine').value = `${orderNumber}: Status: [${emoji}] - ${notes.map(n=>n.text).join(' - ')}`;
 }
 
-document.getElementById('wcCopyNoteBtn').addEventListener('click', async ()=>{
+document.getElementById('wcCopyNoteBtn').addEventListener('click', async (evt)=>{
+  const btn = evt.currentTarget;
   try{
     await navigator.clipboard.writeText(document.getElementById('wcSlackNoteLine').value);
+    flashCopied(btn);
     setWcStatus('Copied monitoring note to clipboard.', 'ok');
   }catch(e){
     setWcStatus('Could not copy automatically — select the text and copy manually.', 'err');
@@ -2434,6 +2659,126 @@ function wcRenderFields(fields){
   `).join('');
 }
 
+function wcParseMoney(str){
+  if(str === null || str === undefined) return null;
+  const n = parseFloat(String(str).replace(/[^0-9.\-]/g, ''));
+  return isNaN(n) ? null : n;
+}
+
+// Reads a product's CURRENT live price straight off its own edit screen (_regular_price /
+// _sale_price — stable WooCommerce core field IDs on the Product data > General panel) rather
+// than TOT's retailPrice/wholesalePrice/msrp fields. Those TOT fields are NOT usable here: per
+// Product_Sync.php, they're pushed to/pulled from HQ's API directly and never stored as
+// WooCommerce postmeta locally, so there's nothing on this page to read them from. This mirrors
+// checkout's real behavior (ExciseService.php's get_transactionLines() also uses
+// $_product->get_price(), i.e. sale price if set else regular price) rather than TOT's own
+// pricing fields — same tradeoff BigCommerce's product & price check makes, just for a different
+// underlying reason (there it's a single collapsed field; here the real fields live off-page).
+//
+// Variable products are explicitly NOT price-checked: get_edit_post_link() on a variation line
+// item links back to the parent product, whose top-level _regular_price/_sale_price describe the
+// range default, not the specific variation that was actually ordered — comparing against that
+// would produce a misleading mismatch far more often than a real one.
+async function wcFetchProductInfo(domain, productId){
+  const url = `https://${domain}/wp-admin/post.php?post=${productId}&action=edit`;
+  const res = await fetch(url, {credentials:'include'});
+  if(!res.ok) throw new Error('HTTP ' + res.status);
+  const html = await res.text();
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const productType = doc.querySelector('select#product-type')?.value || null;
+  const regularPrice = wcParseMoney(doc.querySelector('#_regular_price')?.value);
+  const salePrice = wcParseMoney(doc.querySelector('#_sale_price')?.value);
+  return {productType, regularPrice, salePrice};
+}
+
+function wcRenderProductResults(results){
+  const container = document.getElementById('wcProductResults');
+  container.innerHTML = '';
+  results.forEach(r=>{
+    const item = document.createElement('div');
+    item.className = 'diag-item';
+    const badgeClass = r.priceMismatch ? 'flag' : (r.notFound || r.variable || r.chargedUnit === null) ? 'info' : 'ok';
+    const badgeText = r.priceMismatch ? 'Flag' : (r.notFound || r.variable || r.chargedUnit === null) ? 'Info' : 'OK';
+    let summary;
+    if(r.notFound){
+      summary = 'Could not resolve a product edit page for this line item (no product link found, or fetch failed)';
+    } else if(r.variable){
+      summary = `Variable product — per-variation price not checked (charged ${r.chargedUnit !== null ? r.chargedUnit.toFixed(2) : 'unknown'})`;
+    } else if(r.chargedUnit === null){
+      summary = 'Could not determine charged unit price from the order';
+    } else {
+      summary = `Charged ${r.chargedUnit.toFixed(2)} — current price ${r.currentPrice.toFixed(2)}${r.priceMismatch ? ' (differs)' : ''}`;
+    }
+    item.innerHTML = `
+      <div class="diag-head">
+        <div class="diag-title">${r.name || r.sku || 'Unknown item'}</div>
+        <span class="badge ${badgeClass}">${badgeText}</span>
+      </div>
+      <div class="diag-summary">${summary}</div>
+    `;
+    container.appendChild(item);
+  });
+}
+
+document.getElementById('wcCheckProductsBtn').addEventListener('click', async ()=>{
+  if(!currentWcOrder){ setWcStatus('Fetch an order first.', 'err'); return; }
+  const {domain, parsed} = currentWcOrder;
+  const items = (parsed.lineItems || []).filter(li => li.productId);
+  if(!items.length){ setWcStatus('No line items with a resolvable product link found on this order.', 'err'); return; }
+
+  document.getElementById('wcProductResults').innerHTML = '';
+  const btn = document.getElementById('wcCheckProductsBtn');
+  const progressWrap = document.getElementById('wcProductProgressWrap');
+  const progressBar = document.getElementById('wcProductProgressBar');
+  btn.disabled = true;
+  progressWrap.style.display = 'block';
+  progressBar.style.width = '0%';
+
+  const uniqueProductIds = [...new Set(items.map(li=>li.productId))];
+  const infoByProductId = {};
+  try{
+    for(let i=0;i<uniqueProductIds.length;i++){
+      const pid = uniqueProductIds[i];
+      setWcStatus(`<span class="spinner">⟳</span> Checking product ${i+1} of ${uniqueProductIds.length}…`, null, true);
+      try{
+        infoByProductId[pid] = await wcFetchProductInfo(domain, pid);
+      }catch(e){
+        console.log(`[wc product & price check] product ${pid} — fetch failed:`, e.message);
+        infoByProductId[pid] = null;
+      }
+      progressBar.style.width = `${Math.round(((i+1)/uniqueProductIds.length)*100)}%`;
+      if(i < uniqueProductIds.length - 1) await new Promise(r=>setTimeout(r, 200));
+    }
+
+    const results = items.map(li=>{
+      const info = infoByProductId[li.productId];
+      const chargedUnit = (li.lineTotal !== null && li.qty) ? li.lineTotal / li.qty : null;
+      if(!info){
+        return {sku: li.sku, name: li.name, notFound: true, chargedUnit};
+      }
+      if(info.productType === 'variable'){
+        return {sku: li.sku, name: li.name, variable: true, chargedUnit};
+      }
+      const currentPrice = (info.salePrice !== null ? info.salePrice : info.regularPrice);
+      const priceMismatch = chargedUnit !== null && currentPrice !== null && Math.abs(chargedUnit - currentPrice) > 0.01;
+      return {
+        sku: li.sku,
+        name: li.name,
+        chargedUnit,
+        currentPrice,
+        priceMismatch
+      };
+    });
+
+    wcRenderProductResults(results);
+    const flaggedCount = results.filter(r=>r.priceMismatch).length;
+    setWcStatus(`Checked ${results.length} line item(s), ${flaggedCount} worth a look. A mismatch can also mean the price changed since this order, a coupon/discount was applied, or the order used wholesale pricing this check can't see — not necessarily a bug.`, flaggedCount ? 'err' : 'ok');
+  } finally {
+    btn.disabled = false;
+    progressWrap.style.display = 'none';
+  }
+});
+
 document.getElementById('wcClearBtn').addEventListener('click', ()=>{
   document.getElementById('wcOrderId').value = '';
   document.getElementById('wcStatusPanel').style.display = 'none';
@@ -2442,6 +2787,9 @@ document.getElementById('wcClearBtn').addEventListener('click', ()=>{
   document.getElementById('wcNotesPanel').style.display = 'none';
   document.getElementById('wcFieldsPanel').style.display = 'none';
   document.getElementById('wcFieldsList').innerHTML = '';
+  document.getElementById('wcProductPanel').style.display = 'none';
+  document.getElementById('wcProductResults').innerHTML = '';
+  currentWcOrder = null;
   setWcStatus('Cleared.', 'ok');
 });
 
@@ -2454,9 +2802,11 @@ async function runWcTest(){
 
   const url = wcBuildUrl(row.domain, row.system, orderId);
   setWcStatus(`Fetching ${url} …`);
-  ['wcStatusPanel','wcNotesPanel','wcFieldsPanel'].forEach(id=>document.getElementById(id).style.display='none');
+  ['wcStatusPanel','wcNotesPanel','wcFieldsPanel','wcProductPanel'].forEach(id=>document.getElementById(id).style.display='none');
   document.getElementById('wcDiagList').innerHTML = '';
   document.getElementById('wcDiagEmpty').style.display = 'block';
+  document.getElementById('wcProductResults').innerHTML = '';
+  currentWcOrder = null;
 
   try{
     const res = await fetch(url, {credentials:'include'});
@@ -2481,6 +2831,9 @@ async function runWcTest(){
     wcRenderDiagnostics(checks);
     wcRenderNotes(notes, parsed.orderNumber || orderId);
     wcRenderFields(parsed.fields);
+
+    document.getElementById('wcProductPanel').style.display = 'block';
+    currentWcOrder = {domain: row.domain, parsed};
 
     setWcStatus(`Loaded order ${parsed.orderNumber || orderId} from ${row.domain}.`, 'ok');
   }catch(err){
@@ -2524,6 +2877,8 @@ function switchPlatformTab(platform){
   document.getElementById('platformBigCommerce').classList.toggle('active', platform === 'bigcommerce');
   document.getElementById('platformWooCommerce').classList.toggle('active', platform === 'woocommerce');
   document.getElementById('platformHQ').classList.toggle('active', platform === 'hq');
+  document.getElementById('platformBackfill').classList.toggle('active', platform === 'backfill');
+  document.getElementById('platformInvestigate').classList.toggle('active', platform === 'investigate');
 }
 document.querySelectorAll('.platform-tab').forEach(btn=>{
   btn.addEventListener('click', ()=> switchPlatformTab(btn.dataset.platform));
@@ -2558,6 +2913,264 @@ const HQ_DOMAINS_KEY = 'totHqDomains';
 const HQ_RATE_DIRECTORY_KEY = 'totHqRateDirectory'; // learned tax-rate-per-jurisdiction+SKU-type directory — see overcharge $ estimate, 2026-08-20
 const HQ_SCAN_HOURS = 24; // fixed — "last N hours" mode always means the last 24h, not a typed number
 const HQ_ORIGIN = 'https://app.tokenoftrust.com';
+
+// ---------------------------------------------------------------------------
+// Tax Ops Hq effective-rules cross-check — see the README changelog entries
+// dated 2026-09-01 for the full writeup (both the original proposal and the
+// "endpoint is dead, rebuilt on two working endpoints" follow-up).
+//
+// Originally found by reading the tokenoftrust/tot-taxes GitHub repo
+// (private): this extension's HQ Excise Tax scan has, since 2026-08-24,
+// hand-maintained RETAIL_PRICE_BASED / WHOLESALE_COST_BASED / FLAT_RATE_PER_ML
+// tables inside hqStageScan below, transcribed one screenshot at a time from
+// TaxOps Portal's "State Tax Rules" page — with confirmed transcription bugs
+// along the way (MN's "95%" that's probably missing a "%" sign, a spurious
+// learned 27.3% OH rate that turned out to be a price/volume correlation, and
+// PA's sheet-vs-observed-behavior contradiction, now explained below). That
+// portal (rebranded "Tax Ops Hq" in-app) is deployed at
+// taxes.tokenoftrust.com (prod) / taxes.test.tokenoftrust.com (test, not yet
+// in host_permissions — add it if this ever needs to check test data), auth
+// via a session cookie set by signing in with a @tokenoftrust.com /
+// @team.tokenoftrust.com email, same as HQ itself.
+//
+// GET /api/effective-rules?clientId=<domain> — the endpoint the original
+// 2026-09-01 proposal was built on — is CONFIRMED DEAD as of a live signed-in
+// session the same day: it returns 200 {"productTypes":[]} unconditionally,
+// for every domain tried, even ones with real rule data. Not an auth problem
+// (no 401, no redirect) and not specific to one org — just an empty shape.
+// Replaced with two endpoints that ARE confirmed live and populated:
+//
+// 1. GET /api/clients/<domain> → client.options.exciseTax.ruleOverrides.
+//    <'vape'|'nicotinePouch'>.US.regionCode.<ST> — this ORG'S OWN override
+//    rules (nested objects, confirmed via live Object.keys() walk: top-level
+//    ruleOverrides has 'vape'/'nicotinePouch' keys, each with a single 'US'
+//    key, then a single 'regionCode' key, then real 2-letter state codes).
+//    A region code's value is either one rule object ({attr, pct|tax,
+//    description, if?, when?, ...}) or {all: [...multiple rule objects]}
+//    when more than one condition applies in that state (e.g. WA vape has 3:
+//    two flat per-mL non-nicotine rules plus one 95%-of-price nicotine
+//    rule). This is exactly the blind spot the HQ scan's own README
+//    changelog flagged as its single most valuable open architectural
+//    question (found via kangerwholesaleusa.com's WA rule being silently
+//    overridden to 95%-of-wholesaleCost, vs. vaperanger.com's WA rule using
+//    95%-of-unitDiscountedPrice for the same nominal "95%" state rate) —
+//    confirmed live 2026-09-01 that the two orgs' WA overrides do in fact
+//    differ this way. This same response also confirmed PA's real contract
+//    for vaperanger.com: `attr: "unitDiscountedPrice"` even though the
+//    human `description` says "wholesale price" — the sheet's PA row and
+//    this tool's PA exclusion comment below were both describing a labeling
+//    bug in TOT's own config, not a transcription error on this tool's side.
+//    NOTE: this response also carries this org's Stripe/webhook/HubSpot
+//    secrets alongside the tax data — this code reads only
+//    options.exciseTax.ruleOverrides and must never log, store, or forward
+//    the rest of the payload.
+//
+// 2. GET /api/tax-calendar/rules → global, non-client-specific reference
+//    data (the literal source of TaxOps Portal's "State Tax Rules" page).
+//    Confirmed live shape: `rules` is keyed by 51 full state names (incl.
+//    "District of Columbia"), each with a `"Vapor Products"` and
+//    `"Nicotine Pouches"` array of {state, productType, description,
+//    attribute, source} — no separate numeric rate field; the rate lives
+//    only inside the free-text `description` (e.g. "40% of the purchase
+//    price from the wholesaler", "$1.50 per unit", "No tax", or CA's
+//    stacked "51.08% of wholesale cost\n\n12.5% of retail selling price").
+//    A handful of 2-letter-code keys also live in the same `rules` object
+//    (AK, CO, IL, MD, AL, AZ confirmed) but are COUNTY/CITY overlay entries
+//    (each carries its own `jurisdiction` field, e.g. AK→Anchorage,
+//    CO→Boulder) layered on top of the state's real rule under its full
+//    name — not the state rate itself, and skipped below since this tool's
+//    key format can't represent a locality.
+//
+// Neither replacement endpoint returns a clean {rate, basis} pair the way
+// the dead one was documented to — this file now does its own conservative
+// text parsing (see taxOpsParseDescriptionRate) and only records a rate when
+// exactly one unambiguous figure is found, skipping stacked/compound rates
+// (like CA) entirely rather than guessing which figure applies.
+//
+// Same posture as before: this does NOT recompute "the correct tax" from the
+// live rate — it only cross-checks the RATE NUMBER and the presence of a
+// per-org OVERRIDE against what this tool's own hand-maintained tables
+// assume, surfacing disagreements for a human to confirm via HQ's "How was
+// this tax calculated" tool. GET /auth/whoami is checked first so "not
+// signed into Tax Ops Hq" shows as a clear per-org badge instead of a
+// confusing silent no-op or a raw 401.
+const TAXOPS_ORIGIN = 'https://taxes.tokenoftrust.com';
+const TAXOPS_PRODUCT_TYPE_KEY = { 'Vapor Products': 'vape', 'Nicotine Pouches': 'nicotinePouch' };
+let TAXOPS_RULES_CACHE = {}; // domain -> {ok, states: {'US.regionCode.<ST>::<type>': {rate, basis, source}}, reason?}
+let TAXOPS_GLOBAL_CACHE = null; // {ok, states, reason?} — /api/tax-calendar/rules isn't client-scoped, fetched once and shared across every domain in a scan
+
+// Full state name -> 2-letter USPS code, needed because /api/tax-calendar/
+// rules keys its 51 real state-level entries by full name (confirmed live
+// 2026-09-01), while everywhere else in this tool (calc-detail's ruleId,
+// AUTHORITATIVE_RATES/WHOLESALE_COST_BASED/FLAT_RATE_PER_ML, ruleOverrides'
+// own regionCode keys) uses 2-letter codes.
+const TAXOPS_STATE_NAME_TO_CODE = {
+  'Alabama': 'AL', 'Alaska': 'AK', 'Arizona': 'AZ', 'Arkansas': 'AR', 'California': 'CA',
+  'Colorado': 'CO', 'Connecticut': 'CT', 'Delaware': 'DE', 'District of Columbia': 'DC',
+  'Florida': 'FL', 'Georgia': 'GA', 'Hawaii': 'HI', 'Idaho': 'ID', 'Illinois': 'IL',
+  'Indiana': 'IN', 'Iowa': 'IA', 'Kansas': 'KS', 'Kentucky': 'KY', 'Louisiana': 'LA',
+  'Maine': 'ME', 'Maryland': 'MD', 'Massachusetts': 'MA', 'Michigan': 'MI', 'Minnesota': 'MN',
+  'Mississippi': 'MS', 'Missouri': 'MO', 'Montana': 'MT', 'Nebraska': 'NE', 'Nevada': 'NV',
+  'New Hampshire': 'NH', 'New Jersey': 'NJ', 'New Mexico': 'NM', 'New York': 'NY',
+  'North Carolina': 'NC', 'North Dakota': 'ND', 'Ohio': 'OH', 'Oklahoma': 'OK', 'Oregon': 'OR',
+  'Pennsylvania': 'PA', 'Rhode Island': 'RI', 'South Carolina': 'SC', 'South Dakota': 'SD',
+  'Tennessee': 'TN', 'Texas': 'TX', 'Utah': 'UT', 'Vermont': 'VT', 'Virginia': 'VA',
+  'Washington': 'WA', 'West Virginia': 'WV', 'Wisconsin': 'WI', 'Wyoming': 'WY'
+};
+
+// Conservative single-figure parser for /api/tax-calendar/rules' free-text
+// `description` field. Only ever returns a rate when exactly one unambiguous
+// figure is found — a description with more than one percentage (e.g. CA's
+// stacked wholesale + retail components) is deliberately left unparsed
+// rather than guessing which figure is "the" rate, same caution this tool
+// already applies to CA elsewhere (see the WHOLESALE_COST_BASED comment
+// below). Returns null when nothing safe to extract is found.
+function taxOpsParseDescriptionRate(description) {
+  if (!description || typeof description !== 'string') return null;
+  const text = description.trim();
+  if (/^no tax\.?$/i.test(text)) return { rate: 0, basis: 'none' };
+  const pctMatches = text.match(/\d+(?:\.\d+)?\s*%/g) || [];
+  if (pctMatches.length === 1) {
+    const n = parseFloat(pctMatches[0]);
+    return isNaN(n) ? null : { rate: n / 100, basis: 'ad_valorem' };
+  }
+  if (pctMatches.length > 1) return null; // stacked/compound rate — can't collapse to one number
+  const dollarMatch = text.match(/\$\s*(\d+(?:\.\d+)?)\s*per\b/i);
+  if (dollarMatch) {
+    const n = parseFloat(dollarMatch[1]);
+    return isNaN(n) ? null : { rate: n, basis: 'per_unit' };
+  }
+  return null; // no single unambiguous figure found — skip rather than guess
+}
+
+// Extraction for the live client ruleOverrides shape: a region-code's value
+// is either one rule object directly, or {all: [...]} when multiple
+// conditional rules apply in that state (confirmed live on WA, 3 entries).
+// Prefers a percentage-of-price rule (`pct`) over a flat per-unit rule
+// (`tax`) when both exist in the same array, since this tool's own
+// AUTHORITATIVE_RATES/WHOLESALE_COST_BASED tables it's compared against are
+// percentage-based — falls back to the flat rule when that's all there is.
+function taxOpsExtractRateBasisFromOverride(node) {
+  if (node == null || typeof node !== 'object') return null;
+  const entries = Array.isArray(node.all) ? node.all : [node];
+  const valid = entries.filter(e => e && typeof e === 'object');
+  if (!valid.length) return null;
+  const pctEntry = valid.find(e => typeof e.pct === 'number');
+  if (pctEntry) return { rate: pctEntry.pct / 100, basis: 'ad_valorem' };
+  const taxEntry = valid.find(e => typeof e.tax === 'number');
+  if (taxEntry) return { rate: taxEntry.tax, basis: 'per_unit' };
+  return null;
+}
+
+// Global (non-client-specific) reference rates from TaxOps Portal's own
+// "State Tax Rules" page data. Fetched once total, not once per org.
+async function fetchTaxOpsGlobalRates() {
+  if (TAXOPS_GLOBAL_CACHE) return TAXOPS_GLOBAL_CACHE;
+  let result;
+  try {
+    const res = await fetch(`${TAXOPS_ORIGIN}/api/tax-calendar/rules`, {
+      headers: { Accept: 'application/json' },
+      credentials: 'include'
+    });
+    if (res.status === 401) {
+      result = { ok: false, reason: 'not-signed-in' };
+    } else if (!res.ok) {
+      result = { ok: false, reason: `http-${res.status}` };
+    } else {
+      const body = await res.json();
+      const states = {};
+      Object.keys(body.rules || {}).forEach(stateKey => {
+        const code = TAXOPS_STATE_NAME_TO_CODE[stateKey];
+        if (!code) return; // not a recognized full state name — a locality-overlay entry (see comment above), skip
+        const entry = body.rules[stateKey];
+        Object.keys(TAXOPS_PRODUCT_TYPE_KEY).forEach(label => {
+          const typeKey = TAXOPS_PRODUCT_TYPE_KEY[label];
+          const rules = entry[label];
+          if (!Array.isArray(rules) || !rules.length) return;
+          const rb = taxOpsParseDescriptionRate(rules[0].description);
+          if (!rb) return; // couldn't parse a single unambiguous rate (e.g. CA's stacked components) — skip rather than guess
+          states[`US.regionCode.${code}::${typeKey}`] = { rate: rb.rate, basis: rb.basis, source: 'global' };
+        });
+      });
+      result = { ok: true, states };
+    }
+  } catch (e) {
+    result = { ok: false, reason: 'fetch-failed: ' + (e.message || e) };
+  }
+  // 2026-09-15: only cache a SUCCESS. This cache has no TTL and lives for as
+  // long as the side panel document stays open, which can easily span many
+  // scan runs across a browsing session. Caching a failure (e.g.
+  // 'not-signed-in') unconditionally meant one 401 — from before signing in,
+  // or a session that happened to be mid-refresh — got stuck for the rest of
+  // that session even after actually signing in, exactly the "I was already
+  // logged in" report from Marc on vapesocietysupplies.com. A failure is
+  // cheap to retry (one extra fetch per scan at most); a stale false
+  // negative silently disabling this whole cross-check for a session is not.
+  if (result.ok) TAXOPS_GLOBAL_CACHE = result;
+  return result;
+}
+
+async function fetchTaxOpsEffectiveRules(domain) {
+  if (!domain) return { ok: false, reason: 'no-domain' };
+  if (TAXOPS_RULES_CACHE[domain]) return TAXOPS_RULES_CACHE[domain];
+
+  let result;
+  try {
+    const whoRes = await fetch(`${TAXOPS_ORIGIN}/auth/whoami`, { credentials: 'include' });
+    if (whoRes.status === 401) {
+      result = { ok: false, reason: 'not-signed-in' };
+    } else {
+      const globalRates = await fetchTaxOpsGlobalRates(); // shared cache, its own try/catch — never throws
+      const clientRes = await fetch(`${TAXOPS_ORIGIN}/api/clients/${encodeURIComponent(domain)}`, {
+        headers: { Accept: 'application/json' },
+        credentials: 'include'
+      });
+      if (clientRes.status === 401) {
+        result = { ok: false, reason: 'not-signed-in' };
+      } else if (!clientRes.ok) {
+        result = { ok: false, reason: `http-${clientRes.status}` };
+      } else {
+        const body = await clientRes.json();
+        // Read ONLY the excise-tax rule overrides — this response also
+        // carries this org's Stripe/webhook/HubSpot secrets, which must
+        // never be touched, logged, or stored by this extension.
+        const ruleOverrides = (body && body.client && body.client.options
+          && body.client.options.exciseTax && body.client.options.exciseTax.ruleOverrides) || {};
+        // Start from the global reference rates, then let this org's own
+        // overrides win on any key they cover — mirrors the dead endpoint's
+        // documented "global merged with per-org override" behavior.
+        const states = Object.assign({}, globalRates.ok ? globalRates.states : {});
+        Object.keys(TAXOPS_PRODUCT_TYPE_KEY).forEach(label => {
+          const typeKey = TAXOPS_PRODUCT_TYPE_KEY[label];
+          const regionCodes = ruleOverrides[typeKey] && ruleOverrides[typeKey].US && ruleOverrides[typeKey].US.regionCode;
+          if (!regionCodes) return;
+          Object.keys(regionCodes).forEach(code => {
+            const rb = taxOpsExtractRateBasisFromOverride(regionCodes[code]);
+            if (!rb) return;
+            states[`US.regionCode.${code}::${typeKey}`] = { rate: rb.rate, basis: rb.basis, source: 'override' };
+          });
+        });
+        result = {
+          ok: true,
+          states,
+          globalRatesOk: globalRates.ok,
+          globalRatesReason: globalRates.ok ? null : globalRates.reason
+        };
+      }
+    }
+  } catch (e) {
+    result = { ok: false, reason: 'fetch-failed: ' + (e.message || e) };
+  }
+  // 2026-09-15: same fix as fetchTaxOpsGlobalRates just above — only cache a
+  // SUCCESS, never a failure. TAXOPS_RULES_CACHE has no TTL and persists for
+  // as long as the side panel stays open, so an early 401 (e.g. right after
+  // opening the panel, before signing in on that tab) used to get stuck as
+  // "not-signed-in" for every later scan in that session, even after
+  // actually signing in — exactly what Marc saw on vapesocietysupplies.com
+  // despite being logged in when the scan ran.
+  if (result.ok) TAXOPS_RULES_CACHE[domain] = result;
+  return result;
+}
 
 // Known HQ "Choose App Domain" org names — confirmed exact spellings from
 // today's session. Note some of these differ from the Shopify storefront
@@ -2599,6 +3212,10 @@ let HQ_RESULTS = [];
 let HQ_DOMAINS = [];
 let HQ_RUN_STATE = 'idle'; // idle | running | paused-login | stopped
 let HQ_TAB_ID = null;
+// In-memory-only accumulator for "Export Taxlines CSV" — see the comment at
+// its one write site (in runHqScan) for why this deliberately isn't persisted
+// to chrome.storage.local alongside HQ_RESULTS. Reset at the start of each run.
+let HQ_TAXLINE_ROWS = [];
 
 async function loadHqQueue() {
   const stored = await chrome.storage.local.get([HQ_QUEUE_KEY]);
@@ -2622,11 +3239,85 @@ async function saveHqDomains() {
   await chrome.storage.local.set({ [HQ_DOMAINS_KEY]: HQ_DOMAINS });
 }
 
-function setHqStatus(msg, type) {
+function setHqStatus(msg, type, isHtml) {
   const el = document.getElementById('hqStatus');
-  el.textContent = msg;
+  if (isHtml) el.innerHTML = msg; else el.textContent = msg;
   el.className = 'status-line show' + (type ? ' ' + type : '');
 }
+
+// Separate status line living inside the date-range panel itself — the
+// date-range fetch used to report through setHqStatus, whose #hqStatus
+// element sits up in the Run panel above. That put "Fetching..." messages
+// out of view of the button/inputs the user was actually looking at while
+// waiting. This one renders right under the Fetch & Export CSV button instead.
+function setHqTaxlinesStatus(msg, type, isHtml) {
+  const el = document.getElementById('hqTaxlinesStatus');
+  if (!el) return;
+  if (isHtml) el.innerHTML = msg; else el.textContent = msg;
+  el.className = 'status-line show' + (type ? ' ' + type : '');
+}
+
+// Toggles the Start/Resume button between its resting label and a spinning
+// "Running..." state — the status line alone can sit on the same message for
+// a long stretch of a big scan, so this gives a persistent, always-visible
+// signal (independent of what setHqStatus happens to say) that a run is
+// still going rather than stuck.
+function setHqRunButtonBusy(busy) {
+  const btn = document.getElementById('hqStartBtn');
+  if (!btn) return;
+  btn.disabled = busy;
+  btn.innerHTML = busy ? '<span class="spinner">⟳</span> Running…' : 'Start / Resume scan';
+}
+
+// Live percentage/ETA for the date-range taxlines export. The fetch itself
+// runs inside a single chrome.scripting.executeScript call that only returns
+// once fully done, so hqStageTaxlinesExport (the injected function) pings
+// progress back via chrome.runtime.sendMessage as it works — this listener
+// turns those pings into the panel's status text and progress bar. Registered
+// once at popup load; harmless if it fires with nothing listening on the
+// panel (e.g. between runs) since the DOM lookups below just no-op.
+let HQ_TAXLINES_FETCH_START_MS = null;
+function formatHqEta(ms) {
+  if (!isFinite(ms) || ms < 0) return '';
+  const totalSec = Math.round(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return m > 0 ? `~${m}m ${s}s remaining` : `~${s}s remaining`;
+}
+function setHqTaxlinesProgressBar(pct) {
+  const track = document.getElementById('hqTaxlinesProgressTrack');
+  const fill = document.getElementById('hqTaxlinesProgressFill');
+  if (!track || !fill) return;
+  if (pct == null) { track.className = 'progress-track'; return; }
+  track.className = 'progress-track show';
+  fill.style.width = Math.max(0, Math.min(100, pct)) + '%';
+}
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.type !== 'hqTaxlinesProgress') return;
+  if (msg.phase === 'listed') {
+    HQ_TAXLINES_FETCH_START_MS = Date.now();
+    if (!msg.total) {
+      setHqTaxlinesStatus('No orders found in that range.', 'err');
+      setHqTaxlinesProgressBar(null);
+      return;
+    }
+    setHqTaxlinesStatus(`<span class="spinner">⟳</span> Found ${msg.total} order(s) — fetching details (0%)...`, null, true);
+    setHqTaxlinesProgressBar(0);
+    return;
+  }
+  if (msg.phase === 'fetching') {
+    const pct = msg.total ? Math.round((msg.done / msg.total) * 100) : 0;
+    let etaStr = '';
+    if (HQ_TAXLINES_FETCH_START_MS && msg.done > 0 && msg.done < msg.total) {
+      const elapsedMs = Date.now() - HQ_TAXLINES_FETCH_START_MS;
+      const remainingMs = (elapsedMs / msg.done) * (msg.total - msg.done);
+      const eta = formatHqEta(remainingMs);
+      if (eta) etaStr = ` — ${eta}`;
+    }
+    setHqTaxlinesStatus(`<span class="spinner">⟳</span> Fetching order ${msg.done} of ${msg.total} (${pct}%)${etaStr}...`, null, true);
+    setHqTaxlinesProgressBar(pct);
+  }
+});
 
 function domainOptionsHtml(selected) {
   // Union in the row's current value even if it's since been removed from the
@@ -2759,7 +3450,7 @@ function renderHqProgress() {
       ? (row.idEnd != null ? `orders ${row.idStart}-${row.idEnd}` : `orders ${row.idStart} onward (auto-detect end)`)
       : (row.sinceHoursAgo != null ? `last ${row.sinceHoursAgo}h` : '(no range set)');
     const isCurrent = i === 0 && HQ_RUN_STATE === 'running';
-    return `<div class="hint">${isCurrent ? '▶' : '⏳'} ${escapeAttr(row.domain || '(no domain)')} — ${label}${isCurrent ? ' (in progress...)' : ''}</div>`;
+    return `<div class="hint">${isCurrent ? '<span class="spinner">⟳</span>' : '⏳'} ${escapeAttr(row.domain || '(no domain)')} — ${label}${isCurrent ? ' (in progress...)' : ''}</div>`;
   }).join('');
 }
 
@@ -2769,15 +3460,16 @@ function renderMismatchTable(mismatches) {
       <td>${escapeAttr(String(m.id))}</td>
       <td>${escapeAttr(m.shippingRegion || '—')}</td>
       <td>${escapeAttr(m.transactionType || '—')}</td>
+      <td>${m.mismatchDirection === 'over' ? 'Over-collected' : (m.mismatchDirection === 'under' ? 'Under-collected' : '—')}</td>
       <td>$${escapeAttr(String(m.exciseTaxCollected ?? '0'))}</td>
       <td>$${escapeAttr(String(m.recalculatedTaxSum ?? 0))}</td>
       <td>${escapeAttr((m.ruleKeys || []).join(', ') || '—')}</td>
     </tr>`).join('');
   return `
-    <table class="cfg" style="margin-top:0;">
-      <thead><tr><th>Order ID</th><th>Region</th><th>Type</th><th>Collected</th><th>Should've collected</th><th>Rule(s) applied</th></tr></thead>
+    <div class="table-scroll"><table class="cfg" style="margin-top:0;">
+      <thead><tr><th>Order ID</th><th>Region</th><th>Type</th><th>Direction</th><th>Collected</th><th>Should've collected</th><th>Rule(s) applied</th></tr></thead>
       <tbody>${rows}</tbody>
-    </table>`;
+    </table></div>`;
 }
 
 function renderOverchargeTable(overcharged) {
@@ -2800,10 +3492,10 @@ function renderOverchargeTable(overcharged) {
     });
   });
   return `
-    <table class="cfg" style="margin-top:0;">
+    <div class="table-scroll"><table class="cfg" style="margin-top:0;">
       <thead><tr><th>Order ID</th><th>Region</th><th>SKU</th><th>Product</th><th>Qty</th><th>Actual price</th><th>Catalog price</th><th>Delta/unit</th><th>Est. tax overcharged</th></tr></thead>
       <tbody>${rows.join('')}</tbody>
-    </table>`;
+    </table></div>`;
 }
 
 function renderPossiblyMissedTaxTable(flaggedOrders) {
@@ -2822,10 +3514,50 @@ function renderPossiblyMissedTaxTable(flaggedOrders) {
     });
   });
   return `
-    <table class="cfg" style="margin-top:0;">
+    <div class="table-scroll"><table class="cfg" style="margin-top:0;">
       <thead><tr><th>Order ID</th><th>Region</th><th>SKU</th><th>Product</th><th>Qty</th><th>Catalog price</th></tr></thead>
       <tbody>${rows.join('')}</tbody>
-    </table>`;
+    </table></div>`;
+}
+
+// Verdict/Recalculated columns added 2026-09-02 — see investigateUnverifiedCollected
+// for how `o.investigation` gets populated (auto-run once per order in this bucket,
+// via the Order Investigation API, right after the scan). Three states per row:
+// no `investigation` field at all (shouldn't normally happen post-2026-09-02, but
+// covers stale saved results from before this existed), investigation.ok === false
+// (either 'no-creds' — nobody's saved Order Investigation credentials yet — or a
+// real per-order failure), and investigation.ok === true (a real verdict).
+function renderUnverifiedCollectedTable(flaggedOrders) {
+  const rows = (flaggedOrders || []).map(o => {
+    const inv = o.investigation;
+    let verdictCell, recalcCell;
+    if (!inv) {
+      verdictCell = `<span style="color:var(--muted);font-style:italic;">not checked</span>`;
+      recalcCell = '—';
+    } else if (!inv.ok) {
+      verdictCell = inv.reason === 'no-creds'
+        ? `<span style="color:var(--muted);font-style:italic;">no Order Investigation credentials saved</span>`
+        : `<span style="color:var(--danger);font-style:italic;">check failed: ${escapeAttr(inv.reason)}</span>`;
+      recalcCell = '—';
+    } else {
+      const vs = invVerdictStyle(inv.verdictCode);
+      verdictCell = `<span class="badge" style="color:${vs.color};border-color:${vs.border};background:${vs.bg};">${escapeAttr(inv.verdictCode || 'unknown')}</span>`;
+      recalcCell = inv.recalculatedNowState === 'present' ? `$${escapeAttr(String(inv.recalculatedNow))}` : `<span style="color:var(--muted);font-style:italic;">${escapeAttr(inv.recalculatedNowState || 'absent')}</span>`;
+    }
+    return `
+    <tr>
+      <td>${escapeAttr(String(o.id))}</td>
+      <td>${escapeAttr(o.shippingRegion || '—')}</td>
+      <td>$${escapeAttr(String(o.exciseTaxCollected))}</td>
+      <td>${verdictCell}</td>
+      <td>${recalcCell}</td>
+    </tr>`;
+  });
+  return `
+    <div class="table-scroll"><table class="cfg" style="margin-top:0;">
+      <thead><tr><th>Order ID</th><th>Region</th><th>Collected</th><th>Order Investigation verdict</th><th>Recalculated</th></tr></thead>
+      <tbody>${rows.join('')}</tbody>
+    </table></div>`;
 }
 
 function renderWholesaleCostMismatchTable(flaggedOrders) {
@@ -2848,10 +3580,10 @@ function renderWholesaleCostMismatchTable(flaggedOrders) {
     });
   });
   return `
-    <table class="cfg" style="margin-top:0;">
+    <div class="table-scroll"><table class="cfg" style="margin-top:0;">
       <thead><tr><th>Order ID</th><th>Region</th><th>SKU</th><th>Product</th><th>Rule</th><th>Wholesale cost</th><th>Rate</th><th>Expected unit tax</th><th>Actual unit tax</th><th>Direction</th></tr></thead>
       <tbody>${rows.join('')}</tbody>
-    </table>`;
+    </table></div>`;
 }
 
 function renderFlatRateMismatchTable(flaggedOrders) {
@@ -2874,10 +3606,38 @@ function renderFlatRateMismatchTable(flaggedOrders) {
     });
   });
   return `
-    <table class="cfg" style="margin-top:0;">
+    <div class="table-scroll"><table class="cfg" style="margin-top:0;">
       <thead><tr><th>Order ID</th><th>Region</th><th>SKU</th><th>Product</th><th>Rule</th><th>Volume</th><th>Rate</th><th>Expected unit tax</th><th>Actual unit tax</th><th>Direction</th></tr></thead>
       <tbody>${rows.join('')}</tbody>
-    </table>`;
+    </table></div>`;
+}
+
+function renderTaxOpsCrossCheckTable(flaggedOrders) {
+  const rows = [];
+  (flaggedOrders || []).forEach(o => {
+    (o.taxOpsCrossCheck || []).forEach(m => {
+      const flags = [];
+      if (m.hasOverride) flags.push('<span class="badge flag">per-org override</span>');
+      if (m.rateDisagrees) flags.push('<span class="badge flag">rate disagrees</span>');
+      if (m.uncoveredButRated) flags.push('<span class="badge flag">not on any table here</span>');
+      rows.push(`
+    <tr>
+      <td>${escapeAttr(String(o.id))}</td>
+      <td>${escapeAttr(o.shippingRegion || '—')}</td>
+      <td>${escapeAttr(m.sku || '—')}</td>
+      <td>${escapeAttr(m.ruleKey)}</td>
+      <td>${escapeAttr(m.assumedTable || '—')}${m.assumedRate != null ? ' (' + escapeAttr(String(Math.round(m.assumedRate * 1000) / 10)) + '%)' : ''}</td>
+      <td>${m.liveRate != null ? escapeAttr(String(Math.round(m.liveRate * 1000) / 10)) + '%' : '—'} / ${escapeAttr(m.liveBasis || '—')}</td>
+      <td>${escapeAttr(m.liveSource || '—')}</td>
+      <td>${flags.join(' ')}</td>
+    </tr>`);
+    });
+  });
+  return `
+    <div class="table-scroll"><table class="cfg" style="margin-top:0;">
+      <thead><tr><th>Order ID</th><th>Region</th><th>SKU</th><th>Rule</th><th>This tool assumes</th><th>Tax Ops Hq says</th><th>Source</th><th>Flags</th></tr></thead>
+      <tbody>${rows.join('')}</tbody>
+    </table></div>`;
 }
 
 function renderHqResults() {
@@ -2892,8 +3652,11 @@ function renderHqResults() {
   const possiblyMissedTaxOrgs = HQ_RESULTS.filter(r => r.possiblyMissedTaxCount > 0);
   const wholesaleCostOrgs = HQ_RESULTS.filter(r => r.wholesaleCostFlaggedCount > 0);
   const flatRateOrgs = HQ_RESULTS.filter(r => r.flatRateFlaggedCount > 0);
+  const taxOpsOrgs = HQ_RESULTS.filter(r => r.taxOpsFlaggedCount > 0);
+  const taxOpsUnavailableOrgs = HQ_RESULTS.filter(r => r.taxOpsStatus && r.taxOpsStatus !== 'ok');
+  const investigationClearedOrgs = HQ_RESULTS.filter(r => r.investigationClearedMismatchesCount > 0);
   const errored = HQ_RESULTS.filter(r => r.error);
-  summary.textContent = `Scanned ${HQ_RESULTS.length} org(s) — ${flagged.length} with mismatches, ${overchargedOrgs.length} with a stale catalog price (possible overcharge), ${possiblyMissedTaxOrgs.length} with a possible missed tax (isExempt fallback), ${wholesaleCostOrgs.length} with a wholesale-cost-basis rate mismatch, ${flatRateOrgs.length} with a flat per-mL rate mismatch, ${errored.length} couldn't be scanned.`;
+  summary.textContent = `Scanned ${HQ_RESULTS.length} org(s) — ${flagged.length} with mismatches, ${overchargedOrgs.length} with a stale catalog price (possible overcharge), ${possiblyMissedTaxOrgs.length} with a possible missed tax (isExempt fallback), ${wholesaleCostOrgs.length} with a wholesale-cost-basis rate mismatch, ${flatRateOrgs.length} with a flat per-mL rate mismatch, ${taxOpsOrgs.length} with a Tax Ops Hq cross-check hit, ${errored.length} couldn't be scanned.${taxOpsUnavailableOrgs.length ? ` Tax Ops Hq cross-check was unavailable for ${taxOpsUnavailableOrgs.length} org(s) — see below.` : ''}${investigationClearedOrgs.length ? ` ${investigationClearedOrgs.reduce((s, r) => s + r.investigationClearedMismatchesCount, 0)} mismatch(es) across ${investigationClearedOrgs.length} org(s) were cleared by Order Investigation and are shown separately, not counted above.` : ''}`;
 
   list.innerHTML = '';
   HQ_RESULTS.forEach((r, i) => {
@@ -2909,22 +3672,44 @@ function renderHqResults() {
     } else {
       const badge = r.mismatchCount > 0 ? 'flag' : 'ok';
       const badgeText = r.mismatchCount > 0 ? `${r.mismatchCount} mismatch(es)` : 'Clean';
-      const overchargeBadge = r.overchargedCount > 0 ? `<span class="badge flag" style="margin-left:6px;">${r.overchargedCount} order(s) w/ stale price</span>` : '';
-      const possiblyMissedTaxBadge = r.possiblyMissedTaxCount > 0 ? `<span class="badge flag" style="margin-left:6px;">${r.possiblyMissedTaxCount} order(s) w/ possible missed tax</span>` : '';
-      const wholesaleCostBadge = r.wholesaleCostFlaggedCount > 0 ? `<span class="badge flag" style="margin-left:6px;">${r.wholesaleCostFlaggedCount} order(s) w/ wholesale-cost mismatch</span>` : '';
-      const flatRateBadge = r.flatRateFlaggedCount > 0 ? `<span class="badge flag" style="margin-left:6px;">${r.flatRateFlaggedCount} order(s) w/ flat-rate mismatch</span>` : '';
+      const overchargeBadge = r.overchargedCount > 0 ? `<span class="badge flag">${r.overchargedCount} order(s) w/ stale price</span>` : '';
+      const possiblyMissedTaxBadge = r.possiblyMissedTaxCount > 0 ? `<span class="badge flag">${r.possiblyMissedTaxCount} order(s) w/ possible missed tax</span>` : '';
+      const wholesaleCostBadge = r.wholesaleCostFlaggedCount > 0 ? `<span class="badge flag">${r.wholesaleCostFlaggedCount} order(s) w/ wholesale-cost mismatch</span>` : '';
+      const flatRateBadge = r.flatRateFlaggedCount > 0 ? `<span class="badge flag">${r.flatRateFlaggedCount} order(s) w/ flat-rate mismatch</span>` : '';
+      const taxOpsBadge = r.taxOpsFlaggedCount > 0 ? `<span class="badge flag">${r.taxOpsFlaggedCount} order(s) w/ Tax Ops Hq cross-check hit</span>` : '';
+      const unverifiedCollectedBadge = r.unverifiedCollectedCount > 0 ? `<span class="badge flag">${r.unverifiedCollectedCount} order(s) collected but unverifiable</span>` : '';
+      const taxOpsUnavailableBadge = (r.taxOpsStatus && r.taxOpsStatus !== 'ok') ? `<span class="badge">Tax Ops Hq cross-check: ${escapeAttr(r.taxOpsStatus === 'not-signed-in' ? 'not signed in to taxes.tokenoftrust.com' : r.taxOpsStatus)}</span>` : '';
+      // 2026-09-09: see the investigationClearedMismatches comment near
+      // investigateUnverifiedCollected's second call site (runHqScan) — these
+      // are mismatches calc-detail flagged that Order Investigation's own
+      // live recalculation verdicts "healthy" (e.g. a customer-level
+      // exemption calc-detail never surfaces), so they're broken out of the
+      // main mismatch badge/table rather than left clogging it.
+      const investigationClearedBadge = r.investigationClearedMismatchesCount > 0 ? `<span class="badge ok">${r.investigationClearedMismatchesCount} order(s) cleared by Order Investigation</span>` : '';
       item.innerHTML = `
         <div class="diag-head">
           <div class="diag-title">${escapeAttr(r.domain)}</div>
-          <span class="badge ${badge}">${badgeText}</span>${overchargeBadge}${possiblyMissedTaxBadge}${wholesaleCostBadge}${flatRateBadge}
+          <div class="diag-badges"><span class="badge ${badge}">${badgeText}</span>${overchargeBadge}${possiblyMissedTaxBadge}${wholesaleCostBadge}${flatRateBadge}${taxOpsBadge}${taxOpsUnavailableBadge}${unverifiedCollectedBadge}${investigationClearedBadge}</div>
         </div>
         <div class="diag-summary">${r.checked} order(s) found and checked (${r.notFound} in the range didn't exist / 404'd) — ${r.mismatchCount} of those ${r.checked} show the mismatch pattern.${r.highestFoundId != null ? ` Newest order found: <strong>${r.highestFoundId}</strong> — use this as next cycle's start ID.` : ''}</div>
-        ${r.notRequired != null ? `<div class="diag-summary" style="margin-top:4px;">${r.checked} checked:<div style="margin-top:2px;padding-left:14px;font-family:monospace;line-height:1.6;">${r.notRequired} tot-excise-tax-not-required<br>${r.collected} tot-excise-tax-collected<br>${r.incorrect} tot-excise-tax-incorrect</div></div>` : ''}
+        <!-- 2026-09-09 (v3.17.29): the nav-check/server-session-check line lived
+             here through the multi-org session-loss investigation (v3.17.26
+             persisted it so it wouldn't only flash by in the status line) —
+             Marc confirmed v3.17.28's fix holds, so this debug line no longer
+             belongs in front of every clean scan. navDiag/sessionChecks are
+             still collected and still stored on r (harmless, cheap, and worth
+             keeping in case this ever needs debugging again) — just not
+             rendered for a successful org anymore. Still shown on error
+             entries below, where it's still useful. -->
+        ${r.notRequired != null ? `<div class="diag-summary" style="margin-top:4px;">${r.checked} checked:<div style="margin-top:2px;padding-left:14px;font-family:monospace;line-height:1.6;">${r.notRequired} tot-excise-tax-not-required<br>${r.collected} tot-excise-tax-collected<br>${r.incorrect} tot-excise-tax-incorrect${r.unverifiedCollectedCount > 0 ? `<br>${r.unverifiedCollectedCount} collected but unverifiable (calc-detail empty)` : ''}</div></div>` : ''}
+        ${r.unverifiedCollectedCount > 0 ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><div style="font-weight:600;margin-bottom:4px;">${r.unverifiedCollectedCount} order(s) collected excise tax but calc-detail returned no rules:</div><div class="diag-summary" style="margin-bottom:6px;">Cross-checked against the Order Investigation API (needs credentials saved on that tab) — the table below shows its verdict and recalculated amount where that check ran; if it didn't run or came back inconclusive, check the order manually via HQ's "How was this tax calculated" tool or the Order Investigation tab before drawing a conclusion.</div>${renderUnverifiedCollectedTable(r.unverifiedCollected)}</div>` : ''}
         ${r.mismatchCount > 0 ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><div style="font-weight:600;margin-bottom:4px;">Order IDs tagged tot-excise-tax-incorrect:</div>${renderMismatchTable(r.mismatches)}</div>` : ''}
+        ${r.investigationClearedMismatchesCount > 0 ? `<div class="diag-summary" style="margin-top:4px;" title="Flagged by calc-detail as a mismatch, but Order Investigation's own live recalculation verdicts these orders healthy/exempt (e.g. a customer-level isExemptCustomer exemption calc-detail never surfaces) — no longer counted in tot-excise-tax-incorrect above.">${r.investigationClearedMismatchesCount} order(s) cleared by Order Investigation (healthy/exempt): ${r.investigationClearedMismatches.map(m => escapeAttr(String(m.id))).join(', ')}</div>` : ''}
         ${r.overchargedCount > 0 ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><div style="font-weight:600;margin-bottom:4px;">${r.overchargedCount} order(s) with a line where TOT's saved catalog price is above what was actually charged:</div><div class="diag-summary" style="margin-bottom:6px;">Estimated tax overcharged so far: <strong>~$${r.estimatedOverchargeTotal}</strong>. Only jurisdiction+SKU-type combos confirmed retail-price-based on TaxOps Portal's State Tax Rules page are checked at all (currently NY::vape and WA::vape/nicotinePouch) — everything else is skipped by default, since most states tax by wholesale cost/price, a flat per-mL/per-unit amount, or not at all, where a stale catalog retail price is irrelevant to the tax owed. This is still an estimate, not a confirmed dollar amount — always double-check against HQ's "How was this tax calculated" tool before acting on it.</div>${renderOverchargeTable(r.overcharged)}</div>` : ''}
         ${r.possiblyMissedTaxCount > 0 ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><div style="font-weight:600;margin-bottom:4px;">${r.possiblyMissedTaxCount} order(s) with a nicotine vape line marked exempt but missing its volume classification:</div><div class="diag-summary" style="margin-bottom:6px;">Speculative, unconfirmed lead — not a proven miss. Per BigCommerce's own totProductBuilder.node.js source, a vape product's isExempt gets set to true automatically whenever it's missing volumeInMl or a classifiable vapeSystemType, which is a fallback for incomplete product data rather than a genuine exemption. These lines match that pattern (isExempt, hasNicotine, no volumeInMl on file, non-trivial catalog price) but haven't been checked against a real order the way the overcharge findings above were. Verify each one manually via HQ's "How was this tax calculated" tool before treating it as a real missed tax.</div>${renderPossiblyMissedTaxTable(r.possiblyMissedTax)}</div>` : ''}
         ${r.wholesaleCostFlaggedCount > 0 ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><div style="font-weight:600;margin-bottom:4px;">${r.wholesaleCostFlaggedCount} order(s) with a wholesale-cost-basis tax mismatch:</div><div class="diag-summary" style="margin-bottom:6px;">These states (CO, DC, HI, ME, MA, NV, OR, TN, UT, VT, WY) tax as a percentage of wholesaleCost — a field distinct from retailPrice/wholesalePrice/msrp, so this is a direct expected-vs-actual comparison, not a price-gap estimate. Only CO is confirmed against a real order; the rest are transcribed from the TaxOps sheet and unverified — and it's unconfirmed whether calc-detail always exposes wholesaleCost the way it exposes retailPrice, so a quiet run isn't proof of a clean one either. "Direction" shows whether the actual unit tax charged was above or below the expected amount. Verify each hit via HQ's "How was this tax calculated" tool before acting on it.</div>${renderWholesaleCostMismatchTable(r.wholesaleCostFlagged)}</div>` : ''}
-        ${r.flatRateFlaggedCount > 0 ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><div style="font-weight:600;margin-bottom:4px;">${r.flatRateFlaggedCount} order(s) with a flat per-mL rate mismatch:</div><div class="diag-summary" style="margin-bottom:6px;">These states (VA, OH, DE, IA, KS, LA, NC, WV, WI) tax a flat dollar amount per mL, with no price/cost field involved at all — the most reliable check in this tool, since there's no price-field ambiguity to get wrong. VA and OH are confirmed against real orders (2447866, 2447910); the rest are transcribed from the TaxOps sheet and unverified. "Direction" shows whether the actual unit tax charged was above or below the expected amount. Verify each hit via HQ's "How was this tax calculated" tool before acting on it.</div>${renderFlatRateMismatchTable(r.flatRateFlagged)}</div>` : ''}`;
+        ${r.flatRateFlaggedCount > 0 ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><div style="font-weight:600;margin-bottom:4px;">${r.flatRateFlaggedCount} order(s) with a flat per-mL rate mismatch:</div><div class="diag-summary" style="margin-bottom:6px;">These states (VA, OH, DE, IA, KS, LA, NC, WV, WI) tax a flat dollar amount per mL, with no price/cost field involved at all — the most reliable check in this tool, since there's no price-field ambiguity to get wrong. VA and OH are confirmed against real orders (2447866, 2447910); the rest are transcribed from the TaxOps sheet and unverified. "Direction" shows whether the actual unit tax charged was above or below the expected amount. Verify each hit via HQ's "How was this tax calculated" tool before acting on it.</div>${renderFlatRateMismatchTable(r.flatRateFlagged)}</div>` : ''}
+        ${r.taxOpsFlaggedCount > 0 ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);"><div style="font-weight:600;margin-bottom:4px;">${r.taxOpsFlaggedCount} order(s) with a Tax Ops Hq effective-rules cross-check hit:</div><div class="diag-summary" style="margin-bottom:6px;">Live-verified 2026-09-01 — see the README changelog entries with that date. Compares this tool's hand-maintained rate tables against taxes.tokenoftrust.com's own per-org rule overrides (GET /api/clients/&lt;domain&gt;) and global reference rates (GET /api/tax-calendar/rules) — replaces the originally-proposed GET /api/effective-rules, confirmed dead (always empty) the same day. "per-org override" means Tax Ops Hq has an override active for this org that this tool has no other visibility into. "rate disagrees" means the live rate doesn't match what this tool assumes. "not on any table here" means Tax Ops Hq has a nonzero rate for this state+type but this tool currently skips it entirely. This does NOT recompute "the correct tax" from the live rate+basis — only flags the disagreement for a human to check via HQ's "How was this tax calculated" tool, since it's unconfirmed whether Tax Ops Hq's "basis" field maps to retailPrice/wholesaleCost/volume the same way this tool's own tables assume.</div>${renderTaxOpsCrossCheckTable(r.taxOpsFlagged)}</div>` : ''}`;
     }
     list.appendChild(item);
   });
@@ -2951,15 +3736,60 @@ function hqStageSelectOrg(domain) {
       desc.set.call(el, value);
       el.dispatchEvent(new Event('input', { bubbles: true }));
     }
+    // 2026-09-09 diagnostic: a real session loss doesn't always show up as a
+    // hard redirect to /hq/signin — live testing (giantvapes.com -> mmschainportal.com,
+    // Marc's own recording) caught it landing back on /hq/choose-app with the
+    // sidebar showing "NO ORGANIZATION."/"No User Name" and the org-search
+    // dropdown coming back "Sorry, no matching options" for a domain that's
+    // definitely real. The two checks below catch both shapes rather than
+    // only the URL-redirect one, and tag which shape was actually seen so a
+    // real session loss stops getting silently reported as "domain not
+    // found in HQ" (see the not-found branch further down).
+    if (location.pathname.includes('/hq/signin')) return { ok: false, reason: 'logged-out', detectedAfter: 'choose-app-entry (redirected to /hq/signin)' };
     const input = document.querySelector('input.vs__search');
-    if (!input) return { ok: false, reason: 'logged-out' };
+    if (!input) return { ok: false, reason: 'logged-out', detectedAfter: 'choose-app-entry (no org search box on the page)' };
     input.click();
     input.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
     setNativeValue(input, domain);
-    await new Promise(r => setTimeout(r, 900));
-    const opts = Array.from(document.querySelectorAll('li'));
-    const match = opts.find(l => l.textContent.trim() === domain);
-    if (!match) return { ok: false, reason: 'not-found', opts: opts.map(o => o.textContent.trim()) };
+    // 2026-09-09 (v3.17.23): was a flat 900ms sleep, then read whatever the
+    // dropdown had at that instant. Video 5 caught this org-search coming back
+    // "Sorry, no matching options" for mmschainportal.com right after Marc had
+    // manually signed back in from a fresh /hq/signin — i.e. right when the
+    // org list is most likely still loading, not warm/cached the way it would
+    // be mid-session. A fixed 900ms can't tell "genuinely not in the list" from
+    // "still loading," so this polls instead: keep checking for a real match,
+    // and only accept "no matches" once vue-select's own empty-state <li>
+    // ("Sorry, no matching options") has been the ENTIRE option list for a bit
+    // (not just the first instant it appears, in case it flashes briefly while
+    // the real list is still being fetched), or the timeout is hit.
+    async function waitForDropdownSettled(timeoutMs) {
+      const start = Date.now();
+      let opts = [];
+      let emptyStateSince = null;
+      while (Date.now() - start < timeoutMs) {
+        opts = Array.from(document.querySelectorAll('li'));
+        const match = opts.find(l => l.textContent.trim() === domain);
+        if (match) return { match, opts };
+        const isEmptyState = opts.length === 1 && /no matching options/i.test(opts[0].textContent || '');
+        if (isEmptyState) {
+          if (emptyStateSince == null) emptyStateSince = Date.now();
+          if (Date.now() - emptyStateSince > 1200) return { match: null, opts };
+        } else {
+          emptyStateSince = null;
+        }
+        await new Promise(r => setTimeout(r, 400));
+      }
+      return { match: null, opts };
+    }
+    const { match, opts } = await waitForDropdownSettled(4000);
+    if (!match) {
+      // "NO ORGANIZATION." is this app's own sidebar placeholder for
+      // no-org-selected/no-session — a real domain typo or a not-yet-added
+      // org wouldn't show this, only a session that's lost its org context.
+      const sidebarLoggedOut = /no organization\./i.test(document.body.innerText || '');
+      if (sidebarLoggedOut) return { ok: false, reason: 'logged-out', detectedAfter: `choose-app-search for ${domain} (sidebar shows "NO ORGANIZATION.", dropdown had no matches)`, opts: opts.map(o => o.textContent.trim()) };
+      return { ok: false, reason: 'not-found', opts: opts.map(o => o.textContent.trim()) };
+    }
     match.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
     match.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     match.dispatchEvent(new MouseEvent('click', { bubbles: true }));
@@ -2968,10 +3798,284 @@ function hqStageSelectOrg(domain) {
   })();
 }
 
-function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
+// Export Taxlines CSV for a date range (2026-08-27) — injected into the real
+// HQ tab the same way hqStageScan is, and for the same reason (see "Why
+// chrome.scripting" in the README): org-switch and token-mint only happen
+// through in-page app state, not a directly-callable endpoint.
+//
+// This is a separate injected function rather than a new branch reusing
+// hqStageScan's own body, because chrome.scripting.executeScript's `func`
+// option requires a fully self-contained function — it can't close over
+// anything from popup.js's outer scope, including other functions defined
+// there. That means the token-mint block below and the taxlineRows-building
+// block are duplicates of the same code in hqStageScan/scanOneOrder rather
+// than a shared helper — if the row shape ever changes, both copies need the
+// update. Deliberately does NOT carry over the mismatch/overcharge/
+// wholesale-cost/flat-rate diagnostic computations scanOneOrder does — none
+// of that is needed for a CSV-only pull, so this stays smaller and faster.
+function hqStageTaxlinesExport(domain, sinceIso, untilIso) {
   return (async () => {
     function findButtonByText(txt) {
       return Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === txt);
+    }
+    async function waitForTokenUiReady(timeoutMs) {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        if (findButtonByText('Reset token') || findButtonByText('Generate a new access token') ||
+            findButtonByText('Create a new access token') || document.getElementById('collapsed-token-value')) {
+          return true;
+        }
+        await new Promise(r => setTimeout(r, 300));
+      }
+      return false;
+    }
+    await waitForTokenUiReady(8000);
+    await new Promise(r => setTimeout(r, 1000));
+
+    const resetBtn = findButtonByText('Reset token');
+    if (resetBtn) { resetBtn.click(); await new Promise(r => setTimeout(r, 500)); }
+    const createBtn = findButtonByText('Generate a new access token') || findButtonByText('Create a new access token');
+    if (createBtn) { createBtn.click(); await new Promise(r => setTimeout(r, 1800)); }
+
+    const codeEl = document.getElementById('collapsed-token-value');
+    let full = codeEl && codeEl.getAttribute('data-full-token');
+    if (!full || full === 'No token') {
+      const start2 = Date.now();
+      while ((!full || full === 'No token') && Date.now() - start2 < 4000) {
+        await new Promise(r => setTimeout(r, 400));
+        const el2 = document.getElementById('collapsed-token-value');
+        full = el2 && el2.getAttribute('data-full-token');
+      }
+    }
+    if (!full || full === 'No token') return { ok: false, reason: 'no-token' };
+
+    let decoded;
+    try { decoded = JSON.parse(atob(full)); } catch (e) { return { ok: false, reason: 'decode-failed: ' + e.message }; }
+    if (decoded.referrerOrigin !== domain) return { ok: false, reason: `wrong-scope (token was for ${decoded.referrerOrigin})` };
+    const token = full;
+
+    // Paginate via date-bisection, not an offset/cursor — GET /exciseTax/orders
+    // has neither, only since/until/limit (max 1000). Splitting the window in
+    // half whenever a call comes back exactly at the cap works regardless of
+    // what order the API returns results in, unlike paging by "last seen
+    // timestamp" which would assume a sort order this API doesn't document.
+    // depth is a safety backstop against a truly degenerate range, not
+    // expected to matter for a normal month-sized export.
+    async function fetchIdsInRange(since, until, depth) {
+      const res = await fetch(`/api/exciseTax/orders?since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}&limit=1000`, {
+        headers: { Accept: 'application/json', Authorization: 'Bearer ' + token }
+      });
+      if (res.status !== 200) return { error: `list-orders failed (status ${res.status}) for ${since}..${until}` };
+      const body = await res.json();
+      const orders = body?.content?.orders || [];
+      if (orders.length < 1000 || depth > 12) return orders.map(o => o.orderId || o.id);
+      const sinceMs = new Date(since).getTime(), untilMs = new Date(until).getTime();
+      const midMs = sinceMs + Math.floor((untilMs - sinceMs) / 2);
+      if (!(midMs > sinceMs) || !(midMs < untilMs)) return orders.map(o => o.orderId || o.id);
+      const mid = new Date(midMs).toISOString();
+      const [left, right] = await Promise.all([fetchIdsInRange(since, mid, depth + 1), fetchIdsInRange(mid, until, depth + 1)]);
+      if (left && left.error) return left;
+      if (right && right.error) return right;
+      return Array.from(new Set([...left, ...right]));
+    }
+
+    // Best-effort progress ping back to the popup — this whole function only
+    // returns once at the very end via chrome.scripting.executeScript, so
+    // without this the popup has no way to show a percentage/ETA while it
+    // waits. Fire-and-forget (not awaited) so a slow/missing listener (popup
+    // closed, no one home) never adds latency to the actual fetch loop; wrapped
+    // since sendMessage can throw synchronously if the extension context has
+    // gone away mid-run.
+    function reportProgress(payload) {
+      try { chrome.runtime.sendMessage(Object.assign({ type: 'hqTaxlinesProgress' }, payload)).catch(() => {}); } catch (e) {}
+    }
+
+    const idResult = await fetchIdsInRange(sinceIso, untilIso, 0);
+    if (idResult && idResult.error) return { ok: false, reason: idResult.error };
+    const orderIds = idResult;
+    reportProgress({ phase: 'listed', total: orderIds.length });
+
+    // Same three-source SKU join as scanOneOrder's taxlineRows block — see
+    // the comment there for the full source-by-source breakdown and the
+    // deliberate PII/unavailable-field gaps. Kept in sync by hand; not
+    // shared, per the note at the top of this function.
+    async function fetchOneOrderTaxlines(id) {
+      const orderRes = await fetch(`/api/exciseTax/order/${id}`, { headers: { Accept: 'application/json', Authorization: 'Bearer ' + token } });
+      if (orderRes.status !== 200) return [];
+      const orderBody = await orderRes.json();
+      const order = orderBody?.content?.order;
+      if (!order) return [];
+      const calcRes = await fetch(`/api/exciseTax/orders/${id}/calc-detail`, { headers: { Accept: 'application/json', Authorization: 'Bearer ' + token } });
+      const calcBody = calcRes.status === 200 ? await calcRes.json() : null;
+      const events = calcBody?.content?.events || [];
+      const calcEvent = events.find(e => e.eventType === 'calculation') || events[0] || {};
+      const cd = calcEvent.calcDetail || {};
+      const skeletonEvent = cd.partial === true || cd.source === 'skeleton';
+      const calcProductsBySku = {};
+      (cd.products || []).forEach(p => { if (p.sku) calcProductsBySku[p.sku] = p; });
+      const skippedBySku = {};
+      (cd.skippedProducts || []).forEach(p => { if (p.sku) skippedBySku[p.sku] = p; });
+      const catalogBySku = order?.products || {};
+
+      return (order?.transactionLines || []).map(line => {
+        const sku = line.sku;
+        const calcP = sku ? calcProductsBySku[sku] : null;
+        const catalogP = sku ? catalogBySku[sku] : null;
+        const meta = calcP || catalogP || {};
+        const qty = parseFloat(line.quantity) || 0;
+        const unitPrice = parseFloat(line.unitDiscountedPrice ?? line.unitSalesPrice) || 0;
+        const tags = meta.tags || [];
+        const hasTag = t => tags.includes(t);
+        const appliedRules = (calcP && calcP.appliedRules) || [];
+        const lineTax = appliedRules.reduce((s, r) => s + (r.taxForQty || 0), 0);
+
+        let taxCollectionStatus;
+        if (skeletonEvent || !events.length) taxCollectionStatus = 'no_calculation_data';
+        else if (!calcP) taxCollectionStatus = skippedBySku[sku] ? ('skipped:' + (skippedBySku[sku].reason || 'unknown')) : 'not_in_calc_detail';
+        else if (appliedRules.length === 0) taxCollectionStatus = meta.isExempt ? 'exempt' : 'no_rules_for_jurisdiction';
+        else taxCollectionStatus = 'calculated';
+
+        return {
+          order: id,
+          date: order?.timestamp || '',
+          sku: sku || '',
+          productName: meta.productName || '',
+          productBrand: meta.productBrand || '',
+          productId: line.productId || meta.productId || '',
+          quantity: line.quantity ?? '',
+          totalPrice: qty && unitPrice ? Math.round(qty * unitPrice * 100) / 100 : '',
+          volumeInMl: meta.volumeInMl ?? '',
+          wholesaleCost: meta.wholesaleCost ?? '',
+          wholesalePrice: meta.wholesalePrice ?? '',
+          retailPrice: meta.retailPrice ?? '',
+          msrp: meta.msrp ?? '',
+          productTags: tags.join(','),
+          totalTax: calcP ? Math.round(lineTax * 100) / 100 : '',
+          country: order?.shippingLocation?.countryCode || '',
+          state: order?.shippingLocation?.regionCode || '',
+          city: order?.shippingLocation?.locality || '',
+          postalCode: order?.shippingLocation?.postalCode || '',
+          isVape: hasTag('isVape') ? '1' : '0',
+          isExempt: (meta.isExempt || hasTag('isExempt')) ? '1' : '0',
+          hasNicotine: hasTag('hasNicotine') ? '1' : '0',
+          isOpen: hasTag('isOpen') ? '1' : '0',
+          isClosed: hasTag('isClosed') ? '1' : '0',
+          closedRefillable: hasTag('closedRefillable') ? '1' : '0',
+          closedCartridge: hasTag('closedCartridge') ? '1' : '0',
+          closedSingleUse: hasTag('closedSingleUse') ? '1' : '0',
+          batteryOnly: hasTag('batteryOnly') ? '1' : '0',
+          taxCollectionStatus
+        };
+      });
+    }
+
+    let taxlineRows = [];
+    let checked = 0, failed = 0;
+    // Sequential, matching scanOneOrder's own pattern elsewhere in this file
+    // — not parallelized, since this internal API's tolerance for concurrent
+    // calls from one token hasn't been tested and isn't worth risking on an
+    // export that already runs unattended-ish in the foreground tab.
+    for (const id of orderIds) {
+      try {
+        const rows = await fetchOneOrderTaxlines(id);
+        taxlineRows = taxlineRows.concat(rows);
+        checked++;
+      } catch (e) {
+        failed++;
+      }
+      reportProgress({ phase: 'fetching', done: checked + failed, total: orderIds.length });
+    }
+
+    // Per-order rollup columns (closedVolumeMl, openVolumeMl, totalSalesOf...,
+    // wholesalePriceOf...) — same approach as scanOneOrder: computed per
+    // order, not independently confirmed against the original export's own
+    // formula. Grouped by `order` since taxlineRows here spans many orders.
+    const byOrder = {};
+    taxlineRows.forEach(r => { (byOrder[r.order] = byOrder[r.order] || []).push(r); });
+    const round2 = n => Math.round(n * 100) / 100;
+    Object.values(byOrder).forEach(rows => {
+      let closedVolumeMl = 0, openVolumeMl = 0;
+      let totalSalesOfOpenSystems = 0, totalSalesOfClosedSystems = 0, totalSalesOfSingleUseSystems = 0;
+      let wholesalePriceOfOpenSystems = 0, wholesalePriceOfClosedSystems = 0, wholesaleValueOfSingleUseSystems = 0;
+      rows.forEach(r => {
+        const qty = parseFloat(r.quantity) || 0;
+        const vol = (parseFloat(r.volumeInMl) || 0) * qty;
+        const wsVal = (parseFloat(r.wholesaleCost) || 0) * qty;
+        const price = parseFloat(r.totalPrice) || 0;
+        if (r.isOpen === '1') { openVolumeMl += vol; totalSalesOfOpenSystems += price; wholesalePriceOfOpenSystems += wsVal; }
+        if (r.isClosed === '1' && r.closedSingleUse !== '1') { closedVolumeMl += vol; totalSalesOfClosedSystems += price; wholesalePriceOfClosedSystems += wsVal; }
+        if (r.closedSingleUse === '1') { totalSalesOfSingleUseSystems += price; wholesaleValueOfSingleUseSystems += wsVal; }
+      });
+      rows.forEach(r => {
+        r.closedVolumeMl = round2(closedVolumeMl) || '';
+        r.openVolumeMl = round2(openVolumeMl) || '';
+        r.totalSalesOfOpenSystems = round2(totalSalesOfOpenSystems) || '';
+        r.totalSalesOfClosedSystems = round2(totalSalesOfClosedSystems) || '';
+        r.totalSalesOfSingleUseSystems = round2(totalSalesOfSingleUseSystems) || '';
+        r.wholesalePriceOfOpenSystems = round2(wholesalePriceOfOpenSystems) || '';
+        r.wholesalePriceOfClosedSystems = round2(wholesalePriceOfClosedSystems) || '';
+        r.wholesaleValueOfSingleUseSystems = round2(wholesaleValueOfSingleUseSystems) || '';
+      });
+    });
+
+    return { ok: true, domain, since: sinceIso, until: untilIso, orderCount: orderIds.length, checked, failed, taxlineRows };
+  })();
+}
+
+function hqMintToken(domain) {
+  return (async () => {
+    function findButtonByText(txt) {
+      return Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === txt);
+    }
+
+    // 2026-09-09 (v3.17.23, next diagnostic — Marc: "it still breaks" after
+    // v3.17.23's two fixes, no video this time). checkLoggedOut() below only
+    // reads location.pathname on THIS page — it can't tell whether the
+    // session already died server-side without this page's own bundle ever
+    // re-checking or redirecting (Video 5 showed the /hq/signin redirect
+    // landing a beat AFTER /hq/home rendered "NO ORGANIZATION.", not
+    // instantly — the docs page may never re-validate session state against
+    // the server at all once it's loaded). This adds a real server
+    // round-trip at each checkpoint WITHOUT navigating the visible tab: a
+    // plain fetch() to /hq/home carries the same session cookie a real
+    // navigation would, and its response (final URL after any redirect, plus
+    // the rendered markup) says whether the server still considers the
+    // session valid RIGHT NOW, independent of whatever this page's own JS
+    // believes. Purely diagnostic — never blocks the scan; a failed check
+    // (network hiccup, unexpected shape, anything short of a clear
+    // signed-out marker) reports ok:true, since this exists only to narrow
+    // down when the session dies, not to gate anything.
+    const sessionChecks = [];
+    async function checkServerSessionAlive(stage) {
+      let entry;
+      // 2026-09-09 (v3.17.25 — this fetch had no timeout, and Marc's very next
+      // run hung forever at "Switching to..." with no error ever surfacing.
+      // The fetch below runs inside the injected page function; if that fetch
+      // never settles (a stalled request, or the tab navigating away out from
+      // under it — plausible right around the exact "Back to HQ"/choose-app
+      // transition this whole investigation is about), the entire hqStageScan
+      // call it's part of never resolves either, so nothing upstream ever gets
+      // a chance to time out or report anything — this diagnostic itself was
+      // the new hang, not a new discovery about the underlying bug. Bounded
+      // with AbortController so it can never block the scan longer than 5s;
+      // a timeout reports ok:true (inconclusive), same as any other failure
+      // mode here — this check must never be able to hang anything.
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      try {
+        const res = await fetch('/hq/home', { credentials: 'include', cache: 'no-store', redirect: 'follow', signal: controller.signal });
+        let bodyText = '';
+        try { bodyText = await res.text(); } catch (e) {}
+        const finalUrl = res.url || '';
+        const loggedOut = finalUrl.includes('/hq/signin') || /passwordless login/i.test(bodyText) || /no organization\./i.test(bodyText);
+        entry = { stage, ok: !loggedOut, status: res.status, finalUrl };
+      } catch (e) {
+        entry = { stage, ok: true, error: (e && e.name === 'AbortError') ? 'timed out after 5s' : e.message }; // couldn't check — not proof either way
+      } finally {
+        clearTimeout(timer);
+      }
+      sessionChecks.push(entry);
+      return entry;
     }
 
     // 2026-08-21: the docs page's Vue app can still be rendering when this
@@ -2994,10 +4098,65 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
     await waitForTokenUiReady(8000);
     await new Promise(r => setTimeout(r, 1000)); // let the docs app finish its own auto-token attempt
 
-    const resetBtn = findButtonByText('Reset token');
-    if (resetBtn) { resetBtn.click(); await new Promise(r => setTimeout(r, 500)); }
-    const createBtn = findButtonByText('Generate a new access token') || findButtonByText('Create a new access token');
-    if (createBtn) { createBtn.click(); await new Promise(r => setTimeout(r, 1800)); }
+    // 2026-09-09 diagnostic (Marc: giantvapes.com scanned fine, then got
+    // logged out switching to mmschainportal.com — video confirmed org #1
+    // reached this exact docs page successfully). These checkpoints pin down
+    // which action the session loss actually follows instead of only
+    // discovering it later, on the NEXT org's choose-app visit (see
+    // hqStageSelectOrg's own checks). Session loss hasn't been confirmed to
+    // always redirect to /hq/signin on THIS page, so this may still come
+    // back clean here even when the loss is real — that's still useful,
+    // narrowing it to "sometime after this page, before the next choose-app."
+    function checkLoggedOut(stage) {
+      if (location.pathname.includes('/hq/signin')) return { ok: false, reason: 'logged-out', detectedAfter: stage };
+      return null;
+    }
+    let lo = checkLoggedOut('arrived-at-docs-page (before touching Reset token/Generate)');
+    await checkServerSessionAlive('arrived-at-docs-page');
+    if (lo) return { ...lo, sessionChecks };
+
+    // 2026-09-09: switched from a hard chrome.tabs.update reload to clicking
+    // through HQ's own "Back to HQ"/"Change Org" nav (v3.17.20) — Marc's own
+    // side-by-side test confirmed that in-app nav path works by hand, but a
+    // live run with it still lost the session on the 2nd org, so the nav
+    // method wasn't actually the cause. The one thing that manual test never
+    // did — that this automation always has — is Reset token + Generate a
+    // new access token. That's still the leading suspect; it just doesn't
+    // show up as an immediate redirect on THIS page (the calc-detail/order
+    // API calls that follow use the Authorization: Bearer header, not the
+    // browser's session cookie, so they'd keep working even if that click
+    // already killed the cookie-based login underneath). Rather than force
+    // Reset+Generate every time, check whether the docs page's own auto-token
+    // (shown in the top bar before either button is ever touched — see
+    // README's "auto-token" note) is already correctly scoped to this domain,
+    // and only fall back to clicking Reset/Generate if it isn't. If this
+    // resolves the bug, that confirms Reset/Generate itself was the trigger;
+    // if it doesn't, the checkpoints below will still say so.
+    function readCurrentToken() {
+      const el = document.getElementById('collapsed-token-value');
+      const full = el && el.getAttribute('data-full-token');
+      if (!full || full === 'No token') return null;
+      try {
+        const decoded = JSON.parse(atob(full));
+        return { full, decoded };
+      } catch (e) { return null; }
+    }
+    const existing = readCurrentToken();
+    const existingIsValidForThisDomain = existing && existing.decoded && existing.decoded.referrerOrigin === domain;
+
+    if (!existingIsValidForThisDomain) {
+      const resetBtn = findButtonByText('Reset token');
+      if (resetBtn) { resetBtn.click(); await new Promise(r => setTimeout(r, 500)); }
+      lo = checkLoggedOut('after-Reset-token-click');
+      await checkServerSessionAlive('after-Reset-token-click');
+      if (lo) return { ...lo, sessionChecks };
+
+      const createBtn = findButtonByText('Generate a new access token') || findButtonByText('Create a new access token');
+      if (createBtn) { createBtn.click(); await new Promise(r => setTimeout(r, 1800)); }
+      lo = checkLoggedOut('after-Generate-a-new-access-token-click');
+      await checkServerSessionAlive('after-Generate-a-new-access-token-click');
+      if (lo) return { ...lo, sessionChecks };
+    }
 
     const codeEl = document.getElementById('collapsed-token-value');
     let full = codeEl && codeEl.getAttribute('data-full-token');
@@ -3011,11 +4170,68 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
         full = el2 && el2.getAttribute('data-full-token');
       }
     }
-    if (!full || full === 'No token') return { ok: false, reason: 'no-token' };
+    if (!full || full === 'No token') return { ok: false, reason: 'no-token', sessionChecks };
 
     let decoded;
-    try { decoded = JSON.parse(atob(full)); } catch (e) { return { ok: false, reason: 'decode-failed: ' + e.message }; }
-    if (decoded.referrerOrigin !== domain) return { ok: false, reason: `wrong-scope (token was for ${decoded.referrerOrigin})` };
+    try { decoded = JSON.parse(atob(full)); } catch (e) { return { ok: false, reason: 'decode-failed: ' + e.message, sessionChecks }; }
+    if (decoded.referrerOrigin !== domain) return { ok: false, reason: `wrong-scope (token was for ${decoded.referrerOrigin})`, sessionChecks };
+
+    return { ok: true, token: full, decoded, sessionChecks };
+  })();
+}
+
+
+// 2026-09-09 (v3.17.28): extracted verbatim from hqStageScan, which used to
+// run this ENTIRE section — every order/calc-detail fetch and all the
+// tax-rate classification below — inside the injected page-context
+// function, meaning the tab sat on the API docs subsite for as long as the
+// whole scan took (potentially many orders' worth of fetches). Marc's own
+// successful manual "Back to HQ"/"Change Org" test only ever dwelled on the
+// docs page for a few seconds before switching org; the automation's latest
+// live run proved (via real server-checked fetches, not just guesses)
+// mmschainportal.com's session was still ALIVE through Reset token, Generate
+// a new access token, AND right up through this section finishing — yet the
+// very next real navigation still landed broken, even navigating fresh and
+// directly rather than through "Back to HQ." That's consistent with dwell
+// time on the docs subsite itself being what matters, not any one click —
+// so this section no longer runs on the docs page at all, testing that
+// directly. None of this code ever touched the DOM (confirmed by grepping
+// the original for document./location./window. — nothing matched outside
+// the token-minting part that stayed behind) — it only ever needed the
+// bearer token — so it now runs here, in the side panel, calling the same
+// Excise Tax Order API by absolute URL. The ONLY change from the original
+// text below: its three fetch() calls were relative, resolving against the
+// docs page's own origin when injected there; now explicit
+// https://app.tokenoftrust.com URLs, since there's no page origin to
+// resolve against from the side panel. Everything else — every rate table,
+// every classification, every comment — is unchanged from hqStageScan.
+async function hqScanOrdersWithToken(token, domain, idStart, idEnd, sinceHoursAgo, taxOpsRules) {
+  // Side-panel counterpart of hqMintToken's checkServerSessionAlive — same
+  // idea (a real server round-trip via fetch('/hq/home', {credentials:
+  // 'include'}), bounded with an AbortController so a stall can never hang
+  // this), but called from here (an absolute cross-origin URL, no page to
+  // inject into) rather than from inside the tab. This is the one checkpoint
+  // that moved with the scan itself: hqMintToken still separately checks
+  // arrived-at-docs-page/after-Reset-token-click/after-Generate-a-new-
+  // access-token-click on its own (those all happen before this function
+  // ever runs); scanOneOrg combines both sets into one sessionChecks list
+  // for reporting.
+  async function checkServerSessionAliveFromPanel(stage) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      const res = await fetch('https://app.tokenoftrust.com/hq/home', { credentials: 'include', cache: 'no-store', redirect: 'follow', signal: controller.signal });
+      let bodyText = '';
+      try { bodyText = await res.text(); } catch (e) {}
+      const finalUrl = res.url || '';
+      const loggedOut = finalUrl.includes('/hq/signin') || /passwordless login/i.test(bodyText) || /no organization\./i.test(bodyText);
+      return { stage, ok: !loggedOut, status: res.status, finalUrl };
+    } catch (e) {
+      return { stage, ok: true, error: (e && e.name === 'AbortError') ? 'timed out after 5s' : e.message };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 
     // Learned tax-rate directory (2026-08-20): whenever calc-detail happens to
     // be populated for an order, it shows the actual per-unit tax charged
@@ -3135,6 +4351,7 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
     // possiblyMissedTaxLines below) — whether calc-detail's per-product
     // entries carry the same field the way they carry retailPrice hasn't
     // been directly confirmed, same open question as wholesaleCost above.
+    //
     const FLAT_RATE_PER_ML = {
       'US.regionCode.VA::vape': 0.11, // confirmed via order 2447866
       'US.regionCode.OH::vape': 0.10, // confirmed via order 2447910
@@ -3145,6 +4362,26 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
       'US.regionCode.NC::vape': 0.05,
       'US.regionCode.WV::vape': 0.075,
       'US.regionCode.WI::vape': 0.05
+    };
+
+    // Fixed 2026-09-03, corrected same day: alternativepods.com order 304939
+    // (Stevens Point, WI) got flagged "undercharged" on all 28 vape lines
+    // against WI::vape's $0.05/mL above. HQ's own live "How was this tax
+    // calculated" page for that order says "Vape: Wisconsin is exempt from
+    // excise taxes on vapes" — but Marc confirmed that reference is scoped
+    // to alternativepods.com specifically (an org-level override), not a
+    // change to Wisconsin's general rate. An earlier version of this fix
+    // removed WI::vape from the table above entirely, which would have
+    // wrongly suppressed a real mismatch on any OTHER org's WI vape order —
+    // reverted that; the table above keeps the $0.05/mL default. This map is
+    // the correct, narrowly-scoped fix: per-org exceptions to the tables
+    // above, checked before any of them, so one client's confirmed override
+    // doesn't get applied to every org this tool scans. Add a domain here
+    // only once you have the same kind of direct, live confirmation this
+    // entry has — not from a sheet, and not inferred from one order alone
+    // without checking HQ's own rule reference for that client.
+    const PER_ORG_RATE_EXCEPTIONS = {
+      'alternativepods.com': new Set(['US.regionCode.WI::vape']) // confirmed via order 304939 + HQ's own per-client rule reference, 2026-09-03
     };
 
     // One-time cleanup: purge any previously-learned rate for a key that
@@ -3159,16 +4396,146 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
     }
 
     async function scanOneOrder(id, token) {
-      const orderRes = await fetch(`/api/exciseTax/order/${id}`, { headers: { Accept: 'application/json', Authorization: 'Bearer ' + token } });
+      const orderRes = await fetch(`https://app.tokenoftrust.com/api/exciseTax/order/${id}`, { headers: { Accept: 'application/json', Authorization: 'Bearer ' + token } });
       if (orderRes.status !== 200) return null;
       const orderBody = await orderRes.json();
-      const calcRes = await fetch(`/api/exciseTax/orders/${id}/calc-detail`, { headers: { Accept: 'application/json', Authorization: 'Bearer ' + token } });
+      const calcRes = await fetch(`https://app.tokenoftrust.com/api/exciseTax/orders/${id}/calc-detail`, { headers: { Accept: 'application/json', Authorization: 'Bearer ' + token } });
       const calcBody = calcRes.status === 200 ? await calcRes.json() : null;
       const order = orderBody?.content?.order;
       const events = calcBody?.content?.events || [];
       const calcEvent = events.find(e => e.eventType === 'calculation') || events[0] || {};
       const cd = calcEvent.calcDetail || {};
       const taxSum = (cd.products || []).reduce((s, p) => s + ((p.appliedRules || []).reduce((s2, r) => s2 + (r.taxForQty || 0), 0)), 0);
+
+      // Taxlines CSV rows (2026-08-27): built for the "Export Taxlines CSV"
+      // feature — reconstructs a per-SKU report in the same shape as the
+      // manually-run "Taxlines Full"/"Taxlines Filtered" S3 export, but
+      // sourced from this API instead of the order-sync method that came up
+      // empty for vapesocietysupplies.com (see README). No extra fetches:
+      // this reuses the same `order` and `cd` objects already pulled above
+      // for the mismatch/overcharge checks.
+      //
+      // Three sources joined by SKU, per the Excise Tax Order API's own
+      // schema docs (confirmed live 2026-08-27, not guessed):
+      //   - order.transactionLines[]  — quantity + submitted price (the only
+      //     source with quantity at all; calc-detail's per-product entries
+      //     deliberately have none — confirmed from the CalcDetailProduct
+      //     schema doc, which says to get it from here or derive it from
+      //     taxForQty/unitTax).
+      //   - cd.products[]             — the calc-time snapshot + the actual
+      //     appliedRules/taxForQty this line was assessed. Absent for a line
+      //     that wasn't found by the calculation (see skippedProducts) or
+      //     when the whole event is a partial/skeleton record.
+      //   - order.products{sku:...}   — current catalog snapshot, used only
+      //     as a fallback when calc-detail's own copy of a metadata field is
+      //     missing (calc-detail's copy reflects what the calculation saw at
+      //     calc time, which is preferred when present).
+      //
+      // Known, deliberate gaps vs. the original file — not bugs, just what
+      // this API does not expose: customer.fullName and the street portion
+      // of shippingAddress are both left blank because the API's
+      // shippingLocation schema explicitly excludes givenName/familyName/
+      // line1/line2 as PII (confirmed from the API docs' own PII note).
+      // county is left blank because SafeShippingLocation has no county
+      // field at all. numErrors/error1-3 are left blank — nothing in this
+      // API corresponds to them and nothing in a real sample pull ever had
+      // them populated either. totalPrice is *computed* (quantity ×
+      // unit price), not a value the API hands back directly, since
+      // TransactionLineSummary has no line-total field of its own.
+      const skeletonEvent = cd.partial === true || cd.source === 'skeleton';
+      const calcProductsBySku = {};
+      (cd.products || []).forEach(p => { if (p.sku) calcProductsBySku[p.sku] = p; });
+      const skippedBySku = {};
+      (cd.skippedProducts || []).forEach(p => { if (p.sku) skippedBySku[p.sku] = p; });
+      const catalogBySku = order?.products || {};
+
+      const taxlineRows = (order?.transactionLines || []).map(line => {
+        const sku = line.sku;
+        const calcP = sku ? calcProductsBySku[sku] : null;
+        const catalogP = sku ? catalogBySku[sku] : null;
+        const meta = calcP || catalogP || {};
+        const qty = parseFloat(line.quantity) || 0;
+        const unitPrice = parseFloat(line.unitDiscountedPrice ?? line.unitSalesPrice) || 0;
+        const tags = meta.tags || [];
+        const hasTag = t => tags.includes(t);
+        const appliedRules = (calcP && calcP.appliedRules) || [];
+        const lineTax = appliedRules.reduce((s, r) => s + (r.taxForQty || 0), 0);
+
+        // Status reflects what this pull actually observed, not a guess —
+        // deliberately more specific than the order-sync export's
+        // "not_fulfilled:pending", which turned out to mean "the sync method
+        // never learned fulfillment state" rather than anything about tax.
+        let taxCollectionStatus;
+        if (skeletonEvent || !events.length) taxCollectionStatus = 'no_calculation_data';
+        else if (!calcP) taxCollectionStatus = skippedBySku[sku] ? ('skipped:' + (skippedBySku[sku].reason || 'unknown')) : 'not_in_calc_detail';
+        else if (appliedRules.length === 0) taxCollectionStatus = meta.isExempt ? 'exempt' : 'no_rules_for_jurisdiction';
+        else taxCollectionStatus = 'calculated';
+
+        return {
+          order: id,
+          date: order?.timestamp || '',
+          sku: sku || '',
+          productName: meta.productName || '',
+          productBrand: meta.productBrand || '',
+          productId: line.productId || meta.productId || '',
+          quantity: line.quantity ?? '',
+          totalPrice: qty && unitPrice ? Math.round(qty * unitPrice * 100) / 100 : '',
+          volumeInMl: meta.volumeInMl ?? '',
+          wholesaleCost: meta.wholesaleCost ?? '',
+          wholesalePrice: meta.wholesalePrice ?? '',
+          retailPrice: meta.retailPrice ?? '',
+          msrp: meta.msrp ?? '',
+          productTags: tags.join(','),
+          totalTax: calcP ? Math.round(lineTax * 100) / 100 : '',
+          country: order?.shippingLocation?.countryCode || '',
+          state: order?.shippingLocation?.regionCode || '',
+          city: order?.shippingLocation?.locality || '',
+          postalCode: order?.shippingLocation?.postalCode || '',
+          isVape: hasTag('isVape') ? '1' : '0',
+          isExempt: (meta.isExempt || hasTag('isExempt')) ? '1' : '0',
+          hasNicotine: hasTag('hasNicotine') ? '1' : '0',
+          isOpen: hasTag('isOpen') ? '1' : '0',
+          isClosed: hasTag('isClosed') ? '1' : '0',
+          closedRefillable: hasTag('closedRefillable') ? '1' : '0',
+          closedCartridge: hasTag('closedCartridge') ? '1' : '0',
+          closedSingleUse: hasTag('closedSingleUse') ? '1' : '0',
+          batteryOnly: hasTag('batteryOnly') ? '1' : '0',
+          taxCollectionStatus
+        };
+      });
+
+      // Order-level rollups (closedVolumeMl, openVolumeMl, totalSalesOf...,
+      // wholesalePriceOf...) — computed here as a second pass over this
+      // order's own taxlineRows, grouped by the isOpen/isClosed/
+      // closedSingleUse flags already derived above. Definitions are this
+      // tool's own reconstruction (sum of totalPrice / volumeInMl×quantity /
+      // wholesaleCost×quantity per system-type bucket) — not independently
+      // confirmed to match whatever formula originally produced these
+      // columns in the S3 taxlines export, so treat these five as a
+      // documented approximation, not a verified match.
+      let closedVolumeMl = 0, openVolumeMl = 0;
+      let totalSalesOfOpenSystems = 0, totalSalesOfClosedSystems = 0, totalSalesOfSingleUseSystems = 0;
+      let wholesalePriceOfOpenSystems = 0, wholesalePriceOfClosedSystems = 0, wholesaleValueOfSingleUseSystems = 0;
+      taxlineRows.forEach(r => {
+        const qty = parseFloat(r.quantity) || 0;
+        const vol = (parseFloat(r.volumeInMl) || 0) * qty;
+        const wsVal = (parseFloat(r.wholesaleCost) || 0) * qty;
+        const price = parseFloat(r.totalPrice) || 0;
+        if (r.isOpen === '1') { openVolumeMl += vol; totalSalesOfOpenSystems += price; wholesalePriceOfOpenSystems += wsVal; }
+        if (r.isClosed === '1' && r.closedSingleUse !== '1') { closedVolumeMl += vol; totalSalesOfClosedSystems += price; wholesalePriceOfClosedSystems += wsVal; }
+        if (r.closedSingleUse === '1') { totalSalesOfSingleUseSystems += price; wholesaleValueOfSingleUseSystems += wsVal; }
+      });
+      const round2 = n => Math.round(n * 100) / 100;
+      taxlineRows.forEach(r => {
+        r.closedVolumeMl = round2(closedVolumeMl) || '';
+        r.openVolumeMl = round2(openVolumeMl) || '';
+        r.totalSalesOfOpenSystems = round2(totalSalesOfOpenSystems) || '';
+        r.totalSalesOfClosedSystems = round2(totalSalesOfClosedSystems) || '';
+        r.totalSalesOfSingleUseSystems = round2(totalSalesOfSingleUseSystems) || '';
+        r.wholesalePriceOfOpenSystems = round2(wholesalePriceOfOpenSystems) || '';
+        r.wholesalePriceOfClosedSystems = round2(wholesalePriceOfClosedSystems) || '';
+        r.wholesaleValueOfSingleUseSystems = round2(wholesaleValueOfSingleUseSystems) || '';
+      });
 
       // Learn effective tax rates from calc-detail whenever it's populated
       // (regardless of whether this particular order is overcharged) — key
@@ -3249,6 +4616,7 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
         (p.appliedRules || []).forEach(rule => {
           if (!rule.ruleId || !rule.ruleSet || rule.unitTax == null) return;
           const fKey = rule.ruleId + '::' + rule.ruleSet;
+          if (PER_ORG_RATE_EXCEPTIONS[domain] && PER_ORG_RATE_EXCEPTIONS[domain].has(fKey)) return; // confirmed org-specific override — see PER_ORG_RATE_EXCEPTIONS above
           const fRate = FLAT_RATE_PER_ML[fKey];
           if (fRate == null) return;
           const expectedUnitTax = Math.round(p.volumeInMl * fRate * 100) / 100;
@@ -3266,6 +4634,62 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
           });
         });
       });
+
+      // Tax Ops Hq effective-rules cross-check (proposed, 2026-09-01) — see
+      // the TAXOPS_* constants and fetchTaxOpsEffectiveRules near HQ_ORIGIN
+      // for the full writeup and caveats. taxOpsRules is fetched once per
+      // org in the outer (side panel) scope, before this injected function
+      // runs, and passed in as a plain object — same reason the actual
+      // excise-tax API calls above stay same-origin relative fetches rather
+      // than reaching out cross-origin from inside this injected context.
+      //
+      // Deliberately does NOT recompute "the correct tax" from taxOpsRules'
+      // rate+basis (unconfirmed whether basis maps to retailPrice vs.
+      // wholesaleCost vs. volume the same way this tool's own tables
+      // assume — see the caveat where taxOpsRules is fetched). Only checks
+      // two things per rule actually applied to this order:
+      //   1. Does Tax Ops Hq say this state+type has a per-ORG OVERRIDE
+      //      active? This tool has no visibility into overrides at all
+      //      otherwise (the WA/kangerwholesaleusa.com blind spot from the
+      //      README changelog) — always worth surfacing regardless of rate.
+      //   2. Does Tax Ops Hq's rate NUMBER for this state+type disagree with
+      //      whatever this tool's own hand-maintained tables assume (or
+      //      "assumes nothing" if the state isn't on any of them)? A
+      //      disagreement here is a strong signal this tool's transcribed
+      //      tables are stale or wrong for this state — exactly the class of
+      //      bug that produced the MN/OH/PA issues in the README changelog.
+      const taxOpsCrossCheck = [];
+      if (taxOpsRules && taxOpsRules.ok) {
+        (cd.products || []).forEach(p => {
+          (p.appliedRules || []).forEach(rule => {
+            if (!rule.ruleId || !rule.ruleSet) return;
+            const key = rule.ruleId + '::' + rule.ruleSet;
+            const live = taxOpsRules.states[key];
+            if (!live) return; // Tax Ops Hq had nothing for this exact key — not evidence of anything either way
+            const assumedRate = AUTHORITATIVE_RATES[key] ?? WHOLESALE_COST_BASED[key] ?? FLAT_RATE_PER_ML[key] ?? null;
+            const assumedTable = AUTHORITATIVE_RATES[key] != null ? 'RETAIL_PRICE_BASED'
+              : WHOLESALE_COST_BASED[key] != null ? 'WHOLESALE_COST_BASED'
+              : FLAT_RATE_PER_ML[key] != null ? 'FLAT_RATE_PER_ML' : null;
+            const hasOverride = live.source === 'override';
+            const rateDisagrees = assumedRate != null && live.rate != null && Math.abs(assumedRate - live.rate) > 0.001;
+            const uncoveredButRated = assumedTable == null && live.rate != null && live.rate > 0 && live.source !== 'excluded';
+            if (!hasOverride && !rateDisagrees && !uncoveredButRated) return;
+            taxOpsCrossCheck.push({
+              sku: p.sku || null,
+              productName: p.productName || null,
+              ruleKey: key,
+              assumedTable,
+              assumedRate,
+              liveRate: live.rate,
+              liveBasis: live.basis,
+              liveSource: live.source,
+              hasOverride,
+              rateDisagrees,
+              uncoveredButRated
+            });
+          });
+        });
+      }
 
       // Overcharge detection (2026-08-20): the order endpoint embeds a per-SKU
       // "products" catalog snapshot (retailPrice/wholesalePrice/msrp) right
@@ -3392,14 +4816,81 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
         };
       }).filter(Boolean);
 
+      // Fixed 2026-08-24, found via a real incident: kangerwholesaleusa.com order 771030 got
+      // Slack-alerted as "incorrect excise tax collected," but this scan's own most recent run
+      // had bucketed it as "collected" (clean) rather than "incorrect." HQ's own "How was this
+      // tax calculated" tool showed why: $0.01 was actually collected on the order against a
+      // recalculated-current tax of $242.40 — a real, large under-collection. The old check below
+      // only ever fired on `exciseTaxCollected === '0'`, a strict string-equality test against the
+      // literal zero — "0.01" fails that comparison entirely, so this exact order (and presumably
+      // any other order that collected some trivial nonzero amount instead of genuinely nothing)
+      // was invisible to this check regardless of how wrong the amount was. HQ's own backend had
+      // separately logged this internally as `diagnosticHistory` metric "error.incorrectCollection"
+      // a full day before the Slack alert — this scan's bucketing just never caught up to that.
+      //
+      // Fixed again, same day, found via a second real incident: vaperanger.com order 567098495
+      // (IL) had HQ's own diagnosticHistory logging that exact same "error.incorrectCollection"
+      // metric — but this time for OVER-collection ($183.86 collected vs $91.93 recalculated).
+      // This scan still bucketed it as clean, because the fix above was deliberately written
+      // one-directional (`(taxSum - collectedNum) > 0.02`, under-collection only) on the reasoning
+      // that over-collection was already covered by the stale-catalog-price overcharge check.
+      // That reasoning doesn't hold: the overcharge check is gated to a narrow allowlist
+      // (RETAIL_PRICE_BASED — NY::vape, WA::vape, WA::nicotinePouch) and Illinois isn't on it, so
+      // this order was invisible to both checks at once. Since HQ's own diagnosticHistory metric
+      // name doesn't distinguish direction either (fires for both), there's no reason this scan's
+      // primary correctness check should. Fix: compare the absolute difference against the same
+      // 2-cent tolerance, so both directions land in `mismatch` — and carry `mismatchDirection`
+      // alongside it so anyone triaging the results table can see which way it went without doing
+      // the subtraction themselves.
+      const collectedNum = parseFloat(order?.exciseTaxCollected ?? '0') || 0;
+      const collectionDiff = taxSum - collectedNum;
+      const ruleKeys = Object.keys(cd.rules || {});
+      // 2026-08-26: found via a real false positive, vapesocietysupplies.com
+      // #2448091 — flagged here as "over-collected $22, should've collected
+      // $0," but HQ's own "How was this tax calculated" tool (both Historical
+      // and Current) showed $22 collected against $22 recalculated: no
+      // mismatch at all. Root cause: calc-detail came back completely empty
+      // for this order (cd.rules: {}, cd.products: []) even though a real VA
+      // flat-per-mL rule genuinely applied and $22 was the correct, correctly
+      // collected amount. ruleKeys.length === 0 already means exactly this
+      // ("calc-detail found no rule") and is already treated as "not
+      // required" in the notRequired/incorrect/collected breakdown below —
+      // but the mismatch flag above wasn't applying that same guard, so an
+      // order calc-detail says nothing about was being compared against a
+      // recalculated total of 0 and flagged as a full-amount overcharge.
+      // An empty calc-detail response isn't evidence the correct tax is $0 —
+      // it's evidence calc-detail didn't return anything for this order
+      // (same class of gap as the already-documented "empty 200 instead of a
+      // 404" API bug, whatever its cause here specifically). Only compute a
+      // mismatch when calc-detail actually returned at least one rule.
+      const hasRuleData = ruleKeys.length > 0;
+      // 2026-09-02: found via vapesocietysupplies.com #2448826 (OH) — this
+      // scan's own notRequired/collected/incorrect breakdown bucketed it as
+      // "not required" (ruleKeys.length === 0, same signal `hasRuleData`
+      // above already treats as "calc-detail returned nothing," not as
+      // proof nothing was owed) even though $20.00 was actually collected —
+      // confirmed both by this extension's own Order Investigation tool
+      // (live recalculation: $20.00) and HQ's "How was this tax calculated"
+      // tool (Collected $20.00, Recalculated (current) $20.00, both
+      // matching exactly). Order Investigation's own dossier for this same
+      // order flagged it `needs_review`/"0 rules fired for the resolved
+      // jurisdiction" rather than trusting the empty rule list either — this
+      // scan's notRequired bucket should apply the same skepticism instead
+      // of silently reading "no rules" as "nothing was owed." This is the
+      // same underlying gap as the 2026-08-26 fix just above (empty
+      // calc-detail isn't evidence the correct tax is $0) — that fix only
+      // guarded the mismatch/overcharge computation, not this bucket.
+      const unverifiedCollected = !hasRuleData && collectedNum > 0.005;
       return {
         id,
         exciseTaxCollected: order?.exciseTaxCollected,
         shippingRegion: order?.shippingLocation?.regionCode,
         transactionType: cd.transactionType,
-        ruleKeys: Object.keys(cd.rules || {}),
+        ruleKeys,
         recalculatedTaxSum: Math.round(taxSum * 100) / 100,
-        mismatch: (order?.exciseTaxCollected === '0' && taxSum > 0),
+        mismatch: hasRuleData && Math.abs(collectionDiff) > 0.02,
+        mismatchDirection: !hasRuleData ? null : (collectionDiff > 0.02 ? 'under' : (collectionDiff < -0.02 ? 'over' : null)),
+        unverifiedCollected,
         overchargeLineCount: overchargeLines.length,
         overchargeLines,
         possiblyMissedTaxLineCount: possiblyMissedTaxLines.length,
@@ -3407,11 +4898,13 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
         wholesaleCostMismatchCount: wholesaleCostMismatches.length,
         wholesaleCostMismatches,
         flatRateMismatchCount: flatRateMismatches.length,
-        flatRateMismatches
+        flatRateMismatches,
+        taxOpsCrossCheckCount: taxOpsCrossCheck.length,
+        taxOpsCrossCheck,
+        taxlineRows
       };
     }
 
-    const token = full;
     let results = [];
     let notFound = 0;
     let lastIdChecked = null;
@@ -3442,7 +4935,7 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
     } else if (sinceHoursAgo != null) {
       const until = new Date().toISOString();
       const since = new Date(Date.now() - sinceHoursAgo * 3600 * 1000).toISOString();
-      const listRes = await fetch(`/api/exciseTax/orders?since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}&limit=1000`, {
+      const listRes = await fetch(`https://app.tokenoftrust.com/api/exciseTax/orders?since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}&limit=1000`, {
         headers: { Accept: 'application/json', Authorization: 'Bearer ' + token }
       });
       if (listRes.status !== 200) return { ok: false, reason: `list-orders failed (status ${listRes.status})` };
@@ -3462,14 +4955,33 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
     // Derived status breakdown (see README changelog "2026-08-19, tag breakdown"):
     // no literal API field for this exists (confirmed via CalcDetailEvent.status
     // inspection), so these three are inferred from data already pulled per order.
-    // notRequired: no excise tax rule applied to this order at all.
-    // incorrect: a rule applied AND the known under-collection pattern was hit.
-    // collected: a rule applied and that specific pattern was NOT hit (does not
+    // notRequired: no excise tax rule applied to this order at all, AND
+    // nothing was actually collected on it either — the only combination
+    // that's real evidence "not required" is correct. (Fixed 2026-09-02: an
+    // empty ruleKeys list used to be read as "not required" on its own —
+    // see the unverifiedCollected comment above for the false-positive case
+    // that caught, vapesocietysupplies.com #2448826.)
+    // incorrect: a rule applied AND collected vs recalculated differ by more than
+    // 2 cents, in EITHER direction (fixed 2026-08-24 to catch over-collection too —
+    // see the comment above collectionDiff/mismatchDirection).
+    // collected: a rule applied and that mismatch check was NOT hit (does not
     // guarantee the exact amount collected was correct — only that this one
-    // failure mode wasn't detected).
-    const notRequired = results.filter(r => (r.ruleKeys || []).length === 0).length;
+    // failure mode wasn't detected; state-specific rate checks below cover some,
+    // not all, states more precisely).
+    // unverifiedCollected (added 2026-09-02): calc-detail returned no rules
+    // (same "hasRuleData" gap as everywhere else in this file) BUT a nonzero
+    // amount was actually collected on the order. This is neither a clean
+    // "collected" (this scan has no rule data to check the amount against)
+    // nor a real "not required" (money was, in fact, collected) — it's a
+    // separate "can't verify from calc-detail, go check manually" bucket,
+    // same posture Order Investigation's own needs_review verdict already
+    // takes on exactly this pattern. Always check via HQ's "How was this tax
+    // calculated" tool or the Order Investigation tab before treating one of
+    // these as either a miss or a false alarm.
+    const notRequired = results.filter(r => (r.ruleKeys || []).length === 0 && !r.unverifiedCollected).length;
     const incorrect = results.filter(r => (r.ruleKeys || []).length > 0 && r.mismatch).length;
     const collected = results.filter(r => (r.ruleKeys || []).length > 0 && !r.mismatch).length;
+    const unverifiedCollectedResults = results.filter(r => r.unverifiedCollected);
 
     // Orders with at least one line where TOT's saved catalog price is above
     // what was actually charged — see overchargeLines above for how this is
@@ -3502,15 +5014,27 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
     // the rest are transcribed and unverified.
     const flatRateFlagged = results.filter(r => r.flatRateMismatchCount > 0);
 
+    // Orders with at least one Tax Ops Hq cross-check hit (per-org override
+    // detected, or a rate disagreement/coverage gap vs. this tool's own
+    // tables) — see the taxOpsCrossCheck pass above and its caveats. Empty
+    // whenever taxOpsRules wasn't available (not signed into Tax Ops Hq, or
+    // the fetch failed) — taxOpsStatus below carries that reason so the
+    // results panel can distinguish "checked, found nothing" from "couldn't
+    // check at all."
+    const taxOpsFlagged = results.filter(r => r.taxOpsCrossCheckCount > 0);
+
     // Persist the (possibly updated) rate directory once, at the end of this
     // call, rather than per-order — keeps storage writes cheap while still
     // letting later orders/orgs in the same run (and future runs) benefit
     // from whatever got learned here.
     await chrome.storage.local.set({ totHqRateDirectory: rateDirectory });
+    const scanCompleteCheck = await checkServerSessionAliveFromPanel('scan-complete');
 
     return {
-      ok: true, checked: results.length, notFound, mismatchCount: mismatches.length, mismatches, allResults: results,
+      ok: true, sessionChecks: [scanCompleteCheck], checked: results.length, notFound, mismatchCount: mismatches.length, mismatches, allResults: results,
       lastIdChecked, highestFoundId, notRequired, collected, incorrect,
+      unverifiedCollectedCount: unverifiedCollectedResults.length,
+      unverifiedCollected: unverifiedCollectedResults.map(r => ({ id: r.id, shippingRegion: r.shippingRegion, exciseTaxCollected: r.exciseTaxCollected })),
       overchargedCount: overcharged.length,
       overcharged: overcharged.map(r => ({ id: r.id, shippingRegion: r.shippingRegion, overchargeLines: r.overchargeLines })),
       estimatedOverchargeTotal, overchargeLinesWithEstimate, overchargeLinesTotal,
@@ -3519,13 +5043,13 @@ function hqStageScan(domain, idStart, idEnd, sinceHoursAgo) {
       wholesaleCostFlaggedCount: wholesaleCostFlagged.length,
       wholesaleCostFlagged: wholesaleCostFlagged.map(r => ({ id: r.id, shippingRegion: r.shippingRegion, wholesaleCostMismatches: r.wholesaleCostMismatches })),
       flatRateFlaggedCount: flatRateFlagged.length,
-      flatRateFlagged: flatRateFlagged.map(r => ({ id: r.id, shippingRegion: r.shippingRegion, flatRateMismatches: r.flatRateMismatches }))
+      flatRateFlagged: flatRateFlagged.map(r => ({ id: r.id, shippingRegion: r.shippingRegion, flatRateMismatches: r.flatRateMismatches })),
+      taxOpsStatus: taxOpsRules ? (taxOpsRules.ok ? 'ok' : taxOpsRules.reason) : 'not-fetched',
+      taxOpsFlaggedCount: taxOpsFlagged.length,
+      taxOpsFlagged: taxOpsFlagged.map(r => ({ id: r.id, shippingRegion: r.shippingRegion, taxOpsCrossCheck: r.taxOpsCrossCheck })),
+      taxlineRows: results.flatMap(r => r.taxlineRows || [])
     };
-  })();
 }
-
-// ---- orchestration, running in the side panel's own context ----
-
 function waitForTabLoad(tabId, matchUrlSubstr) {
   return new Promise((resolve) => {
     function listener(id, info, tab) {
@@ -3580,11 +5104,36 @@ async function pollUntilUrlChangesAway(tabId, fromUrlSubstr, timeoutMs) {
 async function settleOrgSwitch(tabId) {
   let url = await pollUntilUrlChangesAway(tabId, '/hq/choose-app', 6000);
   if (url && url.includes('/hq/configuration-check')) {
+    // 2026-08-26: confirmed live that the URL flips to /hq/configuration-check
+    // via client-side routing BEFORE the page's Vue app has actually rendered
+    // the "Continue" button — measured a ~1-1.5s gap between the URL changing
+    // and the button mounting (vapesocietysupplies.com, reproduced against a
+    // real HQ session). The original single-shot query-and-click here fired
+    // right as pollUntilUrlChangesAway first detected the URL change, i.e.
+    // squarely inside that gap — `if (btn) btn.click();` found no button and
+    // silently did nothing. Nothing here ever errors in that case: the outer
+    // poll below just times out waiting for a URL change that was never
+    // going to happen, settleOrgSwitch returns null, and scanOneOrg carries
+    // on to navigate to the docs page anyway — landing on it with the org
+    // switch never actually confirmed server-side. That leaves the docs
+    // page's Vue app unable to establish a valid token-minting context,
+    // which is what actually produces the 'no-token' result reported for
+    // this org, not a wrong-org token as the original comment above assumed.
+    // Fixed the same way waitForTokenUiReady (in hqStageScan) handles an
+    // analogous render-timing gap: poll for the button to exist instead of
+    // assuming it already does.
     await chrome.scripting.executeScript({
       target: { tabId },
       func: () => {
-        const btn = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === 'Continue');
-        if (btn) btn.click();
+        return (async () => {
+          const start = Date.now();
+          while (Date.now() - start < 6000) {
+            const btn = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === 'Continue');
+            if (btn) { btn.click(); return true; }
+            await new Promise(r => setTimeout(r, 300));
+          }
+          return false;
+        })();
       }
     });
     url = await pollUntilUrlChangesAway(tabId, '/hq/configuration-check', 6000);
@@ -3600,10 +5149,10 @@ async function settleOrgSwitch(tabId) {
 // result object (either {ok:true, ...} or {ok:false, reason}) or a
 // {ok:false, reason:'logged-out'|'not-found', ...} if it couldn't even get
 // the org selected.
-async function scanOneOrg(tabId, current) {
+async function exportTaxlinesForDateRange(tabId, domain, sinceIso, untilIso) {
   await navigateHqTab(tabId, HQ_ORIGIN + '/hq/choose-app', '/hq/choose-app');
 
-  const [selectInjection] = await chrome.scripting.executeScript({ target: { tabId }, func: hqStageSelectOrg, args: [current.domain] });
+  const [selectInjection] = await chrome.scripting.executeScript({ target: { tabId }, func: hqStageSelectOrg, args: [domain] });
   const sel = selectInjection.result;
   if (!sel.ok) return sel;
 
@@ -3611,100 +5160,568 @@ async function scanOneOrg(tabId, current) {
 
   await navigateHqTab(tabId, HQ_ORIGIN + '/hq/api-docs/excise-tax-order#/operations/createAccessToken', '/hq/api-docs/excise-tax-order');
 
-  const [scanInjection] = await chrome.scripting.executeScript({
-    target: { tabId }, func: hqStageScan,
-    args: [current.domain, current.idStart ?? null, current.idEnd ?? null, current.sinceHoursAgo ?? null]
+  const [exportInjection] = await chrome.scripting.executeScript({
+    target: { tabId }, func: hqStageTaxlinesExport,
+    args: [domain, sinceIso, untilIso]
   });
-  return scanInjection.result;
+  return exportInjection.result;
+}
+
+// 2026-09-09: Marc ran a direct side-by-side test. Clicking through HQ's own
+// in-app nav by hand — "Back to HQ" off the API docs subsite, then "Change
+// Org" from the main app shell, then picking mmschainportal.com — switched
+// orgs perfectly: full MMSDISTRO branding, no "NO ORGANIZATION.", no lost
+// session. The scan queue automation, hitting the exact same destination
+// (mmschainportal.com's dashboard) via a hard chrome.tabs.update reload
+// straight to /hq/choose-app, reliably lost the session on that same second
+// org instead. That's the one mechanical difference between a path that's
+// confirmed to work and one that's confirmed to fail — a real page load vs.
+// an in-app client-side route change — so this clicks through the same links
+// a person would instead of reloading the URL directly. Falls back to the
+// old hard-navigation approach when neither link is found, which is exactly
+// what happens on a brand-new tab for the very first org in the queue —
+// ensureHqTab already lands a fresh tab on /hq/choose-app with no org shell
+// rendered yet, so there's no "Back to HQ"/"Change Org" to click there and
+// behavior for that first org is unchanged.
+// 2026-09-09 (later same day): v3.17.20/21 both still lost the session on
+// the 2nd org, even with Reset/Generate skipped and a real reload avoided at
+// the choose-app step specifically. One click here has never actually been
+// checked for what it really does: "Back to HQ" leaves the API docs subsite,
+// which is a visibly separate mini-app (its own dark theme, its own nav, no
+// shared sidebar with the rest of HQ) — Marc's successful manual test never
+// went near it at all, so it's never been confirmed whether that link is a
+// same-document client-side route or a real page load back into the main
+// app. performance.timeOrigin is fixed for the life of one document and
+// only changes when the browser actually loads a new one — reading it right
+// before a click and right after tells us, per click, whether that specific
+// step was a real navigation, without needing a marker to survive anything.
+// 2026-09-09 (v3.17.27): the single long-running injected function this used
+// to be (hqClickBackToHqThenChangeOrg) read performance.timeOrigin, clicked,
+// then AWAITED A 1200ms SLEEP before reading it again — all inside one
+// continuous chrome.scripting.executeScript call. Marc's next live run threw
+// "Frame with ID 0 was removed" — Chrome's own signal that the "Back to HQ"
+// click (confirmed a real page navigation twice now, Video 5 and this) tore
+// down the document the injected script was still running in, mid-sleep,
+// before it ever got to the second read. That killed the whole
+// chrome.scripting.executeScript call outright (an uncaught rejection in
+// scanOneOrg, previously reported as a generic "Lost the HQ tab" and
+// stopping the run entirely) instead of reporting a result. Split into two
+// tiny, separate injected functions — a probe (read-only) and a click — so
+// the risky waiting period happens in scanOneOrg itself (the extension's own
+// persistent context, immune to a page's frame being torn down) rather than
+// inside a single injected function whose own continuation can get killed by
+// the very navigation it's trying to observe.
+function hqReadNavProbe() {
+  return { timeOrigin: performance.timeOrigin, pathname: location.pathname, bodyText: (document.body.innerText || '').slice(0, 2000) };
+}
+function hqClickNavItemIfPresent(txt) {
+  const el = Array.from(document.querySelectorAll('a, button, div, span')).find(e => e.textContent.trim() === txt && e.offsetParent !== null);
+  if (el) { el.click(); return { found: true }; }
+  return { found: false };
+}
+
+// Matches the handful of chrome.scripting error shapes seen so far for "the
+// frame this call targeted stopped existing partway through" — the expected
+// consequence of a click that turns out to be a real navigation, not a sign
+// of anything actually wrong. Anything else re-throws, same as before.
+const FRAME_TORN_DOWN_RE = /frame.*(removed|no longer exists)|no (tab|frame) with id/i;
+
+async function clickNavLinkAndProbe(tabId, label) {
+  let before = null;
+  try {
+    const [r] = await chrome.scripting.executeScript({ target: { tabId }, func: hqReadNavProbe });
+    before = r && r.result;
+  } catch (e) { /* tab already in a weird state — before stays null, handled below */ }
+
+  let found = false;
+  let frameTornDown = false;
+  try {
+    const [r2] = await chrome.scripting.executeScript({ target: { tabId }, func: hqClickNavItemIfPresent, args: [label] });
+    found = !!(r2 && r2.result && r2.result.found);
+  } catch (e) {
+    if (FRAME_TORN_DOWN_RE.test((e && e.message) || '')) { found = true; frameTornDown = true; }
+    else throw e;
+  }
+  if (!found) return { found: false, navigated: null, landedBroken: false };
+
+  // The wait lives here, not inside a page script — this survives the frame
+  // teardown a real navigation causes, which is exactly what broke the old
+  // single-function version.
+  await new Promise(r => setTimeout(r, 1200));
+
+  let after = null;
+  try {
+    const [r3] = await chrome.scripting.executeScript({ target: { tabId }, func: hqReadNavProbe });
+    after = r3 && r3.result;
+  } catch (e) {
+    if (FRAME_TORN_DOWN_RE.test((e && e.message) || '')) return { found: true, navigated: true, landedBroken: false, probeFailed: true };
+    throw e;
+  }
+
+  const navigated = frameTornDown || !before || !after || before.timeOrigin !== after.timeOrigin;
+  const landedBroken = !!(after && (after.pathname.includes('/hq/signin') || /no organization\./i.test(after.bodyText || '')));
+  return { found: true, navigated, landedBroken };
+}
+
+async function scanOneOrg(tabId, current) {
+  const backResult = await clickNavLinkAndProbe(tabId, 'Back to HQ');
+  const changeOrgResult = await clickNavLinkAndProbe(tabId, 'Change Org');
+  const navDiag = {
+    usedUiNav: backResult.found || changeOrgResult.found,
+    navigatedAfterBackToHq: backResult.found ? backResult.navigated : null,
+    navigatedAfterChangeOrg: changeOrgResult.found ? changeOrgResult.navigated : null,
+    changeOrgFound: changeOrgResult.found,
+    landedBroken: backResult.landedBroken || changeOrgResult.landedBroken,
+  };
+  // Same reasoning as v3.17.23: only skip the explicit /hq/choose-app
+  // navigation when "Change Org" was actually there to click AND neither
+  // click's landing looked broken; otherwise fall back to navigating to
+  // /hq/choose-app directly, same as a brand-new tab gets on the very first
+  // org.
+  const canSkipExplicitNav = navDiag.changeOrgFound && !navDiag.landedBroken;
+  if (!canSkipExplicitNav) {
+    await navigateHqTab(tabId, HQ_ORIGIN + '/hq/choose-app', '/hq/choose-app');
+  } else {
+    // Give the client-side route change a beat to actually land on
+    // /hq/choose-app before hqStageSelectOrg goes looking for the search box —
+    // this isn't a real page load, so waitForTabLoad's onUpdated listener
+    // (built for the hard-navigation path above) wouldn't fire for it anyway.
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  const [selectInjection] = await chrome.scripting.executeScript({ target: { tabId }, func: hqStageSelectOrg, args: [current.domain] });
+  const sel = selectInjection.result;
+  if (!sel.ok) return { ...sel, navDiag };
+
+  await settleOrgSwitch(tabId);
+
+  await navigateHqTab(tabId, HQ_ORIGIN + '/hq/api-docs/excise-tax-order#/operations/createAccessToken', '/hq/api-docs/excise-tax-order');
+
+  // 2026-09-09 (v3.17.28): this used to inject hqStageScan here — mint AND
+  // scan every order, all inside one call running on the docs page — so the
+  // tab sat on that subsite for as long as the whole scan took. Marc's live
+  // runs have now proven (via real server-checked fetches at each step, not
+  // guesses) that a full org's session survives Reset token, Generate a new
+  // access token, and scanning itself — arrived-at-docs-page through
+  // scan-complete all reported alive — yet the very next navigation, even a
+  // fresh direct one straight to /hq/choose-app (bypassing "Back to HQ"
+  // entirely), still landed broken. That's consistent with dwell time on the
+  // docs subsite itself being what matters, not any one click or action on
+  // it. So: mint ONLY here (fast — a few seconds), then leave the docs page
+  // immediately, and do the actual order-by-order scan afterward via direct
+  // fetch from the side panel (see hqScanOrdersWithToken) using the token
+  // just minted — instead of staying on the docs page for however long that
+  // scan takes.
+  const [mintInjection] = await chrome.scripting.executeScript({ target: { tabId }, func: hqMintToken, args: [current.domain] });
+  const mint = mintInjection.result;
+  if (!mint.ok) return { ...mint, navDiag };
+
+  // Leave the docs subsite right away, before the scan below — this is the
+  // actual test of the dwell-time theory: if it's right, staying off the
+  // docs page during a long scan should stop breaking the next org's switch.
+  await navigateHqTab(tabId, HQ_ORIGIN + '/hq/choose-app', '/hq/choose-app');
+
+  // Fetched here (side panel context) since taxes.tokenoftrust.com is a
+  // different origin than app.tokenoftrust.com. Cached per domain by
+  // fetchTaxOpsEffectiveRules, so this is one extra request per org per
+  // panel session, not per order. A failure here (not signed in, network
+  // error) is non-fatal — hqScanOrdersWithToken treats a null/not-ok
+  // taxOpsRules as "cross-check unavailable" and the scan proceeds exactly
+  // as it did before this was added.
+  const taxOpsRules = await fetchTaxOpsEffectiveRules(current.domain);
+
+  const scanResult = await hqScanOrdersWithToken(mint.token, current.domain, current.idStart ?? null, current.idEnd ?? null, current.sinceHoursAgo ?? null, taxOpsRules);
+  // Combine both halves' diagnostic checkpoints into one list — hqMintToken's
+  // own (arrived-at-docs-page / after-Reset-token-click /
+  // after-Generate-a-new-access-token-click) plus hqScanOrdersWithToken's
+  // (scan-complete, now checked from the side panel instead of in-page) — so
+  // formatSessionChecks still shows the full trail for this org in one place.
+  const combinedSessionChecks = (mint.sessionChecks || []).concat(scanResult.sessionChecks || []);
+  return { ...scanResult, sessionChecks: combinedSessionChecks, navDiag };
+}
+
+// Auto-verification for the unverifiedCollected bucket (added 2026-09-02, at
+// Marc's request after #2448826: "is there something we can do to confirm
+// and verify it so that it won't be unverifiable?"). The Excise Tax Order
+// API's calc-detail endpoint returned nothing for these orders — that's WHY
+// they're in this bucket — but this extension already wraps a second,
+// independent recalculation source with its own auth and its own live
+// recalculation path: the Order Investigation API (see that section below).
+// That's literally the tool that resolved #2448826 by hand (verdict
+// needs_review, recalculatedNow $20.00 matching collected exactly) — so
+// running it automatically for every order that lands here closes the loop
+// without a manual trip to the Order Investigation tab for each one.
+//
+// Deliberately fails open and per-order, not per-run: if Order Investigation
+// credentials were never saved (a separate ops.tokenoftrust.com API key —
+// see that section's own banner for why it's a different credential from
+// everything else in this extension), every entry just gets
+// investigation:{ok:false, reason:'no-creds'} and the scan run itself is
+// completely unaffected — same posture as the Tax Ops Hq cross-check when
+// nobody's signed into taxes.tokenoftrust.com. A single order's investigation
+// failing (network error, this order also 403s, whatever) doesn't stop the
+// rest from being checked.
+//
+// Sequential, not parallel — this bucket is expected to be rare (a handful
+// of orders across an entire org's history so far), so there's no meaningful
+// throughput reason to parallelize, and it avoids hammering an endpoint
+// this extension has already found to be more access-guarded than the rest
+// (diagnostic:investigate vs. diagnostic:read — see the section banner).
+//
+// 2026-09-09: also reused as-is (name kept for minimal diff, but nothing
+// here is specific to the unverifiedCollected bucket — it only ever reads
+// entry.id) for the mismatch cross-check in runHqScan, to clear
+// calc-detail-only false positives like kangerwholesaleusa.com #773121
+// (customer-level isExemptCustomer exemption) — see that call site's own
+// comment for the full writeup.
+async function investigateUnverifiedCollected(targetAppDomain, entries) {
+  if (!entries || !entries.length) return entries || [];
+  const creds = await invLoadCreds();
+  if (!creds || !creds.apiKey || !creds.secretKey || !creds.appDomain) {
+    return entries.map(e => ({ ...e, investigation: { ok: false, reason: 'no-creds' } }));
+  }
+  const out = [];
+  for (const entry of entries) {
+    try {
+      const token = await invGetToken(false);
+      const content = await invFetchInvestigation(token, entry.id, { includeProductHistory: false, targetAppDomain });
+      const v = content.verdict || {};
+      const recalc = (content.values || {}).recalculatedNow;
+      out.push({
+        ...entry,
+        investigation: {
+          ok: true,
+          verdictCode: v.code || null,
+          confidence: v.confidence || null,
+          recalculatedNow: recalc && recalc.state === 'present' ? recalc.amount : null,
+          recalculatedNowState: recalc ? recalc.state : 'absent'
+        }
+      });
+    } catch (e) {
+      out.push({ ...entry, investigation: { ok: false, reason: e.message || String(e) } });
+    }
+  }
+  return out;
+}
+
+// 2026-09-09: renders scanOneOrg's navDiag (set by hqClickBackToHqThenChangeOrg)
+// into one readable phrase so it shows up next to whatever else the status
+// line/Results panel already says about this org, whether it succeeded,
+// failed logged-out, or failed some other way. "not clicked" means that link
+// wasn't on the page at all when this org's turn came up (e.g. the very
+// first org in a fresh tab, which never visits the docs subsite this
+// diagnostic cares about).
+function formatNavDiag(navDiag) {
+  if (!navDiag) return '(nav diagnostic not captured)';
+  const describe = (v) => v === null ? 'not clicked' : (v ? 'REAL page load' : 'client-side only');
+  const brokenNote = navDiag.landedBroken ? ' (landed broken — fell back to explicit /hq/choose-app nav)' : '';
+  return `nav check — "Back to HQ": ${describe(navDiag.navigatedAfterBackToHq)}${brokenNote}; "Change Org": ${describe(navDiag.navigatedAfterChangeOrg)}.`;
+}
+
+// 2026-09-09 (v3.17.23): renders hqStageScan's sessionChecks — the real,
+// server-verified (not just location.pathname) alive/dead check taken at
+// each checkpoint inside that one org's docs-page visit (arriving, after
+// Reset token, after Generate a new access token, and once more at the very
+// end of the scan). Where this first flips from "alive" to "DEAD" pins down
+// which specific step killed the session server-side, for THIS org — as
+// opposed to formatNavDiag, which only covers the *next* org's Back to
+// HQ/Change Org clicks.
+function formatSessionChecks(sessionChecks) {
+  if (!sessionChecks || !sessionChecks.length) return '(server session checks not captured)';
+  return 'server session checks — ' + sessionChecks.map(c => `${c.stage}: ${c.ok ? 'alive' : 'DEAD'}${c.error ? ' (check failed: ' + c.error + ')' : ''}`).join('; ') + '.';
 }
 
 async function runHqScan() {
   if (HQ_RUN_STATE === 'running') return;
   HQ_RUN_STATE = 'running';
+  HQ_TAXLINE_ROWS = [];
+  setHqRunButtonBusy(true);
   renderHqProgress();
 
-  let tabId;
+  // Wrapped in try/finally rather than repeating setHqRunButtonBusy(false) at
+  // every one of the several early-return points below (lost tab, logged out,
+  // no tab available) — easy to miss one of those by hand, and a missed spot
+  // would leave the button stuck showing "Running…" after a run has actually
+  // stopped, which is exactly the confusing state this button exists to avoid.
   try {
-    tabId = await ensureHqTab();
-  } catch (e) {
-    setHqStatus('Could not open an HQ tab: ' + e.message, 'err');
-    HQ_RUN_STATE = 'idle';
-    return;
-  }
-
-  while (HQ_QUEUE.length && HQ_RUN_STATE === 'running') {
-    const current = HQ_QUEUE[0];
-    if (!current.domain || (current.idStart == null && current.sinceHoursAgo == null)) {
-      setHqStatus(`Skipping incomplete row (needs a domain and either an ID range or hours-ago).`, 'err');
-      HQ_QUEUE.shift(); await saveHqQueue(); renderHqProgress();
-      continue;
-    }
-
-    setHqStatus(`Switching to ${current.domain}...`);
-
-    let scanResult;
-    let loggedOut = false;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        scanResult = await scanOneOrg(tabId, current);
-      } catch (e) {
-        setHqStatus('Lost the HQ tab (closed?) — click Start / Resume to reopen it.', 'err');
-        HQ_TAB_ID = null; HQ_RUN_STATE = 'idle'; renderHqProgress();
-        return;
-      }
-
-      if (scanResult.ok) break;
-
-      if (scanResult.reason === 'logged-out') { loggedOut = true; break; }
-      if (scanResult.reason === 'not-found') break; // retrying won't fix a real "not in HQ" result
-
-      // Any other failure (including a wrong-scope token) gets one full retry
-      // of the ENTIRE select-org sequence, not just re-minting on the same
-      // page — a wrong-scope token usually means the org switch itself didn't
-      // fully commit yet, which re-minting alone can't fix.
-      if (attempt === 0) setHqStatus(`${current.domain}: ${scanResult.reason} — retrying the full org-switch once...`, 'err');
-    }
-
-    if (loggedOut) {
-      HQ_RUN_STATE = 'paused-login';
-      setHqStatus(`Not signed into HQ. Sign in on the scan tab, then click "Start / Resume" again — ${current.domain} is still first in the queue.`, 'err');
-      renderHqProgress();
+    let tabId;
+    try {
+      tabId = await ensureHqTab();
+    } catch (e) {
+      setHqStatus('Could not open an HQ tab: ' + e.message, 'err');
+      HQ_RUN_STATE = 'idle';
       return;
     }
-    if (!scanResult.ok && scanResult.reason === 'not-found') {
-      setHqStatus(`"${current.domain}" wasn't found in the org list — skipping it. (dropdown said: ${(scanResult.opts || []).join(', ') || 'nothing'})`, 'err');
-      HQ_RESULTS.push({ domain: current.domain, error: 'domain not found in HQ org search' });
+
+    while (HQ_QUEUE.length && HQ_RUN_STATE === 'running') {
+      const current = HQ_QUEUE[0];
+      if (!current.domain || (current.idStart == null && current.sinceHoursAgo == null)) {
+        setHqStatus(`Skipping incomplete row (needs a domain and either an ID range or hours-ago).`, 'err');
+        HQ_QUEUE.shift(); await saveHqQueue(); renderHqProgress();
+        continue;
+      }
+
+      setHqStatus(`<span class="spinner">⟳</span> Switching to ${escapeAttr(current.domain)}...`, null, true);
+
+      let scanResult;
+      let loggedOut = false;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          scanResult = await scanOneOrg(tabId, current);
+        } catch (e) {
+          // 2026-09-09 (v3.17.26): this branch fired for the first time in
+          // this whole investigation (Marc's screenshot) — previously every
+          // failure came back as a normal {ok:false} result from inside the
+          // injected scripts, this is scanOneOrg's own chrome.scripting call
+          // throwing instead (plausible cause: the tab navigates away — e.g.
+          // "Back to HQ" firing a real page load — WHILE an injected script
+          // is still mid-await, tearing down the execution context out from
+          // under it). The old message threw away e.message entirely, so
+          // there was no way to tell a genuinely closed tab apart from a
+          // script-injection error mid-navigation. Also now recorded in
+          // HQ_RESULTS (previously this branch returned without ever writing
+          // one), so it survives to the next screenshot instead of vanishing
+          // once Marc resumes past it.
+          const errMsg = (e && e.message) || String(e);
+          setHqStatus(`Lost the HQ tab (or a script injection failed mid-switch) — click Start / Resume to reopen it. (${escapeAttr(errMsg)})`, 'err');
+          HQ_RESULTS.push({ domain: current.domain, error: `tab/script error mid-switch — ${errMsg}` });
+          await saveHqResults();
+          HQ_TAB_ID = null; HQ_RUN_STATE = 'idle'; renderHqProgress(); renderHqResults();
+          return;
+        }
+
+        if (scanResult.ok) break;
+
+        if (scanResult.reason === 'logged-out') { loggedOut = true; break; }
+        if (scanResult.reason === 'not-found') break; // retrying won't fix a real "not in HQ" result
+
+        // Any other failure (including a wrong-scope token) gets one full retry
+        // of the ENTIRE select-org sequence, not just re-minting on the same
+        // page — a wrong-scope token usually means the org switch itself didn't
+        // fully commit yet, which re-minting alone can't fix.
+        if (attempt === 0) setHqStatus(`<span class="spinner">⟳</span> ${escapeAttr(current.domain)}: ${escapeAttr(scanResult.reason)} — retrying the full org-switch once...`, 'err', true);
+      }
+
+      if (loggedOut) {
+        HQ_RUN_STATE = 'paused-login';
+        const where = scanResult && scanResult.detectedAfter ? ` Lost session right after: ${scanResult.detectedAfter}.` : '';
+        const navInfo = formatNavDiag(scanResult && scanResult.navDiag);
+        const sessionInfo = formatSessionChecks(scanResult && scanResult.sessionChecks);
+        setHqStatus(`Not signed into HQ.${where} ${navInfo} ${sessionInfo} Sign in on the scan tab, then click "Start / Resume" again — ${current.domain} is still first in the queue.`, 'err');
+        HQ_RESULTS.push({ domain: current.domain, error: `logged out — ${scanResult && scanResult.detectedAfter ? scanResult.detectedAfter : 'point not captured'} — ${navInfo} — ${sessionInfo}` });
+        await saveHqResults();
+        renderHqProgress();
+        renderHqResults();
+        return;
+      }
+      if (!scanResult.ok && scanResult.reason === 'not-found') {
+        const navInfo = formatNavDiag(scanResult.navDiag);
+        setHqStatus(`"${current.domain}" wasn't found in the org list — skipping it. (dropdown said: ${(scanResult.opts || []).join(', ') || 'nothing'}) ${navInfo}`, 'err');
+        HQ_RESULTS.push({ domain: current.domain, error: `domain not found in HQ org search — ${navInfo}` });
+        await saveHqResults();
+        HQ_QUEUE.shift(); await saveHqQueue(); renderHqProgress(); renderHqResults();
+        continue;
+      }
+
+      if (scanResult.ok) {
+        if (scanResult.unverifiedCollectedCount > 0) {
+          setHqStatus(`<span class="spinner">⟳</span> ${escapeAttr(current.domain)}: checking ${scanResult.unverifiedCollectedCount} unverifiable order(s) via Order Investigation...`, null, true);
+          scanResult.unverifiedCollected = await investigateUnverifiedCollected(current.domain, scanResult.unverifiedCollected);
+        }
+        // 2026-09-09: false positive reported by Marc — kangerwholesaleusa.com
+        // order 773121 (CO, wholesale-cost basis) was tagged
+        // tot-excise-tax-incorrect / "Under-collected" ($0 collected vs
+        // $1458.18 recalculated) purely from this scan's own calc-detail read,
+        // but this extension's own Order Investigation tool independently
+        // verdicts the SAME order "healthy" — its dossier shows every line item
+        // skipped from the calculation with reason "isExemptCustomer" (a
+        // customer-level exemption that calc-detail's own products/rules
+        // response never surfaces anywhere this scan reads, unlike the
+        // product-level skippedProducts/isExempt cases already handled
+        // elsewhere in this file). $0 collected is therefore the CORRECT
+        // amount here, not a miss. Nothing observed in calc-detail itself
+        // distinguishes "customer is exempt" from a real under-collection, so
+        // rather than guess at a calc-detail-only heuristic, this reuses the
+        // exact same cross-check this scan already trusts for the
+        // unverifiedCollected bucket above: auto-run Order Investigation on
+        // every flagged mismatch and let its live, independently-recalculated
+        // "healthy" verdict override a mismatch that calc-detail's static
+        // snapshot alone got wrong. Same fail-open posture as
+        // investigateUnverifiedCollected: no Order Investigation credentials
+        // saved, or a per-order investigation failure, leaves that order
+        // flagged exactly as before — nothing is suppressed without a real
+        // independent verdict saying so.
+        if (scanResult.mismatchCount > 0) {
+          setHqStatus(`<span class="spinner">⟳</span> ${escapeAttr(current.domain)}: cross-checking ${scanResult.mismatchCount} mismatch(es) via Order Investigation...`, null, true);
+          const investigatedMismatches = await investigateUnverifiedCollected(current.domain, scanResult.mismatches);
+          const clearedByInvestigation = investigatedMismatches.filter(m => m.investigation && m.investigation.ok && m.investigation.verdictCode === 'healthy');
+          const stillMismatched = investigatedMismatches.filter(m => !(m.investigation && m.investigation.ok && m.investigation.verdictCode === 'healthy'));
+          scanResult.investigationClearedMismatchesCount = clearedByInvestigation.length;
+          scanResult.investigationClearedMismatches = clearedByInvestigation;
+          scanResult.mismatches = stillMismatched;
+          scanResult.mismatchCount = stillMismatched.length;
+          // A mismatch cleared by Order Investigation is real tax-collection
+          // behavior this scan now agrees is correct — move it from
+          // "incorrect" to "collected" rather than letting it just vanish from
+          // the notRequired/collected/incorrect breakdown's total.
+          if (clearedByInvestigation.length) {
+            scanResult.incorrect = Math.max(0, (scanResult.incorrect || 0) - clearedByInvestigation.length);
+            scanResult.collected = (scanResult.collected || 0) + clearedByInvestigation.length;
+          }
+        }
+        // 2026-09-09 (v3.17.26): navDiag/sessionChecks were only ever shown in
+        // the transient status line (below) — gone the moment the next org's
+        // status overwrote it, so a multi-org run's Results panel (what
+        // actually gets screenshotted afterward) never carried this org's own
+        // diagnostic trail. That's exactly the gap that left "server session
+        // checks not captured" on giantvapes.com's error entry: its failure
+        // happened in hqStageSelectOrg (before hqStageScan/sessionChecks ever
+        // ran), so the only place that data COULD have shown up — whether the
+        // PRECEDING org (mmschainportal.com) was already dead by its own
+        // scan-complete checkpoint — was a status line nobody could screenshot
+        // in time. Persisting both here so every org's diagnostic trail
+        // survives in the Results panel, success or failure alike.
+        HQ_RESULTS.push({ domain: current.domain, checked: scanResult.checked, notFound: scanResult.notFound, mismatchCount: scanResult.mismatchCount, mismatches: scanResult.mismatches, investigationClearedMismatchesCount: scanResult.investigationClearedMismatchesCount || 0, investigationClearedMismatches: scanResult.investigationClearedMismatches || [], highestFoundId: scanResult.highestFoundId, openEnded: current.idStart != null && current.idEnd == null, notRequired: scanResult.notRequired, collected: scanResult.collected, incorrect: scanResult.incorrect, unverifiedCollectedCount: scanResult.unverifiedCollectedCount, unverifiedCollected: scanResult.unverifiedCollected, overchargedCount: scanResult.overchargedCount, overcharged: scanResult.overcharged, estimatedOverchargeTotal: scanResult.estimatedOverchargeTotal, overchargeLinesWithEstimate: scanResult.overchargeLinesWithEstimate, overchargeLinesTotal: scanResult.overchargeLinesTotal, possiblyMissedTaxCount: scanResult.possiblyMissedTaxCount, possiblyMissedTax: scanResult.possiblyMissedTax, wholesaleCostFlaggedCount: scanResult.wholesaleCostFlaggedCount, wholesaleCostFlagged: scanResult.wholesaleCostFlagged, flatRateFlaggedCount: scanResult.flatRateFlaggedCount, flatRateFlagged: scanResult.flatRateFlagged, taxOpsStatus: scanResult.taxOpsStatus, taxOpsFlaggedCount: scanResult.taxOpsFlaggedCount, taxOpsFlagged: scanResult.taxOpsFlagged, navDiag: scanResult.navDiag, sessionChecks: scanResult.sessionChecks });
+        // Taxline rows are kept in memory only (HQ_TAXLINE_ROWS), NOT folded into
+        // HQ_RESULTS/saveHqResults — HQ_RESULTS is written to chrome.storage.local
+        // after every single org in the queue, and this extension only has the
+        // plain "storage" permission (no unlimitedStorage, ~5-10MB quota). A scan
+        // of vapesocietysupplies.com's August alone is ~1,700 orders' worth of
+        // per-SKU rows; embedding that in a value re-saved after every queue item
+        // risked slow saves at best and a silently-failing quota error at worst.
+        // Keeping it out of storage means it doesn't survive a popup close before
+        // export, same tradeoff as the rest of a run's in-progress state.
+        HQ_TAXLINE_ROWS = HQ_TAXLINE_ROWS.concat(scanResult.taxlineRows || []);
+        setHqStatus(`${current.domain}: checked ${scanResult.checked}, ${scanResult.mismatchCount} mismatch(es).`, scanResult.mismatchCount > 0 ? 'err' : 'ok');
+      } else {
+        const navInfo = formatNavDiag(scanResult.navDiag);
+        const sessionInfo = formatSessionChecks(scanResult.sessionChecks);
+        HQ_RESULTS.push({ domain: current.domain, error: `${scanResult.reason} — ${navInfo} — ${sessionInfo}` });
+        setHqStatus(`${current.domain} failed after retry: ${scanResult.reason} — skipping. ${navInfo} ${sessionInfo}`, 'err');
+      }
       await saveHqResults();
-      HQ_QUEUE.shift(); await saveHqQueue(); renderHqProgress(); renderHqResults();
-      continue;
+      HQ_QUEUE.shift();
+      await saveHqQueue();
+      renderHqProgress();
+      renderHqResults();
     }
 
-    if (scanResult.ok) {
-      HQ_RESULTS.push({ domain: current.domain, checked: scanResult.checked, notFound: scanResult.notFound, mismatchCount: scanResult.mismatchCount, mismatches: scanResult.mismatches, highestFoundId: scanResult.highestFoundId, openEnded: current.idStart != null && current.idEnd == null, notRequired: scanResult.notRequired, collected: scanResult.collected, incorrect: scanResult.incorrect, overchargedCount: scanResult.overchargedCount, overcharged: scanResult.overcharged, estimatedOverchargeTotal: scanResult.estimatedOverchargeTotal, overchargeLinesWithEstimate: scanResult.overchargeLinesWithEstimate, overchargeLinesTotal: scanResult.overchargeLinesTotal, possiblyMissedTaxCount: scanResult.possiblyMissedTaxCount, possiblyMissedTax: scanResult.possiblyMissedTax, wholesaleCostFlaggedCount: scanResult.wholesaleCostFlaggedCount, wholesaleCostFlagged: scanResult.wholesaleCostFlagged, flatRateFlaggedCount: scanResult.flatRateFlaggedCount, flatRateFlagged: scanResult.flatRateFlagged });
-      setHqStatus(`${current.domain}: checked ${scanResult.checked}, ${scanResult.mismatchCount} mismatch(es).`, scanResult.mismatchCount > 0 ? 'err' : 'ok');
-    } else {
-      HQ_RESULTS.push({ domain: current.domain, error: scanResult.reason });
-      setHqStatus(`${current.domain} failed after retry: ${scanResult.reason} — skipping.`, 'err');
+    if (HQ_RUN_STATE === 'running') {
+      HQ_RUN_STATE = 'idle';
+      const flaggedCount = HQ_RESULTS.filter(r => r.mismatchCount > 0).length;
+      setHqStatus(`Scan complete. ${flaggedCount} org(s) flagged out of ${HQ_RESULTS.length} scanned.`, 'ok');
     }
-    await saveHqResults();
-    HQ_QUEUE.shift();
-    await saveHqQueue();
     renderHqProgress();
-    renderHqResults();
+  } finally {
+    setHqRunButtonBusy(false);
   }
-
-  if (HQ_RUN_STATE === 'running') {
-    HQ_RUN_STATE = 'idle';
-    const flaggedCount = HQ_RESULTS.filter(r => r.mismatchCount > 0).length;
-    setHqStatus(`Scan complete. ${flaggedCount} org(s) flagged out of ${HQ_RESULTS.length} scanned.`, 'ok');
-  }
-  renderHqProgress();
 }
 
 document.getElementById('hqStartBtn').addEventListener('click', () => { runHqScan(); });
 document.getElementById('hqStopBtn').addEventListener('click', () => {
-  if (HQ_RUN_STATE === 'running') { HQ_RUN_STATE = 'stopped'; setHqStatus('Stopping after the current org finishes...', 'ok'); }
+  if (HQ_RUN_STATE === 'running') { HQ_RUN_STATE = 'stopped'; setHqStatus('<span class="spinner">⟳</span> Stopping after the current org finishes...', 'ok', true); }
 });
+
+// Export Taxlines CSV (2026-08-27) — same 44-column header as the manually-run
+// "Taxlines Full"/"Taxlines Filtered" S3 export, rebuilt from HQ_TAXLINE_ROWS
+// (populated by the scan just run — see the taxlineRows comment in
+// scanOneOrder for exactly which columns are real vs. left blank vs.
+// computed). Two files, matching Haroon's original pair: Full is every line
+// this run saw; Filtered narrows to lines with a real, non-zero assessed tax
+// (taxCollectionStatus 'calculated' and totalTax > 0) — i.e. Haroon's own
+// definition, "all taxable product with the tax collected on them" — rather
+// than the order-sync method's fulfillment-based filter, which is what came
+// up empty in the first place.
+const TAXLINES_CSV_HEADERS = [
+  'order','date','customer.fullName','shippingAddress','country','state','city','county','postalCode',
+  'sku','productName','productBrand','productId','quantity','DO NOT USE','totalPrice','volumeInMl',
+  'wholesaleCost','wholesalePrice','retailPrice','msrp','productTags','totalTax','numErrors','error1',
+  'error2','error3','closedVolumeMl','openVolumeMl','totalSalesOfOpenSystems','totalSalesOfClosedSystems',
+  'totalSalesOfSingleUseSystems','wholesalePriceOfOpenSystems','wholesalePriceOfClosedSystems',
+  'wholesaleValueOfSingleUseSystems','isVape','isExempt','hasNicotine','isOpen','isClosed',
+  'closedRefillable','closedCartridge','closedSingleUse','batteryOnly','taxCollectionStatus'
+];
+
+// Only reachable from the date-range export flow below now — the Run panel's
+// own "Export Taxlines CSV" button was removed (2026-08-27) since the
+// date-range fetch is the only supported way to pull this report going
+// forward, and always reports through this panel's own status line.
+function hqExportTaxlinesCsvs() {
+  if (!HQ_TAXLINE_ROWS.length) {
+    setHqTaxlinesStatus('No taxline rows to export yet — run the date-range fetch above first.', 'err');
+    return;
+  }
+  // Stamp filenames with the actual order-date range these rows cover, not
+  // today's export date — the first version used today's date, which made a
+  // downloaded file's actual coverage impossible to tell without opening it.
+  const dates = HQ_TAXLINE_ROWS.map(r => (r.date || '').slice(0, 10)).filter(Boolean).sort();
+  const rangeStamp = dates.length ? `${dates[0]}_to_${dates[dates.length - 1]}` : new Date().toISOString().slice(0, 10);
+
+  const fullCsv = pbToCsv(TAXLINES_CSV_HEADERS, HQ_TAXLINE_ROWS);
+  pbDownloadCsv(`taxlines-full-${rangeStamp}.csv`, fullCsv);
+
+  const filteredRows = HQ_TAXLINE_ROWS.filter(r => r.taxCollectionStatus === 'calculated' && (parseFloat(r.totalTax) || 0) > 0);
+  const filteredCsv = pbToCsv(TAXLINES_CSV_HEADERS, filteredRows);
+  pbDownloadCsv(`taxlines-filtered-${rangeStamp}.csv`, filteredCsv);
+
+  const statusCounts = {};
+  HQ_TAXLINE_ROWS.forEach(r => { statusCounts[r.taxCollectionStatus] = (statusCounts[r.taxCollectionStatus] || 0) + 1; });
+  const breakdown = Object.entries(statusCounts).map(([k, v]) => `${k}: ${v}`).join(', ');
+  setHqTaxlinesStatus(`Exported ${HQ_TAXLINE_ROWS.length} full / ${filteredRows.length} filtered taxline rows (${rangeStamp}). Status breakdown — ${breakdown}.`, 'ok');
+}
+
+function renderHqTaxlinesDomainSelect() {
+  const sel = document.getElementById('hqTaxlinesDomain');
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = '<option value="" disabled>Select a domain...</option>' + domainOptionsHtml(prev);
+}
+
+async function runTaxlinesRangeExport() {
+  const domain = document.getElementById('hqTaxlinesDomain').value;
+  const sinceRaw = document.getElementById('hqTaxlinesSince').value; // yyyy-mm-dd from <input type="date">
+  const untilRaw = document.getElementById('hqTaxlinesUntil').value;
+  if (!domain) { setHqTaxlinesStatus('Pick a domain for the date-range export first.', 'err'); return; }
+  if (!sinceRaw) { setHqTaxlinesStatus('Pick a Since date for the date-range export.', 'err'); return; }
+  const sinceIso = new Date(sinceRaw + 'T00:00:00.000Z').toISOString();
+  const untilIso = untilRaw ? new Date(untilRaw + 'T23:59:59.999Z').toISOString() : new Date().toISOString();
+
+  // The date-bisection pagination and the per-order fetch loop both happen
+  // inside one injected function call (hqStageTaxlinesExport) that only
+  // returns at the very end — but that function pings progress back via
+  // chrome.runtime.sendMessage as it works (see reportProgress() there and
+  // the onMessage listener near setHqTaxlinesStatus above), so the percentage
+  // and ETA below update live rather than only appearing once it's all done.
+  // All status here goes through setHqTaxlinesStatus (this panel's own status
+  // line, not the Run panel's shared #hqStatus) so it shows up right under
+  // the button being watched.
+  const btn = document.getElementById('hqTaxlinesRangeBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner">⟳</span> Fetching…';
+  HQ_TAXLINES_FETCH_START_MS = null;
+  setHqTaxlinesProgressBar(null);
+  setHqTaxlinesStatus(`<span class="spinner">⟳</span> Fetching ${escapeAttr(domain)} orders ${sinceRaw} → ${untilRaw || 'now'}... (listing orders in range)`, null, true);
+  try {
+    const tabId = await ensureHqTab();
+    const result = await exportTaxlinesForDateRange(tabId, domain, sinceIso, untilIso);
+    if (!result || !result.ok) {
+      setHqTaxlinesStatus(`Date-range export failed: ${(result && result.reason) || 'unknown error'}`, 'err');
+      return;
+    }
+    // Replaces whatever taxline rows were last gathered (by either this path
+    // or a scan-queue run) — see the hint text next to this button.
+    HQ_TAXLINE_ROWS = result.taxlineRows || [];
+    setHqTaxlinesStatus(`<span class="spinner">⟳</span> Fetched ${result.orderCount} order(s) for ${escapeAttr(domain)} (${result.checked} checked, ${result.failed} failed) — building CSV...`, 'ok', true);
+    hqExportTaxlinesCsvs();
+  } catch (e) {
+    setHqTaxlinesStatus('Date-range export failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = 'Fetch &amp; Export CSV';
+    setHqTaxlinesProgressBar(null);
+  }
+}
+document.getElementById('hqTaxlinesRangeBtn').addEventListener('click', runTaxlinesRangeExport);
 
 async function initHq() {
   await loadHqDomains();
@@ -3712,7 +5729,1117 @@ async function initHq() {
   await loadHqResults();
   renderHqDomainsTable();
   renderHqQueueTable();
+  renderHqTaxlinesDomainSelect();
   renderHqProgress();
   renderHqResults();
 }
 initHq();
+
+// ---- Product Backfill (beta) ----
+// Built for zuluvape.com's 3-week-stale-metadata situation: HQ's excise-tax "missing data" list
+// (System B — encrypted accessToken blob, pasted fresh from DevTools each run, see the panel's
+// own intro copy for why this can't be automated the way the Product Sync API's Bearer token
+// flow is elsewhere) cross-referenced against the store's real BigCommerce catalog (via the same
+// internal-API pattern bcFetchProductBySku/bcResolveProductViaSearch/bcFetchProductById already
+// use elsewhere in this file). Exports a CSV in HQ's exact "Load Excise Tax Products" vape format
+// for manual review + manual upload — this tool never uploads anything itself. Per explicit
+// instruction, nothing here is ever guessed from a product title/tag: a field either comes from
+// real TOT/BigCommerce data or it's left blank with a plain-language note in a trailing NOTES
+// column (confirmed safe — HQ's own CSV-upload FAQ says trailing extra columns are ignored during
+// parsing). VAPE_SYSTEM_TYPE in particular will get a note on essentially every row: confirmed
+// live (2026-08-25) that TOT has no "vape system category map" configured at all for
+// zuluvape.com — that's a missing org-level backend config, not a per-product gap, so no amount
+// of BigCommerce cross-referencing can ever fill it in. Items whose name plainly suggests a
+// different HQ product type (e.g. "Zimo 6mg Nicotine Pouches" filed under Vape — a confirmed real
+// miscategorization, 16+ instances) are pulled into a separate re-type review list instead of
+// being "completed" under the wrong type.
+
+function setPbStatus(msg, type, isHtml){
+  const statusEl = document.getElementById('pbStatus');
+  if(isHtml) statusEl.innerHTML = msg; else statusEl.textContent = msg;
+  statusEl.className = 'status-line show' + (type ? ' '+type : '');
+}
+
+let PB_RESULTS = null; // {vapeRows, reviewRows} — set after a successful run, used by the download buttons
+
+const PB_VAPE_CSV_HEADERS = ['PRODUCT_ID','SKU','PRODUCT_NAME','PRODUCT_BRAND','VOLUME_ML','WHOLESALE_COST','WHOLESALE_PRICE','MSRP','RETAIL_PRICE','VAPE_SYSTEM_TYPE','HAS_NICOTINE','IS_EXEMPT','PACK_CONFIG','PACK_QUANTITY','TYPE','NICOTINE_ANALOGUE','NOTES'];
+const PB_REVIEW_CSV_HEADERS = ['SKU','PRODUCT_NAME','CURRENT_TOT_TYPE','SUGGESTED_TYPE','REASON'];
+
+// Name-pattern heuristic for catching items HQ has filed under "vape" that are plainly something
+// else by name — this only decides which review bucket an item goes in, it never fills in a CSV
+// field, so it doesn't need to be conservative the way field-derivation below does.
+// Confirmed live (2026-08-25) this org's TOT type field isn't fully reliable even on named,
+// already-complete records — found "Off-Stamp Tee Shirt XXXL" filed with type "vape". None of
+// today's actual missing-data vape items matched this pattern, but a future item could, so this
+// catches it the same way the pouch/hemp patterns above do — pulled into review, never silently
+// completed as a vape row.
+function pbGuessRetype(productName){
+  const n = (productName || '').toLowerCase();
+  if(/\bpouch(es)?\b/.test(n)) return 'nicotinePouch';
+  if(/\b(cbd|delta[\s-]?8|delta[\s-]?9|thc|hemp)\b/.test(n)) return 'hemp';
+  if(/\b(t-?shirt|hoodie|sweatshirt|hat|cap|beanie|jacket|lanyard|sticker|gift card|tote|bag|mug|keychain|pin|patch)\b/i.test(n)) return 'not a compliance product (merchandise)';
+  return null;
+}
+
+function pbCsvEscape(v){
+  const s = (v === null || v === undefined) ? '' : String(v);
+  if(/[",\n]/.test(s)) return '"' + s.replace(/"/g,'""') + '"';
+  return s;
+}
+
+function pbToCsv(headers, rows){
+  const lines = [headers.join(',')];
+  rows.forEach(r => lines.push(headers.map(h => pbCsvEscape(r[h])).join(',')));
+  return lines.join('\r\n');
+}
+
+function pbDownloadCsv(filename, csvString){
+  const blob = new Blob([csvString], {type: 'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(()=> URL.revokeObjectURL(url), 5000);
+}
+
+function pbParseMissingDataUrl(raw){
+  const trimmed = (raw || '').trim();
+  if(!trimmed) return null;
+  try{
+    const u = new URL(trimmed);
+    if(!/(^|\.)tokenoftrust\.com$/.test(u.hostname)) return null;
+    return u.toString();
+  }catch(e){
+    return null;
+  }
+}
+
+// Looks for a BigCommerce variant option whose name suggests it's the size/volume axis (e.g.
+// "Size", "Volume", "mL") and tries to pull a number of mL out of its label (e.g. "30ml",
+// "60 mL"). Confirmed via real data that many disposables have no such option at all — only a
+// flavor axis — in which case this returns null and VOLUME_ML is left blank with a note rather
+// than guessed from anything else.
+function pbExtractVolumeMl(variant){
+  const optionValues = (variant && variant.option_values) || [];
+  for(const ov of optionValues){
+    const optName = (ov.option_display_name || '').toLowerCase();
+    if(/size|volume|\bml\b|capacity/.test(optName)){
+      const m = (ov.label || '').match(/(\d+(?:\.\d+)?)\s*ml/i);
+      if(m) return parseFloat(m[1]);
+    }
+  }
+  return null;
+}
+
+// Fetches TOT's FULL excise-tax product catalog for this org, not just the missing-data slice the
+// pasted URL was copied from. Confirmed live (2026-08-25): the accessToken isn't scoped to a
+// specific quickView value — the same token that was minted for quickView=missingData also works
+// with quickView removed entirely (HQ's own "All" quick-view), which returns every record
+// including the ~3,000+ already-complete ones. That's needed for sibling-derivation below: there's
+// nothing to derive missing fields FROM if we only ever see the broken records.
+async function pbFetchCatalog(url){
+  const u = new URL(url);
+  u.searchParams.delete('quickView');
+  const res = await fetch(u.toString(), {credentials:'include'});
+  if(!res.ok) throw new Error('HTTP ' + res.status + ' — the pasted URL may have expired; grab a fresh one from DevTools.');
+  const data = await res.json();
+  const list = data && data.content && data.content.exciseTaxProducts;
+  if(!Array.isArray(list)) throw new Error('Unexpected response shape — no content.exciseTaxProducts array found.');
+  return list;
+}
+
+// Strips a trailing bundle/pack-count suffix (e.g. "Pick 10", "Box of 5") off a product name to
+// find its underlying product family — confirmed live that pack-size variants of the same device
+// (e.g. every "Lost Mary MT35000" SKU) reliably agree on structural attributes like
+// VAPE_SYSTEM_TYPE even though their own volume/pricing/pack fields differ.
+function pbBaseName(name){
+  return (name || '').replace(/\s+(Pick\s*\d+|Box of \d+)\s*$/i, '').trim().toLowerCase();
+}
+
+// Filters out template/placeholder rows (e.g. "-TEMPLATE- Pick 3", "Excise Taxes Excise Taxes")
+// that exist in TOT's catalog but aren't real products — confirmed these should never be trusted
+// as a derivation source or matched against as a sibling.
+function pbLooksRealProduct(p){
+  const n = (p.productName || '').toLowerCase().trim();
+  if(!n) return false;
+  if(n.includes('template')) return false;
+  if(n === 'excise taxes excise taxes') return false;
+  return true;
+}
+
+function pbBuildSiblingIndex(fullCatalog){
+  const index = {};
+  fullCatalog.filter(pbLooksRealProduct).forEach(p=>{
+    const key = pbBaseName(p.productName);
+    (index[key] = index[key] || []).push(p);
+  });
+  return index;
+}
+
+// Looks for other SKUs in the same product family (same base name) that already have a confirmed
+// value for `field`. Only returns a value when every sibling found agrees — a split vote means
+// the family doesn't actually share this attribute reliably, so it's safer to leave it for a human
+// than guess which sibling is right.
+function pbDeriveFromSiblings(item, field, siblingIndex){
+  const key = pbBaseName(item.productName);
+  const sibs = (siblingIndex[key] || []).filter(s => s.sku !== item.sku && s[field]);
+  if(!sibs.length) return {value: null};
+  const values = [...new Set(sibs.map(s=>s[field]))];
+  if(values.length !== 1) return {value: null, conflict: true, siblingSkus: sibs.map(s=>s.sku)};
+  return {value: values[0], siblingSkus: sibs.map(s=>s.sku)};
+}
+
+async function pbFetchBcVariant(sub, sku){
+  let bcProduct = null;
+  try{
+    bcProduct = await bcFetchProductBySku(sub, sku);
+  }catch(e){
+    console.log(`[product backfill] BC lookup failed for SKU "${sku}":`, e.message);
+    return null;
+  }
+  if(!bcProduct || !bcProduct.id) return null;
+  // bcFetchProductBySku resolves variant SKUs down to their parent product — fetch the dedicated
+  // variants endpoint to get this exact SKU's own cost/option data rather than the parent's
+  // (parent-level cost_price/option fields are frequently blank or zero even when the specific
+  // variant has real data — confirmed on a real zuluvape product).
+  try{
+    const vRes = await fetch(`https://${sub}.mybigcommerce.com/internalapi/v1/catalog/products/${bcProduct.id}/variants/`, {credentials:'include', headers:{'X-Requested-With':'XMLHttpRequest'}});
+    if(!vRes.ok) return null;
+    const vData = await vRes.json();
+    const variants = (vData && vData.data) || [];
+    return variants.find(v => v.sku === sku) || null;
+  }catch(e){
+    console.log(`[product backfill] variants fetch failed for product ${bcProduct.id}:`, e.message);
+    return null;
+  }
+}
+
+function pbRenderResults(vapeRows, reviewRows, unclassifiedCount){
+  const panel = document.getElementById('pbResultsPanel');
+  panel.style.display = 'block';
+  const notesCount = vapeRows.filter(r => r.NOTES).length;
+  const derivedCount = vapeRows.filter(r => /derived from \d+ sibling/.test(r.NOTES || '')).length;
+  document.getElementById('pbResultsSummary').innerHTML = `
+    <div>${vapeRows.length} vape row(s) built for CSV export (${notesCount} with at least one field noted, ${derivedCount} of those with a sibling-derived value to verify).</div>
+    <div>${reviewRows.length} item(s) pulled out for re-type review (name suggests a different product type than HQ has stored).</div>
+    <div>${unclassifiedCount} completely unclassified item(s) in the source list were skipped — no name/SKU on file, and (confirmed on this org's full bucket) a live BigCommerce check recovers none of them, so it's not run by default.</div>
+  `;
+
+  const list = document.getElementById('pbResultsList');
+  list.innerHTML = '';
+  const combined = [
+    ...reviewRows.map(r => ({...r, _kind: 'retype'})),
+    ...vapeRows.filter(r => r.NOTES).map(r => ({...r, _kind: 'note'}))
+  ];
+  combined.slice(0, 200).forEach(r=>{
+    const item = document.createElement('div');
+    item.className = 'diag-item';
+    const badgeClass = r._kind === 'retype' ? 'flag' : 'info';
+    const badgeText = r._kind === 'retype' ? 'Re-type' : 'Note';
+    const summary = r._kind === 'retype'
+      ? `Currently filed as "${r.CURRENT_TOT_TYPE}" — name suggests "${r.SUGGESTED_TYPE}". ${r.REASON}`
+      : r.NOTES;
+    item.innerHTML = `
+      <div class="diag-head">
+        <div class="diag-title">${escapeAttr(r.PRODUCT_NAME || r.SKU || '')}</div>
+        <span class="badge ${badgeClass}">${badgeText}</span>
+      </div>
+      <div class="diag-summary">${escapeAttr(summary || '')}</div>
+    `;
+    list.appendChild(item);
+  });
+  if(combined.length > 200){
+    const more = document.createElement('div');
+    more.className = 'hint';
+    more.textContent = `...and ${combined.length - 200} more not shown here — all are included in the downloaded CSV(s).`;
+    list.appendChild(more);
+  }
+}
+
+document.getElementById('pbClearBtn').addEventListener('click', ()=>{
+  PB_RESULTS = null;
+  document.getElementById('pbResultsPanel').style.display = 'none';
+  document.getElementById('pbResultsList').innerHTML = '';
+  document.getElementById('pbResultsSummary').innerHTML = '';
+  setPbStatus('Cleared.', 'ok');
+});
+
+document.getElementById('pbRunBtn').addEventListener('click', async ()=>{
+  const url = pbParseMissingDataUrl(document.getElementById('pbUrlInput').value);
+  const sub = document.getElementById('pbSubdomain').value.trim();
+  if(!url){ setPbStatus('Paste a valid app.tokenoftrust.com missing-data URL first (see the hint above the box).', 'err'); return; }
+  if(!sub){ setPbStatus('Enter the BigCommerce subdomain.', 'err'); return; }
+
+  const btn = document.getElementById('pbRunBtn');
+  const progressWrap = document.getElementById('pbProgressWrap');
+  const progressBar = document.getElementById('pbProgressBar');
+  btn.disabled = true;
+  progressWrap.style.display = 'block';
+  progressBar.style.width = '0%';
+  document.getElementById('pbResultsPanel').style.display = 'none';
+
+  try{
+    setPbStatus('Fetching full excise-tax product catalog from HQ (not just the missing-data slice — needed to find already-completed sibling products)…');
+    const fullCatalog = await pbFetchCatalog(url);
+    const siblingIndex = pbBuildSiblingIndex(fullCatalog);
+    const missing = fullCatalog.filter(p => p.missingData);
+
+    const unclassified = missing.filter(p => !p.type);
+    const vapeTyped = missing.filter(p => p.type === 'vape');
+
+    // Split off anything that looks mistyped by name before doing any BigCommerce work on it —
+    // these never get "completed" as vape rows, they need a human to re-type them in HQ first.
+    const reviewRows = [];
+    const genuineVape = [];
+    vapeTyped.forEach(p=>{
+      const suggestion = pbGuessRetype(p.productName);
+      if(suggestion){
+        const reason = suggestion === 'not a compliance product (merchandise)'
+          ? 'Product name matches apparel/merchandise wording (e.g. shirt, hat, sticker) — likely not an excise-taxable item at all, not a vape product.'
+          : `Product name matches a "${suggestion}" naming pattern, not vape.`;
+        reviewRows.push({
+          SKU: p.sku || '',
+          PRODUCT_NAME: p.productName || '',
+          CURRENT_TOT_TYPE: p.type || '',
+          SUGGESTED_TYPE: suggestion,
+          REASON: reason
+        });
+      } else {
+        genuineVape.push(p);
+      }
+    });
+
+    setPbStatus(`${genuineVape.length} vape item(s) to cross-reference against BigCommerce (${reviewRows.length} pulled out for re-type review, ${unclassified.length} unclassified record(s) skipped — see status below)…`);
+
+    const totalWork = genuineVape.length;
+    let doneCount = 0;
+
+    const vapeRows = [];
+    for(let i=0;i<genuineVape.length;i++){
+      const p = genuineVape[i];
+      setPbStatus(`<span class="spinner">⟳</span> Cross-referencing vape item ${i+1} of ${genuineVape.length} (${p.sku || 'no SKU'})…`, null, true);
+
+      const variant = p.sku ? await pbFetchBcVariant(sub, p.sku) : null;
+      const notes = [];
+
+      let volumeMl = (p.volumeInMl !== undefined && p.volumeInMl !== null) ? p.volumeInMl : null;
+      if(volumeMl === null && variant) volumeMl = pbExtractVolumeMl(variant);
+      if(volumeMl === null) notes.push('VOLUME_ML: not in TOT and no size/volume BigCommerce option found for this SKU — left blank.');
+
+      let wholesaleCost = (p.wholesaleCost !== undefined && p.wholesaleCost !== null) ? p.wholesaleCost : null;
+      if(wholesaleCost === null && variant && variant.cost_price > 0) wholesaleCost = variant.cost_price;
+      if(wholesaleCost === null) notes.push('WHOLESALE_COST: not in TOT and BigCommerce has no usable cost_price (0 or missing) for this SKU — left blank.');
+
+      const wholesalePrice = (p.wholesalePrice !== undefined && p.wholesalePrice !== null) ? p.wholesalePrice : null;
+      if(wholesalePrice === null) notes.push('WHOLESALE_PRICE: not in TOT — left blank (no reliable BigCommerce equivalent).');
+
+      const msrp = (p.msrp !== undefined && p.msrp !== null) ? p.msrp : null;
+      if(msrp === null) notes.push('MSRP: not in TOT — left blank.');
+
+      let retailPrice = (p.retailPrice !== undefined && p.retailPrice !== null) ? p.retailPrice : null;
+      if(retailPrice === null && variant && (variant.calculated_price || variant.price)){
+        retailPrice = variant.calculated_price || variant.price;
+      }
+      if(retailPrice === null) notes.push('RETAIL_PRICE: not in TOT and no BigCommerce price found for this SKU — left blank.');
+
+      // VAPE_SYSTEM_TYPE is a required CSV field. Confirmed (2026-08-25) this org has no "vape
+      // system category map" configured on TOT's side for zuluvape.com, so it's never present
+      // directly on the record — but confirmed live that pack-size siblings of the same device
+      // (e.g. every "Lost Mary MT35000" SKU) reliably agree on this value elsewhere in TOT's own
+      // catalog. Only used when every sibling found agrees — a split vote leaves it blank rather
+      // than guessing which one is right, and either way it's flagged in NOTES for a human check
+      // rather than treated as equivalent to the SKU's own confirmed data.
+      let vapeSystemType = (p.vapeSystemType !== undefined && p.vapeSystemType !== null && p.vapeSystemType !== '') ? p.vapeSystemType : null;
+      if(vapeSystemType === null){
+        const derived = pbDeriveFromSiblings(p, 'vapeSystemType', siblingIndex);
+        if(derived.value){
+          vapeSystemType = derived.value;
+          notes.push(`VAPE_SYSTEM_TYPE: TOT has no vape system category map configured for this domain — derived from ${derived.siblingSkus.length} sibling SKU(s) in the same product family (e.g. SKU ${derived.siblingSkus[0]}) that all agree on this value. Verify before uploading.`);
+        } else if(derived.conflict){
+          notes.push('VAPE_SYSTEM_TYPE: TOT has no vape system category map configured for this domain, and sibling SKUs in this product family disagree on system type — left blank, needs a manual check.');
+        } else {
+          notes.push('VAPE_SYSTEM_TYPE: TOT has no vape system category map configured for this domain, and no sibling SKUs in this product family have a confirmed value either — set this manually from HQ\'s dropdown before uploading.');
+        }
+      }
+
+      const hasNicotine = (p.hasNicotine === true) ? 'Nicotine' : (p.hasNicotine === false ? 'No Nicotine' : null);
+      if(hasNicotine === null) notes.push('HAS_NICOTINE: not set in TOT — left blank (not derived from siblings, since nicotine strength can genuinely differ within the same product family).');
+
+      let brand = p.productBrand || null;
+      if(!brand){
+        const derivedBrand = pbDeriveFromSiblings(p, 'productBrand', siblingIndex);
+        if(derivedBrand.value){
+          brand = derivedBrand.value;
+          notes.push(`PRODUCT_BRAND: not set in TOT — derived from ${derivedBrand.siblingSkus.length} sibling SKU(s) in the same product family. Verify before uploading.`);
+        } else {
+          notes.push('PRODUCT_BRAND: not set in TOT and no sibling SKUs in this product family have a confirmed value either — left blank.');
+        }
+      }
+
+      vapeRows.push({
+        PRODUCT_ID: '',
+        SKU: p.sku || '',
+        PRODUCT_NAME: p.productName || '',
+        PRODUCT_BRAND: brand || '',
+        VOLUME_ML: volumeMl !== null ? volumeMl : '',
+        WHOLESALE_COST: wholesaleCost !== null ? wholesaleCost : '',
+        WHOLESALE_PRICE: wholesalePrice !== null ? wholesalePrice : '',
+        MSRP: msrp !== null ? msrp : '',
+        RETAIL_PRICE: retailPrice !== null ? retailPrice : '',
+        VAPE_SYSTEM_TYPE: vapeSystemType || '',
+        HAS_NICOTINE: hasNicotine || '',
+        IS_EXEMPT: '',
+        PACK_CONFIG: '',
+        PACK_QUANTITY: (p.packQuantity !== undefined && p.packQuantity !== null) ? p.packQuantity : '',
+        TYPE: 'vape',
+        NICOTINE_ANALOGUE: (p.nicotineAnalogue !== undefined && p.nicotineAnalogue !== null) ? p.nicotineAnalogue : '',
+        NOTES: notes.join(' | ')
+      });
+
+      doneCount++;
+      progressBar.style.width = `${Math.round((doneCount/totalWork)*100)}%`;
+      if(i < genuineVape.length - 1) await new Promise(r=>setTimeout(r, 200));
+    }
+
+    // Completely unclassified records (no name, no SKU, no type in TOT) were tried as a live
+    // BigCommerce lookup by productId in an earlier version of this tool — the idea being that a
+    // resolving ID recovers a real name/SKU for someone to type manually, while a non-resolving
+    // one gets reported as a likely stale reference for TOT/ExciseOps to clean up. Removed
+    // (2026-08-25) after a real run against zuluvape's full 984-record unclassified bucket came
+    // back with zero resolved — every single one 404s on BigCommerce. Confirmed this wasn't a
+    // sampling fluke (an earlier 50-record spot-check found the same thing), so the live check
+    // was pure runtime cost — it's easily the slowest part of a full run — for zero recovered
+    // records. Left as a flat skip rather than deleted outright in case a different org's
+    // unclassified bucket looks different; re-enable per-org if a run there might actually recover
+    // something.
+    setPbStatus(`${unclassified.length} completely unclassified record(s) skipped — no name/SKU on file in TOT, and a live BigCommerce check against this org's full unclassified bucket recovered zero of them, so it's no longer run by default.`);
+
+    PB_RESULTS = {vapeRows, reviewRows, sub};
+    pbRenderResults(vapeRows, reviewRows, unclassified.length);
+    setPbStatus(`Done. ${vapeRows.length} vape row(s) ready to review, ${reviewRows.length} flagged for re-type, ${unclassified.length} unclassified record(s) skipped (no live BigCommerce match to be found — see status above).`, 'ok');
+  }catch(err){
+    setPbStatus('Failed — ' + (err.message || 'unknown error'), 'err');
+  } finally {
+    btn.disabled = false;
+    progressWrap.style.display = 'none';
+  }
+});
+
+document.getElementById('pbDownloadVapeBtn').addEventListener('click', ()=>{
+  if(!PB_RESULTS || !PB_RESULTS.vapeRows.length){ setPbStatus('Run a cross-reference first.', 'err'); return; }
+  const csv = pbToCsv(PB_VAPE_CSV_HEADERS, PB_RESULTS.vapeRows);
+  const storeTag = PB_RESULTS.sub || 'store';
+  pbDownloadCsv(`${storeTag}-vape-backfill-${new Date().toISOString().slice(0,10)}.csv`, csv);
+  setPbStatus(`Downloaded ${PB_RESULTS.vapeRows.length} vape row(s). Review the NOTES column before uploading via HQ.`, 'ok');
+});
+
+document.getElementById('pbDownloadReviewBtn').addEventListener('click', ()=>{
+  if(!PB_RESULTS || !PB_RESULTS.reviewRows.length){ setPbStatus('No re-type items to download — run a cross-reference first, or none were found.', 'err'); return; }
+  const csv = pbToCsv(PB_REVIEW_CSV_HEADERS, PB_RESULTS.reviewRows);
+  const storeTag = PB_RESULTS.sub || 'store';
+  pbDownloadCsv(`${storeTag}-retype-review-${new Date().toISOString().slice(0,10)}.csv`, csv);
+  setPbStatus(`Downloaded ${PB_RESULTS.reviewRows.length} re-type review item(s).`, 'ok');
+});
+
+// =====================================================================
+// Order Investigation (BETA — wraps HQ's new, internal-only Excise Order
+// Investigation API, GET /api/exciseTax/orders/{appTransactionId}/investigation).
+// See README "Order Investigation" section for the full writeup.
+//
+// Unlike everything else in this extension, this doesn't ride a signed-in
+// HQ browser session — it needs a standalone ops.tokenoftrust.com API key
+// pair (totApiKey/totSecretKey) with api:opsAdmin, exchanged for a bearer
+// token via POST /api/accessToken. Confirmed live (2026-08-26) that this
+// extension's usual session-minted token gets a 403 insufficientPermissions
+// against this endpoint — diagnostic:investigate is a separate, more
+// guarded grant than diagnostic:read, which every ordinary key gets.
+//
+// 2026-08-26 correction: the first version of this section guessed at the
+// POST /api/accessToken request/response shape (the HQ session investigating
+// it lost its org context mid-session before the AccessTokenRequest/
+// AccessTokenResponse schema pages could be read). Marc then pulled up the
+// actual "Create an access token" docs page directly — the real request body
+// is THREE required fields, not two: totApiKey, totSecretKey, AND appDomain
+// ("Domain associated with API keys") — the original code only sent the
+// first two, which would have failed every call with a 422 for a missing
+// required field. Confirmed from the same page: the response token lives at
+// content.accessToken (one of the guessed candidates was right, kept as the
+// primary lookup now), used as `Authorization: Bearer <accessToken>`, and
+// the token is valid 24 hours — replacing the earlier defensive 10-minute
+// assumption.
+//
+// Confirmed working end-to-end (2026-08-26): the real credentials come from
+// HQ's own self-service flow, not a special provisioning request — sign
+// into HQ, select "ops" as the vendor (same choose-app flow as everywhere
+// else in this extension), then open its Integration tab. That page's
+// totApiKey/totSecretKey pair, with appDomain "ops.tokenoftrust.com" (NOT
+// the bare "tokenoftrust.com" the API docs' own generic example showed),
+// authenticates AND carries diagnostic:investigate — tested live against
+// order 2448120 (vapesocietysupplies.com), returned a clean "healthy"
+// verdict. See README "Order Investigation" for the full writeup, including
+// why Target app domain almost always needs to be filled in explicitly
+// (it defaults to the key's own ops.tokenoftrust.com domain, which has no
+// real client orders on it).
+// =====================================================================
+
+const INV_CREDS_KEY = 'totExciseInvestigationCreds';
+let INV_TOKEN = null;       // in-memory only, deliberately not persisted — cheap to re-mint from the stored key pair
+let INV_TOKEN_EXPIRES = 0;  // ms epoch; 0 forces a re-mint
+
+function invSetCredsStatus(msg, type, isHtml){
+  const el = document.getElementById('invCredsStatus');
+  if(isHtml) el.innerHTML = msg; else el.textContent = msg;
+  el.className = 'status-line show' + (type ? ' '+type : '');
+}
+function invSetStatus(msg, type, isHtml){
+  const el = document.getElementById('invStatus');
+  if(isHtml) el.innerHTML = msg; else el.textContent = msg;
+  el.className = 'status-line show' + (type ? ' '+type : '');
+}
+
+async function invLoadCreds(){
+  const stored = await chrome.storage.local.get([INV_CREDS_KEY]);
+  return stored[INV_CREDS_KEY] || null;
+}
+async function invSaveCreds(apiKey, secretKey, appDomain){
+  await chrome.storage.local.set({ [INV_CREDS_KEY]: { apiKey, secretKey, appDomain } });
+}
+async function invClearCreds(){
+  await chrome.storage.local.remove([INV_CREDS_KEY]);
+  INV_TOKEN = null;
+  INV_TOKEN_EXPIRES = 0;
+}
+
+// Exchanges totApiKey/totSecretKey/appDomain for a bearer token. Confirmed
+// against the actual "Create an access token" docs page (2026-08-26) — see
+// the section banner above.
+async function invExchangeToken(apiKey, secretKey, appDomain){
+  const res = await fetch('https://app.tokenoftrust.com/api/accessToken', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ totApiKey: apiKey, totSecretKey: secretKey, appDomain })
+  });
+  let body;
+  try{ body = await res.json(); }catch(e){ throw new Error(`HTTP ${res.status} — response wasn't valid JSON.`); }
+  if(!res.ok){
+    const msg = body?.content?.message || body?.message || body?.content?.code || `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+  const c = body?.content || body;
+  // content.accessToken is the confirmed field; the other candidates stay as a fallback
+  // only in case a future API version renames it, not because the shape is still unknown.
+  const token = c?.accessToken || c?.token || c?.bearerToken || c?.access_token || (typeof c === 'string' ? c : null);
+  if(!token){
+    throw new Error(`Got a 200 back but couldn't find content.accessToken — response had top-level keys: ${Object.keys(c || {}).join(', ') || '(none)'}.`);
+  }
+  // Docs confirm 24-hour validity. Still checks for an explicit expiresAt/expires field
+  // first in case the response carries one, but no longer guesses a conservative fallback —
+  // 24h is the documented value, not an assumption.
+  const expiresAt = c?.expiresAt || c?.expires || null;
+  const expiresMs = expiresAt ? (typeof expiresAt === 'number' ? expiresAt : new Date(expiresAt).getTime()) : (Date.now() + 24*60*60*1000);
+  return { token, expiresMs };
+}
+
+async function invGetToken(forceRefresh){
+  if(!forceRefresh && INV_TOKEN && Date.now() < INV_TOKEN_EXPIRES - 15000) return INV_TOKEN;
+  const creds = await invLoadCreds();
+  if(!creds || !creds.apiKey || !creds.secretKey || !creds.appDomain) throw new Error('No saved credentials — enter your totApiKey/totSecretKey/appDomain above first.');
+  const { token, expiresMs } = await invExchangeToken(creds.apiKey, creds.secretKey, creds.appDomain);
+  INV_TOKEN = token;
+  INV_TOKEN_EXPIRES = expiresMs;
+  return token;
+}
+
+async function invFetchInvestigation(token, appTransactionId, opts){
+  const params = new URLSearchParams();
+  params.set('includeProductHistory', opts.includeProductHistory ? 'true' : 'false');
+  if(opts.regionCode) params.set('regionCode', opts.regionCode);
+  if(opts.targetAppDomain) params.set('targetAppDomain', opts.targetAppDomain);
+  const url = `https://app.tokenoftrust.com/api/exciseTax/orders/${encodeURIComponent(appTransactionId)}/investigation?${params.toString()}`;
+  const res = await fetch(url, { headers: { Accept: 'application/json', Authorization: 'Bearer ' + token } });
+  let body;
+  try{ body = await res.json(); }catch(e){ throw new Error(`HTTP ${res.status} — response wasn't valid JSON.`); }
+  if(!res.ok){
+    const msg = body?.content?.message || body?.content?.causedBy?.message || body?.message || `HTTP ${res.status}`;
+    throw new Error(`${res.status}: ${msg}`);
+  }
+  return body?.content || body;
+}
+
+// Per-product excise breakdown (added 2026-09-15, for the frepouch.com
+// Trello card asking whether TOT can supply line-item excise amounts for
+// their ERP). Charlie confirmed this ships already, no new work needed on
+// TOT's side — this endpoint IS the feature, per the "Excise Tax Per-Product
+// Breakdown API" doc he sent the client. That doc is written for an external
+// client's OWN single-tenant key (POST /internal/auth/token there, vs. this
+// extension's already-proven /api/accessToken flow — both mint a Bearer
+// token, just different mint endpoints; not mixing them here since ours
+// already works) and says nothing about cross-tenant scoping, because a
+// normal client key never needs it. Whether OUR ops key's cross-tenant
+// access (confirmed for Investigate via targetAppDomain) extends to this
+// endpoint too is genuinely unverified — passed through defensively, same
+// as invFetchInvestigation, rather than assumed either way. This is the
+// actual live test Charlie asked Marc to run (pull a giantvapes order),
+// not a check that's already been confirmed.
+async function invFetchCalcDetail(token, appTransactionId, opts){
+  const params = new URLSearchParams();
+  if(opts && opts.targetAppDomain) params.set('targetAppDomain', opts.targetAppDomain);
+  const qs = params.toString();
+  const url = `https://app.tokenoftrust.com/api/exciseTax/orders/${encodeURIComponent(appTransactionId)}/calc-detail${qs ? '?'+qs : ''}`;
+  const res = await fetch(url, { headers: { Accept: 'application/json', Authorization: 'Bearer ' + token } });
+  let body;
+  try{ body = await res.json(); }catch(e){ throw new Error(`HTTP ${res.status} — response wasn't valid JSON.`); }
+  if(!res.ok){
+    const msg = body?.content?.message || body?.content?.causedBy?.message || body?.message || `HTTP ${res.status}`;
+    throw new Error(`${res.status}: ${msg}`);
+  }
+  return body?.content || body;
+}
+
+// Renders per the doc's own reading guide: events[0] is current state (newest first),
+// sum appliedRules[].taxForQty per product for the line total, list skippedProducts with
+// their reason (not a silent $0 — the doc is explicit that count:0/empty products is a
+// "no breakdown stored" success response, not proof no tax was charged).
+function invRenderCalcDetail(content){
+  const events = content.events || [];
+  if(!events.length){
+    return `<div class="diag-summary" style="color:var(--muted);">count: ${invEsc(content.count ?? 0)}, no events — per the doc, this is a success response meaning no calc-detail is stored for this order, NOT proof no tax was charged. Check GET /exciseTax/order/{id}'s exciseTaxCollected for the order-level total instead.</div>`;
+  }
+  const event = events[0];
+  const cd = event.calcDetail || {};
+  const products = cd.products || [];
+  const skipped = cd.skippedProducts || [];
+
+  let html = `<div class="diag-summary" style="margin-bottom:10px;font-size:11px;color:var(--muted);">
+    event ${invEsc(event.eventType||'?')} at ${invEsc(event.eventTs||'?')} · status: ${invEsc(event.status||'—')} · ${events.length} event(s) total (showing events[0], the current state)
+  </div>`;
+
+  if(!products.length && !skipped.length){
+    html += `<div class="diag-summary" style="color:var(--muted);">This event's calcDetail has no products and no skippedProducts — empty breakdown.</div>`;
+  }
+
+  if(products.length){
+    let orderTotal = 0;
+    html += `<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:10px;">
+      <thead><tr style="text-align:left;border-bottom:1px solid var(--border);"><th>SKU</th><th>Product</th><th>Applied rules</th><th>Line total</th></tr></thead>
+      <tbody>`;
+    products.forEach(p=>{
+      const rules = p.appliedRules || [];
+      const lineTax = rules.reduce((s,r)=> s + (r.taxForQty || 0), 0);
+      orderTotal += lineTax;
+      const rulesHtml = rules.length
+        ? rules.map(r=>`${invEsc(r.taxLabel||'?')}: $${Number(r.taxForQty||0).toFixed(2)} (unit $${Number(r.unitTax||0).toFixed(2)})`).join('<br>')
+        : '<span style="color:var(--muted);">none</span>';
+      html += `<tr style="border-bottom:1px solid var(--border);">
+        <td style="font-family:var(--mono);font-size:11px;">${invEsc(p.sku||'—')}</td>
+        <td>${invEsc(p.productName||'—')}</td>
+        <td>${rulesHtml}</td>
+        <td style="font-family:var(--mono);">$${lineTax.toFixed(2)}</td>
+      </tr>`;
+    });
+    html += `</tbody></table>
+    <div class="diag-summary" style="font-weight:600;margin-bottom:10px;">Order total (sum of line totals): $${orderTotal.toFixed(2)}</div>`;
+  }
+
+  if(skipped.length){
+    html += `<div class="diag-summary" style="margin-bottom:10px;"><div style="font-weight:600;margin-bottom:4px;">Skipped products (${skipped.length}) — not taxed, with reason</div>${skipped.map(s=>`${invEsc(s.sku||'—')}: ${invEsc(s.reason||'no reason given')}`).join('<br>')}</div>`;
+  }
+
+  html += `<details style="margin-top:6px;"><summary style="cursor:pointer;color:var(--muted);font-size:11px;">Raw response</summary>
+    <pre style="white-space:pre-wrap;font-size:11px;background:var(--panel2);padding:8px;border-radius:6px;margin-top:6px;">${invEsc(JSON.stringify(content, null, 2))}</pre>
+  </details>`;
+
+  return html;
+}
+
+function invEsc(s){ return escapeAttr(String(s ?? '')); }
+
+// present/absent/degraded — never coerce absent to a dollar amount, per the API's own
+// "Unknown is never zero" warning. Rendered as a plain dash + reasonCode instead of $0.
+// label is a small pre-built HTML cell (plain-English name + the raw API field name as a
+// muted subline) — see INV_VALUE_LABELS below. Not user data, so not run through invEsc.
+function invTaxValueHtml(tv, label){
+  if(!tv) return `<tr><td>${label}</td><td colspan="3" style="color:var(--muted);">not returned</td></tr>`;
+  if(tv.state === 'present'){
+    return `<tr><td>${label}</td><td style="font-family:var(--mono);">$${Number(tv.amount).toFixed(2)}</td><td>${invEsc(tv.source||'')}</td><td style="color:var(--muted);font-size:11px;">${invEsc(tv.observedAt||'')}</td></tr>`;
+  }
+  const color = tv.state === 'degraded' ? 'var(--warn)' : 'var(--muted)';
+  return `<tr><td>${label}</td><td style="font-style:italic;color:${color};">— (${invEsc(tv.reasonCode||tv.state)})</td><td>${invEsc(tv.source||'')}</td><td style="color:var(--muted);font-size:11px;">${invEsc(tv.observedAt||'')}</td></tr>`;
+}
+
+// Plain-English names for the five TaxValue fields, with the raw API field name kept as a
+// small muted subline so the row is still traceable back to the docs. Order matches the
+// API's own collected/reconcileReported/checkoutCalculated/recordCalculated/recalculatedNow.
+function invValueLabel(friendly, rawField){
+  return `<div>${friendly}</div><div style="font-size:10px;color:var(--muted);font-family:var(--mono);">${rawField}</div>`;
+}
+
+// Returns inline banner styling (border/background/text color) rather than a CSS class —
+// this extension's .ok/.warn/.err styling only exists combined with .status-line/.badge,
+// there's no bare .warn class defined at all, so a class-only approach here would silently
+// render unstyled. Mirrors the .status-line.ok/.err color+border+background combo directly.
+function invVerdictStyle(code){
+  if(code === 'healthy') return { color: 'var(--accent)', border: '#1c5a3d', bg: 'var(--accent-dim)' };
+  if(code === 'amount_drift' || code === 'needs_review') return { color: 'var(--warn)', border: 'var(--warn-dim)', bg: 'var(--warn-dim)' };
+  return { color: 'var(--danger)', border: '#5a2626', bg: 'var(--danger-dim)' }; // jurisdiction_mismatch, collected_but_engine_says_zero, should_have_collected, computed_but_not_collected
+}
+
+function invRenderDossier(content){
+  const v = content.verdict || {};
+  const vals = content.values || {};
+  const j = content.jurisdiction || {};
+  const rec = j.record || {};
+  const products = content.products || [];
+  const skipped = content.skippedProducts || [];
+  const degradations = content.degradations || [];
+  const operational = content.operational || {};
+  const handoff = content.handoff || {};
+
+  const vs = invVerdictStyle(v.code);
+  const numbers = v.numbers || {};
+
+  let html = '';
+
+  html += `<div style="padding:10px;border-radius:6px;margin-bottom:12px;border:1px solid ${vs.border};background:${vs.bg};">
+    <div style="font-weight:700;font-size:14px;margin-bottom:2px;color:${vs.color};">${invEsc(v.code||'unknown')}</div>
+    <div style="margin-bottom:6px;">${invEsc(v.headline||'')}</div>
+    <div style="font-size:11px;color:var(--muted);">confidence: ${invEsc(v.confidence||'?')} · A (charged to customer): ${numbers.collected ?? '—'} · B (calculated when saved): ${numbers.recordCalculated ?? '—'} · C (recalculated now): ${numbers.recalcNow ?? '—'}</div>
+    ${(v.reasons||[]).length ? `<ul style="margin:8px 0 0 18px;padding:0;">${v.reasons.map(r=>`<li>${invEsc(r)}</li>`).join('')}</ul>` : ''}
+  </div>`;
+
+  html += `<table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:12px;">
+    <thead><tr style="text-align:left;border-bottom:1px solid var(--border);"><th>Value</th><th>Amount</th><th>Source</th><th>Observed</th></tr></thead>
+    <tbody>
+      ${invTaxValueHtml(vals.collected, invValueLabel('Charged to customer', 'collected · platform'))}
+      ${invTaxValueHtml(vals.reconcileReported, invValueLabel('Reported in reconciliation', 'reconcileReported · platform'))}
+      ${invTaxValueHtml(vals.checkoutCalculated, invValueLabel('Calculated at checkout', 'checkoutCalculated · engine'))}
+      ${invTaxValueHtml(vals.recordCalculated, invValueLabel('Calculated when order was saved', 'recordCalculated · engine'))}
+      ${invTaxValueHtml(vals.recalculatedNow, invValueLabel('Recalculated just now', 'recalculatedNow · engine'))}
+    </tbody>
+  </table>`;
+
+  if(rec.input || rec.resolved){
+    const mismatch = j.crossResolutionMismatch;
+    html += `<div class="diag-summary" style="margin-bottom:12px;">
+      <div style="font-weight:600;margin-bottom:4px;">Jurisdiction${mismatch ? ' <span style="color:var(--danger);">— input/resolved mismatch</span>' : ''}</div>
+      <div>Input: ${invEsc([rec.input?.locality, rec.input?.regionCode, rec.input?.postalCode].filter(Boolean).join(', '))}</div>
+      <div>Resolved: ${invEsc([rec.resolved?.locality, rec.resolved?.regionCode, rec.resolved?.postalCode].filter(Boolean).join(', '))}</div>
+    </div>`;
+  }
+
+  if((content.rules?.firedForJurisdiction||[]).length){
+    html += `<div class="diag-summary" style="margin-bottom:12px;"><div style="font-weight:600;margin-bottom:4px;">Rules fired</div>${content.rules.firedForJurisdiction.map(r=>invEsc(r)).join(', ')}</div>`;
+  }
+
+  const drifted = products.filter(p => (p.changedSinceOrder||[]).length);
+  if(drifted.length){
+    html += `<div class="diag-summary" style="margin-bottom:12px;"><div style="font-weight:600;margin-bottom:4px;">Product metadata drift since order (${drifted.length})</div>`;
+    drifted.forEach(p=>{
+      html += `<div style="margin-bottom:4px;">${invEsc(p.sku)}: ${(p.changedSinceOrder||[]).map(c=>`${invEsc(c.field)} was ${invEsc(c.orderTime)} → now ${invEsc(c.current)}`).join('; ')}</div>`;
+    });
+    html += `</div>`;
+  }
+
+  if(skipped.length){
+    html += `<div class="diag-summary" style="margin-bottom:12px;"><div style="font-weight:600;margin-bottom:4px;">Skipped products (${skipped.length})</div>${skipped.map(s=>`${invEsc(s.sku||s.productId)}: ${invEsc(s.reason)}`).join('<br>')}</div>`;
+  }
+
+  if(degradations.length){
+    html += `<div class="diag-summary" style="margin-bottom:12px;color:var(--warn);"><div style="font-weight:600;margin-bottom:4px;">Degradations — evidence that couldn't be gathered</div>${degradations.map(d=>`${invEsc(d.stage)}: ${invEsc(d.reasonCode)}${d.detail ? ' — '+invEsc(d.detail) : ''}`).join('<br>')}</div>`;
+  }
+
+  // 2026-09-14: operational.checkoutTraceId + a checkout-scoped Sentry link
+  // (labeled with "tot_checkout_id") were added to the investigation API by
+  // PR 1604 (Trello 9859 follow-up) — surfaces the Shopify checkout id a
+  // "tax calculated but never collected" order carries, plus a Sentry link
+  // scoped to that one checkout instead of the whole shop's free-text search.
+  // sentryLinks was already rendered generically below (just .map() over
+  // whatever the array contains), so the new 4th entry shows up there with
+  // no changes needed — this block only adds the id itself, which wasn't
+  // rendered anywhere before, and bolds/labels the checkout-scoped link so
+  // it stands out from the three pre-existing free-text ones.
+  if(operational.checkoutTraceId){
+    html += `<div class="diag-summary" style="margin-bottom:12px;">
+      <div style="font-weight:600;margin-bottom:4px;">Checkout trace ID</div>
+      <div style="font-family:var(--mono);font-size:11px;">${invEsc(operational.checkoutTraceId)}</div>
+    </div>`;
+  }
+
+  if((operational.sentryLinks||[]).length){
+    html += `<div class="diag-summary" style="margin-bottom:12px;" id="invSentryBlock">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;flex-wrap:wrap;gap:6px;">
+        <div style="font-weight:600;">Sentry links</div>
+        <button class="btn ghost small" id="invSentrySearchBtn">Search Sentry now</button>
+      </div>
+      ${operational.sentryLinks.map(s=>{
+        const isCheckoutScoped = /tot_checkout_id/i.test(s.label||'');
+        return `<a href="${invEsc(s.url)}" target="_blank" rel="noopener" style="color:var(--accent);${isCheckoutScoped ? 'font-weight:700;' : ''}">${invEsc(s.label||s.project)}${isCheckoutScoped ? ' ←' : ''}</a>`;
+      }).join('<br>')}
+      <div id="invSentryResults" style="margin-top:8px;"></div>
+    </div>`;
+  }
+
+  if(content.whatIf){
+    const w = content.whatIf;
+    html += `<div class="diag-summary" style="margin-bottom:12px;"><div style="font-weight:600;margin-bottom:4px;">What-if: ${invEsc(w.requestedRegionCode)}</div>${w.state === 'present' ? `$${Number(w.amount).toFixed(2)}` : `— (${invEsc(w.reasonCode||w.state)})`} — structurally separate from the verdict above, per the API's own note that a regionCode what-if never affects it.</div>`;
+  }
+
+  if(handoff.markdown){
+    html += `<div class="panel" style="margin-top:4px;padding:10px;border:1px solid var(--border);border-radius:6px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+        <div style="font-weight:600;">Agent / ticket handoff</div>
+        <button class="btn ghost small" id="invCopyHandoffBtn">Copy</button>
+      </div>
+      <textarea readonly style="width:100%;height:120px;font-family:var(--mono);font-size:11px;" id="invHandoffText">${invEsc(handoff.markdown)}</textarea>
+    </div>`;
+  }
+
+  return html;
+}
+
+// Target app domain dropdown reuses the same HQ_DOMAINS list/storage as the
+// HQ Excise Tax Scan tab's "Known domains" table (see loadHqDomains/saveHqDomains/
+// domainOptionsHtml above) rather than maintaining a second copy — add or fix
+// domains in that tab and this dropdown picks them up too. A hidden text input
+// (#invTargetDomain) stays the actual source of truth that invRunBtn reads, so
+// its handler didn't need to change; the visible <select> (#invTargetDomainSelect)
+// just writes into it, with an "Other…" option falling back to free text for a
+// domain not yet in the list.
+function invRenderTargetDomainSelect(selected){
+  const sel = document.getElementById('invTargetDomainSelect');
+  if(!sel) return;
+  const opts = ['<option value="">(use my key\'s own domain — ops.tokenoftrust.com)</option>'];
+  opts.push(domainOptionsHtml(selected && selected !== '__custom__' ? selected : ''));
+  opts.push('<option value="__custom__"' + (selected === '__custom__' ? ' selected' : '') + '>Other… (type manually)</option>');
+  sel.innerHTML = opts.join('');
+  if(selected && selected !== '__custom__') sel.value = selected;
+}
+
+document.getElementById('invTargetDomainSelect').addEventListener('change', (e)=>{
+  const textInput = document.getElementById('invTargetDomain');
+  if(e.target.value === '__custom__'){
+    textInput.style.display = '';
+    textInput.value = '';
+    textInput.focus();
+  } else {
+    textInput.style.display = 'none';
+    textInput.value = e.target.value;
+  }
+});
+
+async function initInvestigation(){
+  const creds = await invLoadCreds();
+  if(creds){
+    document.getElementById('invApiKey').value = creds.apiKey || '';
+    document.getElementById('invSecretKey').value = creds.secretKey || '';
+    document.getElementById('invAppDomain').value = creds.appDomain || '';
+  }
+  await loadHqDomains();
+  invRenderTargetDomainSelect('');
+}
+
+document.getElementById('invSaveCredsBtn').addEventListener('click', async ()=>{
+  const apiKey = document.getElementById('invApiKey').value.trim();
+  const secretKey = document.getElementById('invSecretKey').value.trim();
+  const appDomain = document.getElementById('invAppDomain').value.trim();
+  if(!apiKey || !secretKey || !appDomain){ invSetCredsStatus('Enter totApiKey, totSecretKey, and appDomain — all three are required by POST /api/accessToken.', 'err'); return; }
+  invSetCredsStatus('Saving and testing…');
+  try{
+    await invSaveCreds(apiKey, secretKey, appDomain);
+    await invGetToken(true); // force a fresh exchange to actually validate the pair
+    invSetCredsStatus('Saved — credentials exchanged for a token successfully.', 'ok');
+  }catch(err){
+    invSetCredsStatus('Saved, but the test call failed — ' + (err.message || 'unknown error') + '. Double-check the key pair and appDomain.', 'err');
+  }
+});
+
+document.getElementById('invClearCredsBtn').addEventListener('click', async ()=>{
+  await invClearCreds();
+  document.getElementById('invApiKey').value = '';
+  document.getElementById('invAppDomain').value = '';
+  document.getElementById('invSecretKey').value = '';
+  invSetCredsStatus('Cleared saved credentials.', 'ok');
+});
+
+document.getElementById('invRunBtn').addEventListener('click', async ()=>{
+  const appTransactionId = document.getElementById('invOrderId').value.trim();
+  if(!appTransactionId){ invSetStatus('Enter an order ID first.', 'err'); return; }
+  const includeProductHistory = document.getElementById('invIncludeHistory').checked;
+  const regionCode = document.getElementById('invRegionCode').value.trim() || null;
+  const targetAppDomain = document.getElementById('invTargetDomain').value.trim() || null;
+
+  const btn = document.getElementById('invRunBtn');
+  btn.disabled = true;
+  document.getElementById('invResultsPanel').style.display = 'none';
+  invSetStatus('Getting a token…');
+  try{
+    const token = await invGetToken(false);
+    invSetStatus(`<span class="spinner">⟳</span> Investigating order ${invEsc(appTransactionId)}…`, null, true);
+    const content = await invFetchInvestigation(token, appTransactionId, { includeProductHistory, regionCode, targetAppDomain });
+    document.getElementById('invResultsBody').innerHTML = invRenderDossier(content);
+    document.getElementById('invResultsPanel').style.display = 'block';
+    const copyBtn = document.getElementById('invCopyHandoffBtn');
+    if(copyBtn){
+      copyBtn.addEventListener('click', async (evt)=>{
+        const btn = evt.currentTarget;
+        try{
+          await navigator.clipboard.writeText(document.getElementById('invHandoffText').value);
+          flashCopied(btn);
+          invSetStatus('Copied handoff markdown to clipboard.', 'ok');
+        }catch(e){
+          invSetStatus('Could not copy automatically — select the text in the box above and copy manually.', 'err');
+        }
+      });
+    }
+    const sentrySearchBtn = document.getElementById('invSentrySearchBtn');
+    if(sentrySearchBtn){
+      sentrySearchBtn.addEventListener('click', async ()=>{
+        const resultsEl = document.getElementById('invSentryResults');
+        sentrySearchBtn.disabled = true;
+        resultsEl.innerHTML = '<span class="spinner">⟳</span> Searching Sentry…';
+        try{
+          const creds = await sentryLoadCreds();
+          const events = await sentrySearchEvents(creds, targetAppDomain, appTransactionId);
+          resultsEl.innerHTML = sentryRenderEvents(events);
+        }catch(err){
+          resultsEl.innerHTML = `<div style="color:var(--danger);">Sentry search failed — ${invEsc(err.message || 'unknown error')}</div>`;
+        } finally {
+          sentrySearchBtn.disabled = false;
+        }
+      });
+    }
+    invSetStatus(`Done. Verdict: ${invEsc(content.verdict?.code || 'unknown')}.`, 'ok');
+  }catch(err){
+    invSetStatus('Failed — ' + (err.message || 'unknown error'), 'err');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById('invCalcDetailBtn').addEventListener('click', async ()=>{
+  const appTransactionId = document.getElementById('invOrderId').value.trim();
+  if(!appTransactionId){ invSetStatus('Enter an order ID first.', 'err'); return; }
+  const targetAppDomain = document.getElementById('invTargetDomain').value.trim() || null;
+
+  const btn = document.getElementById('invCalcDetailBtn');
+  btn.disabled = true;
+  document.getElementById('invCalcDetailPanel').style.display = 'none';
+  invSetStatus('Getting a token…');
+  try{
+    const token = await invGetToken(false);
+    invSetStatus(`<span class="spinner">⟳</span> Fetching calc-detail for order ${invEsc(appTransactionId)}…`, null, true);
+    const content = await invFetchCalcDetail(token, appTransactionId, { targetAppDomain });
+    document.getElementById('invCalcDetailBody').innerHTML = invRenderCalcDetail(content);
+    document.getElementById('invCalcDetailPanel').style.display = 'block';
+    invSetStatus(`Done. ${content.count ?? 0} event(s) found.`, 'ok');
+  }catch(err){
+    invSetStatus('Failed — ' + (err.message || 'unknown error'), 'err');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+initInvestigation();
+
+// =====================================================================
+// Sentry event search (beta) — added 3.17.9. Ported from Engineering's
+// scripts/excise-diagnostics/sentry-order-lookup.js (Trello 9369, the 8/31
+// handoff snapshot for the "[Epic][TaxOpsTools] Adopt portable excise
+// diagnostics" epic). Only the Sentry-querying half of that script is
+// portable — confirmed by direct source inspection: fetchSentryIssue/
+// searchSentryEvents call https://sentry.io/api/0/organizations/{org}/...
+// directly over plain HTTPS with a Bearer token, and the script's own
+// SystemServices/commonUtils requires only appear later, in the separate
+// order-fetch/recalculate step (getAccessToken/fetchOrder/
+// calculateWithDiagnostics) — a step the script's own --sentry-only flag
+// skips entirely, proving the Sentry half has no monolith dependency.
+//
+// This ports searchSentryEvents() specifically (not fetchSentryIssue-by-ID —
+// out of scope for now, nothing in this extension currently takes a raw
+// Sentry issue ID as input). Query shape, field list, sort, and the 25-result
+// cap all mirror the original function exactly. Reuses the same
+// excise.appDomain / excise.appTransactionId tags the "Sentry links" section
+// in the Investigation dossier already generates clickable search links for —
+// this adds an inline result list as an alternative to clicking out.
+// =====================================================================
+
+const SENTRY_CREDS_KEY = 'totExciseSentryCreds';
+
+function sentrySetCredsStatus(msg, type, isHtml){
+  const el = document.getElementById('sentryCredsStatus');
+  if(isHtml) el.innerHTML = msg; else el.textContent = msg;
+  el.className = 'status-line show' + (type ? ' '+type : '');
+}
+function sentrySetStandaloneStatus(msg, type, isHtml){
+  const el = document.getElementById('sentryStandaloneStatus');
+  if(isHtml) el.innerHTML = msg; else el.textContent = msg;
+  el.className = 'status-line show' + (type ? ' '+type : '');
+}
+
+async function sentryLoadCreds(){
+  const stored = await chrome.storage.local.get([SENTRY_CREDS_KEY]);
+  return stored[SENTRY_CREDS_KEY] || null;
+}
+async function sentrySaveCreds(authToken, org, project){
+  await chrome.storage.local.set({ [SENTRY_CREDS_KEY]: { authToken, org, project } });
+}
+async function sentryClearCreds(){
+  await chrome.storage.local.remove([SENTRY_CREDS_KEY]);
+}
+
+function sentryEsc(s){ return escapeAttr(String(s ?? '')); }
+
+// Mirrors sentry-order-lookup.js's searchSentryEvents() — same query shape
+// (tags[excise.appDomain]:<domain> [tags[excise.appTransactionId]:<id>]),
+// same field list, same -timestamp sort, same 25-result cap.
+async function sentrySearchEvents(creds, appDomain, appTransactionId){
+  if(!creds || !creds.authToken || !creds.org) throw new Error('No saved Sentry credentials — enter an auth token and org slug above first.');
+  if(!appDomain) throw new Error('App domain is required.');
+  let query = `tags[excise.appDomain]:${appDomain}`;
+  if(appTransactionId) query += ` tags[excise.appTransactionId]:${appTransactionId}`;
+  const params = new URLSearchParams();
+  params.set('query', query);
+  ['id','message','timestamp','tags[errorType]','tags[excise.appDomain]','tags[excise.appTransactionId]','tags[excise.sku]','tags[excise.productId]','tags[excise.integrationSource]'].forEach(f=>params.append('field', f));
+  params.set('sort', '-timestamp');
+  params.set('per_page', '25');
+  if(creds.project) params.set('project', creds.project);
+  const url = `https://sentry.io/api/0/organizations/${encodeURIComponent(creds.org)}/events/?${params.toString()}`;
+  const res = await fetch(url, { headers: { Authorization: 'Bearer ' + creds.authToken, Accept: 'application/json' } });
+  let body;
+  try{ body = await res.json(); }catch(e){ throw new Error(`HTTP ${res.status} — response wasn't valid JSON.`); }
+  if(!res.ok){
+    const msg = body?.detail || body?.message || `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+  return (body.data || []).map(e => ({
+    id: e.id,
+    message: e.message,
+    timestamp: e.timestamp,
+    errorType: e['tags[errorType]'] || 'unknown',
+    appDomain: e['tags[excise.appDomain]'] || null,
+    appTransactionId: e['tags[excise.appTransactionId]'] || null,
+    sku: e['tags[excise.sku]'] || null,
+    productId: e['tags[excise.productId]'] || null,
+    integrationSource: e['tags[excise.integrationSource]'] || null
+  }));
+}
+
+// Sentry has no dedicated ping/token-exchange endpoint the way the
+// Investigation API's /accessToken does, so "test" here hits the org detail
+// endpoint (GET .../organizations/{org}/), which needs only org:read and
+// confirms the token + org slug actually work together.
+async function sentryTestCreds(authToken, org){
+  const res = await fetch(`https://sentry.io/api/0/organizations/${encodeURIComponent(org)}/`, {
+    headers: { Authorization: 'Bearer ' + authToken, Accept: 'application/json' }
+  });
+  if(!res.ok){
+    let body; try{ body = await res.json(); }catch(e){}
+    const msg = body?.detail || `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+}
+
+function sentryRenderEvents(events){
+  if(!events || !events.length) return '<div style="color:var(--muted);">(no Sentry events found)</div>';
+  return `<div class="table-scroll"><table class="cfg" style="width:100%;">
+    <thead><tr><th>Time</th><th>Error type</th><th>SKU</th><th>Order</th><th>Source</th><th>Message</th></tr></thead>
+    <tbody>
+      ${events.map(e => `<tr>
+        <td style="white-space:nowrap;font-size:11px;color:var(--muted);">${sentryEsc(e.timestamp||'')}</td>
+        <td>${sentryEsc(e.errorType||'')}</td>
+        <td>${sentryEsc(e.sku||'—')}</td>
+        <td>${sentryEsc(e.appTransactionId||'—')}</td>
+        <td>${sentryEsc(e.integrationSource||'—')}</td>
+        <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${sentryEsc(e.message||'')}">${sentryEsc(e.message||'')}</td>
+      </tr>`).join('')}
+    </tbody>
+  </table></div>`;
+}
+
+// App domain dropdown reuses the same HQ_DOMAINS list/storage as the
+// Investigate tab's Target app domain select and the HQ Excise Tax Scan
+// tab's Known domains table (see loadHqDomains/domainOptionsHtml above) —
+// add or fix domains in either of those and this dropdown picks them up
+// too. Mirrors invRenderTargetDomainSelect exactly, minus the "use my key's
+// own domain" default option, which has no Sentry equivalent — a domain
+// must be explicitly chosen (or typed via "Other...") here.
+function sentryRenderAppDomainSelect(selected){
+  const sel = document.getElementById('sentryAppDomainSelect');
+  if(!sel) return;
+  const opts = ['<option value="">(select a domain)</option>'];
+  opts.push(domainOptionsHtml(selected && selected !== '__custom__' ? selected : ''));
+  opts.push('<option value="__custom__"' + (selected === '__custom__' ? ' selected' : '') + '>Other… (type manually)</option>');
+  sel.innerHTML = opts.join('');
+  if(selected && selected !== '__custom__') sel.value = selected;
+}
+
+document.getElementById('sentryAppDomainSelect').addEventListener('change', (e)=>{
+  const textInput = document.getElementById('sentryAppDomain');
+  if(e.target.value === '__custom__'){
+    textInput.style.display = '';
+    textInput.value = '';
+    textInput.focus();
+  } else {
+    textInput.style.display = 'none';
+    textInput.value = e.target.value;
+  }
+});
+
+async function initSentry(){
+  const creds = await sentryLoadCreds();
+  if(creds){
+    document.getElementById('sentryAuthToken').value = creds.authToken || '';
+    document.getElementById('sentryOrg').value = creds.org || '';
+    document.getElementById('sentryProject').value = creds.project || '';
+  }
+  await loadHqDomains(); // idempotent if the Investigate tab's init already ran this
+  sentryRenderAppDomainSelect('');
+}
+
+document.getElementById('sentrySaveCredsBtn').addEventListener('click', async ()=>{
+  const authToken = document.getElementById('sentryAuthToken').value.trim();
+  const org = document.getElementById('sentryOrg').value.trim();
+  const project = document.getElementById('sentryProject').value.trim();
+  if(!authToken || !org){ sentrySetCredsStatus('Enter at least an auth token and org slug.', 'err'); return; }
+  sentrySetCredsStatus('Saving and testing…');
+  try{
+    await sentrySaveCreds(authToken, org, project);
+    await sentryTestCreds(authToken, org);
+    sentrySetCredsStatus('Saved — org lookup succeeded.', 'ok');
+  }catch(err){
+    sentrySetCredsStatus('Saved, but the test call failed — ' + (err.message || 'unknown error') + '. Double-check the token and org slug.', 'err');
+  }
+});
+
+document.getElementById('sentryClearCredsBtn').addEventListener('click', async ()=>{
+  await sentryClearCreds();
+  document.getElementById('sentryAuthToken').value = '';
+  document.getElementById('sentryOrg').value = '';
+  document.getElementById('sentryProject').value = '';
+  sentrySetCredsStatus('Cleared saved credentials.', 'ok');
+});
+
+document.getElementById('sentrySearchStandaloneBtn').addEventListener('click', async ()=>{
+  const appDomain = document.getElementById('sentryAppDomain').value.trim();
+  const orderId = document.getElementById('sentryOrderId').value.trim() || null;
+  if(!appDomain){ sentrySetStandaloneStatus('Enter an app domain first.', 'err'); return; }
+  const btn = document.getElementById('sentrySearchStandaloneBtn');
+  btn.disabled = true;
+  document.getElementById('sentryStandaloneResults').innerHTML = '';
+  sentrySetStandaloneStatus('<span class="spinner">⟳</span> Searching Sentry…', null, true);
+  try{
+    const creds = await sentryLoadCreds();
+    const events = await sentrySearchEvents(creds, appDomain, orderId);
+    document.getElementById('sentryStandaloneResults').innerHTML = sentryRenderEvents(events);
+    sentrySetStandaloneStatus(`Done — ${events.length} event(s) found.`, 'ok');
+  }catch(err){
+    sentrySetStandaloneStatus('Failed — ' + (err.message || 'unknown error'), 'err');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+initSentry();
