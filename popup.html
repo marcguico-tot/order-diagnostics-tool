@@ -222,6 +222,7 @@
     <button class="platform-tab" data-platform="hq">HQ Excise Tax</button>
     <button class="platform-tab" data-platform="backfill">Product Backfill</button>
     <button class="platform-tab" data-platform="investigate">Order Investigation</button>
+    <button class="platform-tab" data-platform="verification">Verification</button>
   </div>
 
   <div class="platform-panel active" id="platformShopify">
@@ -507,9 +508,9 @@
 
   <div class="panel">
     <h2>Scan queue</h2>
-    <div class="hint" style="margin-bottom:8px;">Each row is one org. Three ways to scope a row: an ID start + end (fixed range), an ID start with no end (scans forward from there and auto-stops once it stops finding real orders — use this when you know where to start but not what the newest order number is), or check "Last 24h" to scan by time window instead. "Last 24h" clears the ID range fields.</div>
+    <div class="hint" style="margin-bottom:8px;">Each row is one org. Three ways to scope a row: an ID start + end (fixed range), an ID start with no end (scans forward from there and auto-stops once it stops finding real orders — use this when you know where to start but not what the newest order number is), or check the time-window box to scan by hours-ago instead (defaults to 24, editable up to 336 / 2 weeks — bump it past 24 to cover a weekend or other gap the ID-range mode's auto-stop skipped). Checking it clears the ID range fields.</div>
     <table class="cfg" id="hqQueueTable">
-      <thead><tr><th>Domain</th><th>ID start</th><th>ID end</th><th>Last 24h</th><th></th></tr></thead>
+      <thead><tr><th>Domain</th><th>ID start</th><th>ID end</th><th>Time window</th><th></th></tr></thead>
       <tbody id="hqQueueBody"></tbody>
     </table>
     <div class="btn-row">
@@ -661,6 +662,14 @@
         <input type="text" id="invRegionCode" placeholder="CA" style="width:100%;">
       </div>
     </div>
+    <label style="margin-top:10px;">Platform <span class="hint" style="display:inline;">(optional — just tells this dossier which static troubleshooting notes to show below; doesn't affect the API call itself)</span></label>
+    <select id="invPlatform" style="width:100%;">
+      <option value="">(not set — skip platform-specific notes)</option>
+      <option value="shopify">Shopify</option>
+      <option value="bigcommerce">BigCommerce</option>
+      <option value="woocommerce">WooCommerce</option>
+      <option value="foxycart">FoxyCart</option>
+    </select>
     <div class="btn-row" style="margin-top:10px;">
       <button class="btn primary" id="invRunBtn">Investigate</button>
       <button class="btn ghost" id="invCalcDetailBtn">Show per-product breakdown</button>
@@ -712,6 +721,60 @@
     </div>
     <div class="status-line" id="sentryStandaloneStatus" style="margin-top:8px;"></div>
     <div id="sentryStandaloneResults" style="margin-top:8px;"></div>
+  </div>
+
+  </div>
+
+  <div class="platform-panel" id="platformVerification">
+
+  <div class="panel">
+    <h2>Verification Diagnostics <span style="text-transform:none;font-weight:400;color:var(--muted);">(beta)</span></h2>
+    <div class="hint" style="margin-bottom:10px;">
+      Calls HQ's <code>POST /api/diagnostic/evaluate</code> — the same self-describing diagnostic function API documented at <code>/hq/api-docs/diagnostic</code> that the Ops "VerifOps" Trello epic is built around. Of its 19 functions, 8 are already wired into VEX (Verification Explorer); the two below — <code>lookupVerificationAttempt</code> and <code>verificationHealthCheck</code> — are exposed but reachable nowhere Ops can get at today, per that epic's own API coverage assessment. No new API work needed here, only UI wiring on top of an endpoint that already exists.
+    </div>
+    <div class="hint" style="margin-bottom:0;color:var(--warn);">
+      Reuses the same ops.tokenoftrust.com API key/secret entered on the Order Investigation tab (evaluate needs <code>diagnostic:read</code>, plus <code>diagnostic:crossTenant</code> for any domain other than the key's own). Whether that key actually carries <code>diagnostic:read</code>/<code>diagnostic:crossTenant</code> is genuinely unconfirmed — the epic's own Uncertainty #1 notes its absence reads as "no data found", not "no permission" (i.e. a clean-looking empty result can silently mean the wrong thing). Running either check below against a known real case is the actual live test for that, not an assumption baked in ahead of it.
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Look up a verification attempt code</h2>
+    <div class="hint" style="margin-bottom:10px;">Resolves the 6-character code shown in a verification modal's footer to the journey behind it — appDomain, appUserid, sessionUuid, and the reuse chain (<code>sourceVerificationAttemptId</code>) when the attempt reused a prior verification. Per the epic: "the most common intake artifact, and Ops cannot resolve one today."</div>
+    <label>6-character code <span class="hint" style="display:inline;">(from the modal footer; normalized the same way the API does — uppercased, 0&rarr;O / 1&rarr;I / 8&rarr;B / 5&rarr;S / 2&rarr;Z)</span></label>
+    <input type="text" id="vCode" placeholder="A3F9K2" maxlength="6" style="width:100%;font-family:var(--mono);text-transform:uppercase;">
+    <label style="margin-top:10px;">Target app domain <span class="hint" style="display:inline;">(optional — defaults to your key's own domain; needs diagnostic:crossTenant for any other domain. Same shared domain list as Order Investigation.)</span></label>
+    <select id="vLookupDomainSelect" style="width:100%;"></select>
+    <input type="text" id="vLookupDomain" placeholder="vapesocietysupplies.com" style="width:100%;margin-top:6px;display:none;">
+    <div class="btn-row" style="margin-top:10px;">
+      <button class="btn primary" id="vLookupBtn">Look up code</button>
+    </div>
+    <div class="status-line" id="vLookupStatus" style="margin-top:8px;"></div>
+  </div>
+
+  <div class="panel" id="vLookupResultsPanel" style="display:none;">
+    <h2>Attempt lookup result</h2>
+    <div id="vLookupResultsBody"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Verification health check</h2>
+    <div class="hint" style="margin-bottom:10px;">Proactive sweep — no user report needed. Scans onboarding metrics over a time window and flags stalled journeys (attempt started, no terminal step reached), skipped correction advice (reuse blocked but correction never shown and no auto-restart), broken redirects (correction redirect fired, no follow-up step), and users with an unusually high number of verification attempts.</div>
+    <label>Since <span class="hint" style="display:inline;">(required — start of the scan window)</span></label>
+    <input type="datetime-local" id="vHealthSince" style="width:100%;">
+    <label style="margin-top:10px;">Until <span class="hint" style="display:inline;">(optional — defaults to now)</span></label>
+    <input type="datetime-local" id="vHealthUntil" style="width:100%;">
+    <label style="margin-top:10px;">Target app domain <span class="hint" style="display:inline;">(optional — same rules as above)</span></label>
+    <select id="vHealthDomainSelect" style="width:100%;"></select>
+    <input type="text" id="vHealthDomain" placeholder="vapesocietysupplies.com" style="width:100%;margin-top:6px;display:none;">
+    <div class="btn-row" style="margin-top:10px;">
+      <button class="btn primary" id="vHealthBtn">Run health check</button>
+    </div>
+    <div class="status-line" id="vHealthStatus" style="margin-top:8px;"></div>
+  </div>
+
+  <div class="panel" id="vHealthResultsPanel" style="display:none;">
+    <h2>Health check findings</h2>
+    <div id="vHealthResultsBody"></div>
   </div>
 
   </div>

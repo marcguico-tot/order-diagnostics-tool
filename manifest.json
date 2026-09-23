@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "TOT Order Diagnostics Tool",
-  "version": "3.17.37",
-  "version_name": "3.17.37 (Order Investigation tab: added a 'Show per-product breakdown' button next to Investigate, calling GET /exciseTax/orders/{id}/calc-detail directly and rendering the SKU-level tax breakdown per HQ's own 'Excise Tax Per-Product Breakdown API' doc — same doc Charlie sent frepouch.com. Built for the frepouch.com Trello card: Charlie says the feature already ships with no work needed, and asked Marc to confirm by pulling a real giantvapes.com order through it. Reuses the existing ops token (invGetToken) and Order ID/Target app domain fields already on the Investigate panel — no separate credentials. Sums appliedRules[].taxForQty per line, shows skippedProducts with their reason (per the doc: an empty/missing breakdown is a documented 'not stored' success case, not proof no tax was charged), and an order total. NOTE: whether the ops key's cross-tenant access (proven for Investigate via targetAppDomain) also applies to calc-detail is unverified — passed through defensively but not assumed; this is the actual live test to run, not a confirmed-working feature)",
-  "description": "Look up Shopify, BigCommerce, or WooCommerce orders directly and run excise tax troubleshooting checks. Shopify: 9 checks incl. TOT tags, PMD, tax jurisdiction match, live price check, plus 2 conditional checks. BigCommerce: verification status, excise tax line item incl. jurisdiction/compliance cross-check, payment/address/coupon/cart checks. WooCommerce: order fetch + raw custom-field display. Also includes an HQ Excise Tax scan across client orgs, a Taxlines CSV export by date range, a Product Data Backfill tool for missing BigCommerce catalog data, an Order Investigation deep-dive via HQ's API, and inline Sentry event search.",
+  "version": "3.17.40",
+  "version_name": "3.17.40 — HQ Excise Tax scan's time-window mode is no longer stuck at 24 hours: it's now an editable hours field (up to 2 weeks) so a weekend or other gap can be scanned in one pass. Also widened the open-ended ID-range mode's stop threshold so a low-volume weekend doesn't make it give up early.",
+  "description": "Looks up an order from Shopify, BigCommerce, or WooCommerce and checks it for common tax and verification problems. Also includes tools for scanning tax data across all client stores, digging into one order's tax history, and checking on ID verification issues.",
   "action": {
     "default_title": "Order Diagnostics Tool",
     "default_icon": {

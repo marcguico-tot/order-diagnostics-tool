@@ -2879,6 +2879,7 @@ function switchPlatformTab(platform){
   document.getElementById('platformHQ').classList.toggle('active', platform === 'hq');
   document.getElementById('platformBackfill').classList.toggle('active', platform === 'backfill');
   document.getElementById('platformInvestigate').classList.toggle('active', platform === 'investigate');
+  document.getElementById('platformVerification').classList.toggle('active', platform === 'verification');
 }
 document.querySelectorAll('.platform-tab').forEach(btn=>{
   btn.addEventListener('click', ()=> switchPlatformTab(btn.dataset.platform));
@@ -2911,7 +2912,8 @@ const HQ_QUEUE_KEY = 'totHqQueue';
 const HQ_RESULTS_KEY = 'totHqResults';
 const HQ_DOMAINS_KEY = 'totHqDomains';
 const HQ_RATE_DIRECTORY_KEY = 'totHqRateDirectory'; // learned tax-rate-per-jurisdiction+SKU-type directory — see overcharge $ estimate, 2026-08-20
-const HQ_SCAN_HOURS = 24; // fixed — "last N hours" mode always means the last 24h, not a typed number
+const HQ_SCAN_HOURS = 24; // default hours for the time-window mode when first checked — editable per row from there, see the sinceHoursAgo input in renderHqQueueTable
+const HQ_SCAN_HOURS_MAX = 24 * 14; // sanity cap (2 weeks) — guards against a mistyped huge value pulling in an unbounded order list
 const HQ_ORIGIN = 'https://app.tokenoftrust.com';
 
 // ---------------------------------------------------------------------------
@@ -3332,16 +3334,19 @@ function renderHqQueueTable() {
   const body = document.getElementById('hqQueueBody');
   body.innerHTML = '';
   HQ_QUEUE.forEach((row, i) => {
-    const last24 = row.sinceHoursAgo != null;
+    const sinceMode = row.sinceHoursAgo != null;
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td><select data-i="${i}" data-f="domain" style="width:150px;">
         <option value="" ${row.domain ? '' : 'selected'} disabled>Select a domain...</option>
         ${domainOptionsHtml(row.domain)}
       </select></td>
-      <td><input type="text" data-i="${i}" data-f="idStart" value="${row.idStart ?? ''}" placeholder="idStart" style="width:70px;" ${last24 ? 'disabled' : ''}></td>
-      <td><input type="text" data-i="${i}" data-f="idEnd" value="${row.idEnd ?? ''}" placeholder="blank = auto" title="Leave blank to auto-detect the end — the scan walks forward from ID start until it stops finding real orders." style="width:80px;" ${last24 ? 'disabled' : ''}></td>
-      <td style="text-align:center;"><input type="checkbox" data-i="${i}" data-f="last24" ${last24 ? 'checked' : ''} title="Scan the last ${HQ_SCAN_HOURS} hours instead of a fixed ID range"></td>
+      <td><input type="text" data-i="${i}" data-f="idStart" value="${row.idStart ?? ''}" placeholder="idStart" style="width:70px;" ${sinceMode ? 'disabled' : ''}></td>
+      <td><input type="text" data-i="${i}" data-f="idEnd" value="${row.idEnd ?? ''}" placeholder="blank = auto" title="Leave blank to auto-detect the end — the scan walks forward from ID start until it stops finding real orders." style="width:80px;" ${sinceMode ? 'disabled' : ''}></td>
+      <td style="text-align:center; white-space:nowrap;">
+        <input type="checkbox" data-i="${i}" data-f="sinceMode" ${sinceMode ? 'checked' : ''} title="Scan a time window instead of a fixed ID range">
+        <input type="number" data-i="${i}" data-f="sinceHoursAgo" value="${row.sinceHoursAgo ?? HQ_SCAN_HOURS}" min="1" max="${HQ_SCAN_HOURS_MAX}" step="1" style="width:52px;" ${sinceMode ? '' : 'disabled'} title="Hours back to scan — default ${HQ_SCAN_HOURS}, editable up to ${HQ_SCAN_HOURS_MAX} (2 weeks). Raise it past 24 to cover a weekend or other gap.">
+      </td>
       <td><button class="row-del" data-i="${i}" title="Remove">✕</button></td>`;
     body.appendChild(tr);
   });
@@ -3360,16 +3365,34 @@ function renderHqQueueTable() {
       await saveHqQueue();
     });
   });
-  body.querySelectorAll('input[data-f="last24"]').forEach(cb => {
+  body.querySelectorAll('input[data-f="sinceMode"]').forEach(cb => {
     cb.addEventListener('change', async e => {
       const i = +e.target.dataset.i;
       if (e.target.checked) {
-        HQ_QUEUE[i].sinceHoursAgo = HQ_SCAN_HOURS;
+        // Restore whatever hours value this row last used (so re-checking
+        // the box after unchecking it doesn't silently reset a
+        // deliberately-widened weekend-catch-up window back to the 24h
+        // default) — _lastSinceHoursAgo survives the uncheck below,
+        // sinceHoursAgo itself doesn't.
+        HQ_QUEUE[i].sinceHoursAgo = HQ_QUEUE[i]._lastSinceHoursAgo ?? HQ_SCAN_HOURS;
         HQ_QUEUE[i].idStart = null;
         HQ_QUEUE[i].idEnd = null;
       } else {
+        if (HQ_QUEUE[i].sinceHoursAgo != null) HQ_QUEUE[i]._lastSinceHoursAgo = HQ_QUEUE[i].sinceHoursAgo;
         HQ_QUEUE[i].sinceHoursAgo = null;
       }
+      await saveHqQueue();
+      renderHqQueueTable();
+    });
+  });
+  body.querySelectorAll('input[data-f="sinceHoursAgo"]').forEach(inp => {
+    inp.addEventListener('change', async e => {
+      const i = +e.target.dataset.i;
+      let val = Number(e.target.value);
+      if (!Number.isFinite(val) || val < 1) val = HQ_SCAN_HOURS;
+      val = Math.min(val, HQ_SCAN_HOURS_MAX);
+      HQ_QUEUE[i].sinceHoursAgo = val;
+      HQ_QUEUE[i]._lastSinceHoursAgo = val;
       await saveHqQueue();
       renderHqQueueTable();
     });
@@ -4922,6 +4945,16 @@ async function hqScanOrdersWithToken(token, domain, idStart, idEnd, sinceHoursAg
       // end" since order IDs can have small legitimate gaps (e.g. a
       // cancelled/test order never landing in this API) — MISS_STREAK_LIMIT
       // consecutive misses in a row is the actual stop condition.
+      //
+      // Deliberately NOT raised past 15, per the 2026-08-21 README entry on
+      // this same failure mode ("gaps can exceed the miss-streak limit") —
+      // raising it just moves the failure to a bigger gap on some other
+      // store instead of removing it. A weekend-sized gap (as hit again on
+      // 2026-09-21) is exactly the case that entry says to use the
+      // time-window mode for instead, which lists whatever TOT actually
+      // recorded rather than walking a guessed ID space. That mode's
+      // 24-hour cap is what made it unusable for a multi-day gap — fixed
+      // below by making the hours value editable instead of fixed.
       const MISS_STREAK_LIMIT = 15;
       const MAX_CHECKED = 3000; // runaway-loop backstop, not expected to be hit in normal use
       let missStreak = 0;
@@ -4935,14 +4968,36 @@ async function hqScanOrdersWithToken(token, domain, idStart, idEnd, sinceHoursAg
     } else if (sinceHoursAgo != null) {
       const until = new Date().toISOString();
       const since = new Date(Date.now() - sinceHoursAgo * 3600 * 1000).toISOString();
-      const listRes = await fetch(`https://app.tokenoftrust.com/api/exciseTax/orders?since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}&limit=1000`, {
-        headers: { Accept: 'application/json', Authorization: 'Bearer ' + token }
-      });
-      if (listRes.status !== 200) return { ok: false, reason: `list-orders failed (status ${listRes.status})` };
-      const body = await listRes.json();
-      const orders = body?.content?.orders || body?.content || [];
-      for (const o of orders) {
-        const id = o.orderId || o.id;
+      // GET /exciseTax/orders caps at limit=1000 with no offset/cursor, only
+      // since/until — a 24h window rarely hits that, but now that this mode
+      // can be widened well past 24h (weekend/multi-day catch-up scans), a
+      // busy org could come back with exactly 1000 and silently drop
+      // whatever didn't fit. Same date-bisection fix already used for this
+      // same endpoint's pagination in the Product Backfill / taxlines export
+      // path (see fetchIdsInRange above): split the window in half and
+      // recurse whenever a call comes back right at the cap. depth is a
+      // safety backstop against a truly degenerate range, not expected to
+      // matter in normal use.
+      async function fetchOrderIdsInRange(sinceIso, untilIso, depth) {
+        const res = await fetch(`https://app.tokenoftrust.com/api/exciseTax/orders?since=${encodeURIComponent(sinceIso)}&until=${encodeURIComponent(untilIso)}&limit=1000`, {
+          headers: { Accept: 'application/json', Authorization: 'Bearer ' + token }
+        });
+        if (res.status !== 200) return { error: `list-orders failed (status ${res.status}) for ${sinceIso}..${untilIso}` };
+        const body = await res.json();
+        const orders = body?.content?.orders || body?.content || [];
+        if (orders.length < 1000 || depth > 12) return orders.map(o => o.orderId || o.id);
+        const sinceMs = new Date(sinceIso).getTime(), untilMs = new Date(untilIso).getTime();
+        const midMs = sinceMs + Math.floor((untilMs - sinceMs) / 2);
+        if (!(midMs > sinceMs) || !(midMs < untilMs)) return orders.map(o => o.orderId || o.id);
+        const mid = new Date(midMs).toISOString();
+        const [left, right] = await Promise.all([fetchOrderIdsInRange(sinceIso, mid, depth + 1), fetchOrderIdsInRange(mid, untilIso, depth + 1)]);
+        if (left && left.error) return left;
+        if (right && right.error) return right;
+        return Array.from(new Set([...left, ...right]));
+      }
+      const idResult = await fetchOrderIdsInRange(since, until, 0);
+      if (idResult && idResult.error) return { ok: false, reason: idResult.error };
+      for (const id of idResult) {
         const r = await scanOneOrder(id, token);
         if (r === null) notFound++; else results.push(r);
       }
@@ -6345,7 +6400,13 @@ function invRenderCalcDetail(content){
   }
 
   if(skipped.length){
-    html += `<div class="diag-summary" style="margin-bottom:10px;"><div style="font-weight:600;margin-bottom:4px;">Skipped products (${skipped.length}) — not taxed, with reason</div>${skipped.map(s=>`${invEsc(s.sku||'—')}: ${invEsc(s.reason||'no reason given')}`).join('<br>')}</div>`;
+    html += `<div class="diag-summary" style="margin-bottom:10px;"><div style="font-weight:600;margin-bottom:4px;">Skipped products (${skipped.length}) — not taxed, with reason</div>${skipped.map(s=>{
+      const note = invSkipReasonNote(s.reason);
+      const base = `${invEsc(s.sku||'—')}: ${invEsc(s.reason||'no reason given')}`;
+      if(!note) return base;
+      const color = note.normal ? 'var(--muted)' : 'var(--warn)';
+      return `${base}<br><span style="color:${color};font-size:11px;">↳ ${note.normal ? '(expected) ' : '(check this) '}${invEsc(note.note)}</span>`;
+    }).join('<br>')}</div>`;
   }
 
   html += `<details style="margin-top:6px;"><summary style="cursor:pointer;color:var(--muted);font-size:11px;">Raw response</summary>
@@ -6387,7 +6448,105 @@ function invVerdictStyle(code){
   return { color: 'var(--danger)', border: '#5a2626', bg: 'var(--danger-dim)' }; // jurisdiction_mismatch, collected_but_engine_says_zero, should_have_collected, computed_but_not_collected
 }
 
-function invRenderDossier(content){
+// Platform-specific collection-mechanism notes and Sentry project lists, copied
+// verbatim (not paraphrased) from Engineering's investigate-order.node.js
+// PLATFORM_GUIDANCE constant, per the excise-diagnostics handoff snapshot dated
+// 2026-08-31 (Trello 9369 review bundle). That script's own Stage 4 verdict
+// engine computes the exact same verdict codes our Investigation API already
+// returns (healthy/amount_drift/jurisdiction_mismatch/collected_but_engine_
+// says_zero/should_have_collected/computed_but_not_collected/needs_review) —
+// this extension already gets that engine's OUTPUT from the live API, but was
+// missing the static "how this platform's collection mechanism actually works,
+// and what to check" knowledge that script prints alongside its verdict. Added
+// here as reference text only — it never changes what gets fetched or how the
+// verdict itself is computed, only what guidance is shown alongside it.
+const INV_PLATFORM_GUIDANCE = {
+  shopify: {
+    repo: 'TOT/shopify-app',
+    sentry: ['shopify-app', 'shopify-checkout'],
+    basics: 'Excise tax is applied via the Checkout UI Extension (a TOT_TAXLINE line). It is $0 when a checkout path never renders the extension (e.g. some B2B / draft-order / portal flows). Recall the totCheckoutId vs cart_token reconciliation gap. shopify-checkout logs errors from the tax extension itself.'
+  },
+  bigcommerce: {
+    repo: 'TOT/bigcommerce-app',
+    sentry: ['bigcommerce-app', 'bigcommerce-ui'],
+    basics: 'Excise tax is a cart line item (catalog product SKU TOT_EXCISE_TAX) added by /tax/calculate from TOT\'s totalTaxes; a $0 calc removes the line. But exciseTaxCollected is RE-SUMMED at order-record time from order lines matched by isExciseTaxLine (product_id / sku==TOT_EXCISE_TAX / name ~ /excise tax/i) — NOT from the live calc. A stale line left after the cart turned exempt / changed jurisdiction is still summed. Check the order for a leftover excise line and the "Incorrect Taxes Collected" order metafield.'
+  },
+  woocommerce: {
+    repo: 'TOT/tokenoftrust (WooCommerce plugin hits /api/exciseTax/calculate + /api/ecommerce/orderCreated)',
+    sentry: ['wordpress'],
+    basics: 'WordPress/WooCommerce plugin calls the same TOT calculate/record endpoints. Explore the plugin for how the tax line is applied client-side.'
+  },
+  foxycart: {
+    repo: 'TOT/tot-foxycart',
+    sentry: ['foxycart-app'],
+    basics: 'FoxyCart collection mechanism — explore the repo (webhook/transaction handling) for how the excise amount is applied and reported.'
+  }
+};
+const INV_SENTRY_CORE_PROJECT = 'tot-server'; // always check this one regardless of platform — it's where the core calc runs
+
+// Skipped-product reason-code translations, from sentry-order-lookup.js's diagnose()
+// function in the same handoff snapshot. isTaxSku/noRulesForJurisdiction are treated
+// as expected/normal there (not flagged) — everything else gets a specific suggested
+// action. Falls back to showing the raw reason with no guess for anything not on this
+// list, since the MD-doc examples (isExempt/taxExpired) don't even use the same exact
+// spelling as this script's checks (productIsExempt) — API reason strings clearly
+// aren't fully stable/enumerated, so this is deliberately additive, never assumed complete.
+const INV_SKIP_REASON_NOTES = {
+  isTaxSku: { normal: true, note: 'Expected — this line IS the tax line itself, not a taxable product.' },
+  noRulesForJurisdiction: { normal: true, note: 'Expected — no excise rule exists for this jurisdiction/product combination.' },
+  MissingVapeSystemType: { normal: false, note: 'Fix this product\'s tags — needs one of isClosed/isOpen/isLiquid/batteryOnly.' },
+  MissingProductData: { normal: false, note: 'Product has no metadata on file — upload/refresh the product CSV for this domain.' },
+  productIsExempt: { normal: false, note: 'Product is marked isExempt=true — verify that\'s actually intentional for this SKU.' },
+  isExempt: { normal: false, note: 'Product is marked exempt — verify that\'s actually intentional for this SKU.' },
+  taxExpired: { normal: false, note: 'This product\'s tax rule had an expiration date that has passed — check if that\'s expected or a stale rule.' }
+};
+function invSkipReasonNote(reason){
+  return INV_SKIP_REASON_NOTES[reason] || null;
+}
+
+function invRenderPlatformNotes(platform, verdictCode){
+  const g = INV_PLATFORM_GUIDANCE[platform] || null;
+  const didntCollect = verdictCode === 'should_have_collected' || verdictCode === 'computed_but_not_collected';
+  let html = '';
+
+  if(g){
+    html += `<div class="diag-summary" style="margin-bottom:8px;">
+      <div style="font-weight:600;margin-bottom:4px;">How ${invEsc(platform)} collection works</div>
+      <div>${invEsc(g.basics)}</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px;">Repo to explore: ${invEsc(g.repo)} — apps change often, don't trust cached file paths/line numbers.</div>
+    </div>`;
+  } else {
+    html += `<div class="diag-summary" style="margin-bottom:8px;color:var(--muted);">Set "Platform" above for platform-specific collection-mechanism notes.</div>`;
+  }
+
+  if(verdictCode === 'amount_drift'){
+    html += `<div class="diag-summary" style="margin-bottom:8px;">
+      <div style="font-weight:600;margin-bottom:4px;">Amount drift — two candidate causes (check in this order)</div>
+      <div>(a) A stale/wrong-jurisdiction line on the platform order — e.g. a mid-checkout address change left an earlier jurisdiction's excise line (BigCommerce re-sums this at record time). Ask which jurisdiction the platform order page shows; if it differs from the resolved region above, this is likely it — TOT resolved correctly, the wrong tax is a stale platform-side line, not a resolution bug.</div>
+      <div>(b) Rules or product metadata changed between the order and now — compare order-time vs current (see product metadata drift above, if any).</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px;">This dossier only sees TOT's resolved jurisdiction, not what the platform order page itself shows — a correct-looking resolution here does NOT rule out a wrong-state amount on the order.</div>
+    </div>`;
+  }
+
+  if(platform === 'shopify' && didntCollect){
+    html += `<div class="diag-summary" style="margin-bottom:8px;">
+      <div style="font-weight:600;margin-bottom:4px;">Possible cause — Shopify express/accelerated payments</div>
+      <div>Apple Pay / Google Pay / Shop Pay express checkout bypasses the tax Checkout UI Extension entirely, so excise tax is silently missed. This is a known issue with no code fix — check whether this order was placed via an express/accelerated wallet; if so, the remedy is asking the vendor to disable express payment methods.</div>
+    </div>`;
+  }
+
+  const suspectServer = didntCollect || verdictCode === 'needs_review';
+  const projects = [INV_SENTRY_CORE_PROJECT].concat((g && g.sentry) || []);
+  html += `<div class="diag-summary" style="margin-bottom:0;">
+    <div style="font-weight:600;margin-bottom:4px;">Check Sentry${suspectServer ? ' — collection may have failed due to a TOT server issue' : ' (if a server outage/timeout is suspected)'}</div>
+    <div>org: token-of-trust · projects: ${invEsc(projects.join(', '))} (tot-server = core calc; always check it)</div>
+    <div style="font-size:11px;color:var(--muted);margin-top:4px;">Filter by tags excise.appDomain / excise.appTransactionId, bounded to the order timestamp. Look for ApplicationTimeout, 5xx/calc failures, connection errors (core) and tax-extension errors (platform UI project). The Sentry credentials panel below only searches one saved project at a time — check the others listed here manually if the first comes up empty.</div>
+  </div>`;
+
+  return html;
+}
+
+function invRenderDossier(content, platform){
   const v = content.verdict || {};
   const vals = content.values || {};
   const j = content.jurisdiction || {};
@@ -6444,7 +6603,13 @@ function invRenderDossier(content){
   }
 
   if(skipped.length){
-    html += `<div class="diag-summary" style="margin-bottom:12px;"><div style="font-weight:600;margin-bottom:4px;">Skipped products (${skipped.length})</div>${skipped.map(s=>`${invEsc(s.sku||s.productId)}: ${invEsc(s.reason)}`).join('<br>')}</div>`;
+    html += `<div class="diag-summary" style="margin-bottom:12px;"><div style="font-weight:600;margin-bottom:4px;">Skipped products (${skipped.length})</div>${skipped.map(s=>{
+      const note = invSkipReasonNote(s.reason);
+      const base = `${invEsc(s.sku||s.productId)}: ${invEsc(s.reason)}`;
+      if(!note) return base;
+      const color = note.normal ? 'var(--muted)' : 'var(--warn)';
+      return `${base}<br><span style="color:${color};font-size:11px;">↳ ${note.normal ? '(expected) ' : '(check this) '}${invEsc(note.note)}</span>`;
+    }).join('<br>')}</div>`;
   }
 
   if(degradations.length){
@@ -6486,6 +6651,11 @@ function invRenderDossier(content){
     const w = content.whatIf;
     html += `<div class="diag-summary" style="margin-bottom:12px;"><div style="font-weight:600;margin-bottom:4px;">What-if: ${invEsc(w.requestedRegionCode)}</div>${w.state === 'present' ? `$${Number(w.amount).toFixed(2)}` : `— (${invEsc(w.reasonCode||w.state)})`} — structurally separate from the verdict above, per the API's own note that a regionCode what-if never affects it.</div>`;
   }
+
+  html += `<div class="panel" style="margin-top:4px;margin-bottom:12px;padding:10px;border:1px solid var(--border);border-radius:6px;">
+    <div style="font-weight:600;margin-bottom:6px;">Platform & troubleshooting notes <span style="font-weight:400;color:var(--muted);font-size:11px;">(from Engineering's investigate-order.node.js playbook)</span></div>
+    ${invRenderPlatformNotes(platform, v.code)}
+  </div>`;
 
   if(handoff.markdown){
     html += `<div class="panel" style="margin-top:4px;padding:10px;border:1px solid var(--border);border-radius:6px;">
@@ -6570,6 +6740,7 @@ document.getElementById('invRunBtn').addEventListener('click', async ()=>{
   const includeProductHistory = document.getElementById('invIncludeHistory').checked;
   const regionCode = document.getElementById('invRegionCode').value.trim() || null;
   const targetAppDomain = document.getElementById('invTargetDomain').value.trim() || null;
+  const platform = document.getElementById('invPlatform').value || null;
 
   const btn = document.getElementById('invRunBtn');
   btn.disabled = true;
@@ -6579,7 +6750,7 @@ document.getElementById('invRunBtn').addEventListener('click', async ()=>{
     const token = await invGetToken(false);
     invSetStatus(`<span class="spinner">⟳</span> Investigating order ${invEsc(appTransactionId)}…`, null, true);
     const content = await invFetchInvestigation(token, appTransactionId, { includeProductHistory, regionCode, targetAppDomain });
-    document.getElementById('invResultsBody').innerHTML = invRenderDossier(content);
+    document.getElementById('invResultsBody').innerHTML = invRenderDossier(content, platform);
     document.getElementById('invResultsPanel').style.display = 'block';
     const copyBtn = document.getElementById('invCopyHandoffBtn');
     if(copyBtn){
@@ -6643,6 +6814,206 @@ document.getElementById('invCalcDetailBtn').addEventListener('click', async ()=>
 });
 
 initInvestigation();
+
+// =====================================================================
+// Verification Diagnostics (beta) — added 3.17.39. Ports lookupVerificationAttempt
+// and verificationHealthCheck from HQ's POST /api/diagnostic/evaluate, per the
+// [VerifOps] "Adopt portable verification diagnostics into Ops daily tooling"
+// Trello epic (https://trello.com/c/j3fzLvwd) and its companion [VerifOpsAPI]
+// card (https://trello.com/c/OsqiYsvY). Both functions are confirmed present
+// in the real AVAILABLE_FUNCTIONS registry (modules/diagnostic/api/
+// diagnostic-api-routes.node.js, tokenoftrust/tokenoftrust@a93162bb7, packaged
+// 2026-09-11 for the VerifOpsAPI card) — not just described in the card — so
+// this is purely UI wiring on an endpoint that already exists, same as the
+// calc-detail button above. verificationHealthCheck's response shape
+// ({anomalies, scanned, healthy, summary:{errors,warnings,info}}) and its five
+// anomaly types (stalled/skippedCorrection/brokenRedirect/multipleAttempts/
+// error, each error|warning|info) are read directly out of that file's
+// evaluateVerificationHealthCheck function, lines 909-1082 of the snapshot —
+// not guessed. lookupVerificationAttempt's exact response fields are NOT
+// independently confirmed the same way (the route just forwards whatever
+// VerificationAttemptService.lookup() returns, and that service's source
+// wasn't in this snapshot) — the field list below is the card's own stated
+// DoD ("resolves to appDomain + appUserid + sessionUuid, incl.
+// sourceVerificationAttemptId"), rendered defensively with a raw-JSON fallback
+// so nothing is hidden if the real shape differs.
+//
+// Reuses the same ops.tokenoftrust.com key/token as Order Investigation
+// (invGetToken) — whether that key actually carries diagnostic:read /
+// diagnostic:crossTenant is unconfirmed; see the panel's hint text and the
+// epic's own Uncertainty #1.
+// =====================================================================
+
+async function verifDiagEvaluate(token, functionName, params){
+  const res = await fetch('https://app.tokenoftrust.com/api/diagnostic/evaluate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: 'Bearer ' + token },
+    body: JSON.stringify({ functionName, params })
+  });
+  let body;
+  try{ body = await res.json(); }catch(e){ throw new Error(`HTTP ${res.status} — response wasn't valid JSON.`); }
+  if(!res.ok){
+    const msg = body?.error || body?.content?.error || body?.content?.message || body?.message || `HTTP ${res.status}`;
+    throw new Error(`${res.status}: ${msg}`);
+  }
+  return body?.content !== undefined ? body.content : body;
+}
+
+function vSetStatus(id, msg, type, isHtml){
+  const el = document.getElementById(id);
+  if(isHtml) el.innerHTML = msg; else el.textContent = msg;
+  el.className = 'status-line show' + (type ? ' '+type : '');
+}
+
+// Mirrors invRenderTargetDomainSelect / sentryRenderAppDomainSelect exactly —
+// same shared HQ_DOMAINS list (fed by the HQ Excise Tax Scan tab's Known
+// domains), same "Other… (type manually)" fallback pattern.
+function vRenderDomainSelect(selectId, textId, selected){
+  const sel = document.getElementById(selectId);
+  if(!sel) return;
+  const opts = ['<option value="">(use my key\'s own domain — ops.tokenoftrust.com)</option>'];
+  opts.push(domainOptionsHtml(selected && selected !== '__custom__' ? selected : ''));
+  opts.push('<option value="__custom__"' + (selected === '__custom__' ? ' selected' : '') + '>Other… (type manually)</option>');
+  sel.innerHTML = opts.join('');
+  if(selected && selected !== '__custom__') sel.value = selected;
+  sel.addEventListener('change', (e)=>{
+    const textInput = document.getElementById(textId);
+    if(e.target.value === '__custom__'){
+      textInput.style.display = '';
+      textInput.value = '';
+      textInput.focus();
+    } else {
+      textInput.style.display = 'none';
+      textInput.value = e.target.value;
+    }
+  });
+}
+
+async function initVerification(){
+  await loadHqDomains(); // idempotent if the Investigate/Sentry tab's init already ran this
+  vRenderDomainSelect('vLookupDomainSelect', 'vLookupDomain', '');
+  vRenderDomainSelect('vHealthDomainSelect', 'vHealthDomain', '');
+}
+
+function vRenderLookupResult(content){
+  let html = '<div class="diag-summary" style="margin-bottom:10px;">';
+  const fields = [
+    ['appDomain', content.appDomain],
+    ['appUserid', content.appUserid],
+    ['appTransactionId', content.appTransactionId],
+    ['sessionUuid', content.sessionUuid],
+    ['verificationAttemptId', content.verificationAttemptId],
+    ['sourceVerificationAttemptId', content.sourceVerificationAttemptId],
+    ['createdAt', content.createdAt || content.ts]
+  ];
+  const rows = fields.filter(([, v]) => v !== undefined && v !== null && v !== '');
+  if(rows.length){
+    html += '<table style="width:100%;border-collapse:collapse;">' + rows.map(([k,v]) =>
+      `<tr><td style="padding:3px 8px 3px 0;color:var(--muted);white-space:nowrap;">${invEsc(k)}</td><td style="padding:3px 0;font-family:var(--mono);word-break:break-all;">${invEsc(v)}</td></tr>`
+    ).join('') + '</table>';
+  } else {
+    html += 'None of the expected fields (appDomain/appUserid/sessionUuid/…) were on this response — the real shape may differ from the card\'s stated DoD. Check the raw response below.';
+  }
+  if(content.sourceVerificationAttemptId){
+    html += `<div style="margin-top:8px;color:var(--warn);">This attempt reused a prior verification (sourceVerificationAttemptId set) — you're looking at the reuse chain, not a fresh verification.</div>`;
+  }
+  html += '</div>';
+  html += `<details style="margin-top:6px;"><summary style="cursor:pointer;color:var(--muted);font-size:11px;">Raw response</summary>
+    <pre style="white-space:pre-wrap;font-size:11px;background:var(--panel2);padding:8px;border-radius:6px;margin-top:6px;">${invEsc(JSON.stringify(content, null, 2))}</pre>
+  </details>`;
+  return html;
+}
+
+const V_SEVERITY_STYLE = {
+  error: { color: 'var(--danger)', border: '#5a2626', bg: 'var(--danger-dim)' },
+  warning: { color: 'var(--warn)', border: 'var(--warn-dim)', bg: 'var(--warn-dim)' },
+  info: { color: 'var(--muted)', border: 'var(--border)', bg: 'var(--panel2)' }
+};
+
+function vRenderHealthResult(content){
+  const anomalies = content.anomalies || [];
+  const summary = content.summary || { errors: 0, warnings: 0, info: 0 };
+  let html = `<div class="diag-summary" style="margin-bottom:10px;">Scanned ${content.scanned ?? '?'} associated_id(s), ${content.healthy ?? '?'} with no anomalies. ${anomalies.length} total: ${summary.errors ?? 0} error, ${summary.warnings ?? 0} warning, ${summary.info ?? 0} info.</div>`;
+  if(!anomalies.length){
+    html += '<div class="diag-summary">Nothing to show for this window.</div>';
+    return html;
+  }
+  const bySeverity = { error: [], warning: [], info: [] };
+  anomalies.forEach(a => {
+    const sev = bySeverity[a.severity] ? a.severity : 'info';
+    bySeverity[sev].push(a);
+  });
+  ['error','warning','info'].forEach(sev => {
+    if(!bySeverity[sev].length) return;
+    const s = V_SEVERITY_STYLE[sev];
+    bySeverity[sev].forEach(a => {
+      html += `<div style="border:1px solid ${s.border};background:${s.bg};border-radius:6px;padding:8px 10px;margin-bottom:8px;">
+        <div style="font-weight:600;color:${s.color};">${invEsc(a.type)} <span style="font-weight:400;color:var(--muted);font-size:11px;">(${invEsc(sev)})</span></div>
+        <div style="margin-top:2px;">associated_id: <span style="font-family:var(--mono);">${invEsc(a.associated_id)}</span></div>
+        <div style="margin-top:2px;">${invEsc(a.description)}</div>
+        ${a.evidence ? `<details style="margin-top:4px;"><summary style="cursor:pointer;color:var(--muted);font-size:11px;">Evidence</summary>
+          <pre style="white-space:pre-wrap;font-size:11px;background:var(--panel2);padding:6px;border-radius:6px;margin-top:4px;">${invEsc(JSON.stringify(a.evidence, null, 2))}</pre>
+        </details>` : ''}
+      </div>`;
+    });
+  });
+  return html;
+}
+
+document.getElementById('vLookupBtn').addEventListener('click', async ()=>{
+  const codeRaw = document.getElementById('vCode').value.trim();
+  if(!codeRaw || codeRaw.length !== 6){ vSetStatus('vLookupStatus', 'Enter the 6-character code from the modal footer.', 'err'); return; }
+  const targetAppDomain = document.getElementById('vLookupDomain').value.trim() || null;
+
+  const btn = document.getElementById('vLookupBtn');
+  btn.disabled = true;
+  document.getElementById('vLookupResultsPanel').style.display = 'none';
+  vSetStatus('vLookupStatus', 'Getting a token…');
+  try{
+    const token = await invGetToken(false);
+    vSetStatus('vLookupStatus', `<span class="spinner">⟳</span> Looking up code ${invEsc(codeRaw)}…`, null, true);
+    const params = { code: codeRaw };
+    if(targetAppDomain) params.appDomain = targetAppDomain;
+    const content = await verifDiagEvaluate(token, 'lookupVerificationAttempt', params);
+    document.getElementById('vLookupResultsBody').innerHTML = vRenderLookupResult(content);
+    document.getElementById('vLookupResultsPanel').style.display = 'block';
+    vSetStatus('vLookupStatus', 'Done.', 'ok');
+  }catch(err){
+    vSetStatus('vLookupStatus', 'Failed — ' + (err.message || 'unknown error') + '. A 404 here can mean either "not found" or a permission gap on this key — see the hint above.', 'err');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById('vHealthBtn').addEventListener('click', async ()=>{
+  const sinceLocal = document.getElementById('vHealthSince').value;
+  if(!sinceLocal){ vSetStatus('vHealthStatus', 'Enter a "since" time first.', 'err'); return; }
+  const untilLocal = document.getElementById('vHealthUntil').value;
+  const targetAppDomain = document.getElementById('vHealthDomain').value.trim() || null;
+
+  const btn = document.getElementById('vHealthBtn');
+  btn.disabled = true;
+  document.getElementById('vHealthResultsPanel').style.display = 'none';
+  vSetStatus('vHealthStatus', 'Getting a token…');
+  try{
+    const token = await invGetToken(false);
+    vSetStatus('vHealthStatus', '<span class="spinner">⟳</span> Scanning…', null, true);
+    const params = { since: new Date(sinceLocal).toISOString() };
+    if(untilLocal) params.until = new Date(untilLocal).toISOString();
+    if(targetAppDomain) params.appDomain = targetAppDomain;
+    const content = await verifDiagEvaluate(token, 'verificationHealthCheck', params);
+    document.getElementById('vHealthResultsBody').innerHTML = vRenderHealthResult(content);
+    document.getElementById('vHealthResultsPanel').style.display = 'block';
+    const n = (content.anomalies || []).length;
+    vSetStatus('vHealthStatus', `Done. ${n} anomal${n===1?'y':'ies'} found.`, 'ok');
+  }catch(err){
+    vSetStatus('vHealthStatus', 'Failed — ' + (err.message || 'unknown error'), 'err');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+initVerification();
 
 // =====================================================================
 // Sentry event search (beta) — added 3.17.9. Ported from Engineering's
