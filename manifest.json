@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "TOT Order Diagnostics Tool",
-  "version": "3.17.40",
-  "version_name": "3.17.40 — HQ Excise Tax scan's time-window mode is no longer stuck at 24 hours: it's now an editable hours field (up to 2 weeks) so a weekend or other gap can be scanned in one pass. Also widened the open-ended ID-range mode's stop threshold so a low-volume weekend doesn't make it give up early.",
+  "version": "3.21.1",
+  "version_name": "3.21.1 \u2014 Tax Rules tab on PRODUCTION (live keys only); optional \"Remember on this computer\" restored for live credentials.",
   "description": "Looks up an order from Shopify, BigCommerce, or WooCommerce and checks it for common tax and verification problems. Also includes tools for scanning tax data across all client stores, digging into one order's tax history, and checking on ID verification issues.",
   "action": {
     "default_title": "Order Diagnostics Tool",
@@ -25,6 +25,22 @@
     "48": "icon48.png",
     "128": "icon128.png"
   },
-  "permissions": ["storage", "sidePanel", "scripting", "tabs"],
-  "host_permissions": ["https://admin.shopify.com/*", "https://docs.google.com/*", "https://*.googleusercontent.com/*", "https://*.myshopify.com/*", "https://*.mybigcommerce.com/*", "https://vapesocietysupplies.com/*", "https://vapedepotusa.com/*", "https://app.tokenoftrust.com/*", "https://taxes.tokenoftrust.com/*", "https://sentry.io/*"]
+  "permissions": [
+    "storage",
+    "sidePanel",
+    "scripting",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://admin.shopify.com/*",
+    "https://docs.google.com/*",
+    "https://*.googleusercontent.com/*",
+    "https://*.myshopify.com/*",
+    "https://*.mybigcommerce.com/*",
+    "https://vapesocietysupplies.com/*",
+    "https://vapedepotusa.com/*",
+    "https://app.tokenoftrust.com/*",
+    "https://taxes.tokenoftrust.com/*",
+    "https://sentry.io/*"
+  ]
 }

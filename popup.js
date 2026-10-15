@@ -2880,6 +2880,7 @@ function switchPlatformTab(platform){
   document.getElementById('platformBackfill').classList.toggle('active', platform === 'backfill');
   document.getElementById('platformInvestigate').classList.toggle('active', platform === 'investigate');
   document.getElementById('platformVerification').classList.toggle('active', platform === 'verification');
+  document.getElementById('platformTaxRules').classList.toggle('active', platform === 'taxrules');
 }
 document.querySelectorAll('.platform-tab').forEach(btn=>{
   btn.addEventListener('click', ()=> switchPlatformTab(btn.dataset.platform));

@@ -971,3 +971,33 @@ Was a free-text input; replaced with a `<select>` populated from the same shared
 - Package/sign for the Chrome Web Store (internal or unlisted) so teammates don't need Developer Mode
 - BigCommerce: exemption field support, bulk scan equivalent, and validating the status vocabulary against more client stores
 - Product Backfill: Hemp and Nicotine Pouch CSV formats, Shopify/WooCommerce cross-referencing
+
+## Tax Rules tab (PRODUCTION) — v3.21.0 / v3.21.1
+
+Tool for the Tax Rules API on **production (app.tokenoftrust.com)**. Since v3.21.0 this tab no longer talks to test.tokenoftrust.com (it was test-only in v3.19.0/v3.20.0); the host is still hard-coded, so it cannot reach any other environment. **Saves change live rules for real vendors.**
+
+What changed in v3.21.0:
+- API origin is `https://app.tokenoftrust.com/api`; the `test.tokenoftrust.com` host permission was removed from the manifest.
+- Connect accepts only **live** key pairs (`public_live_…` / `secret_live_…`) and refuses test keys before any network call.
+- **"Remember on this computer"** still works, now for live keys only (v3.21.1; v3.21.0 had disabled it). It keeps the live secret **unencrypted** in this browser profile (`chrome.storage.local`, same as the Order Investigation tab) so the tab reconnects by itself in a new session or when the 24h token expires. That's an accepted trade-off for a personal ops tool; don't tick it on a shared machine. **Forget saved credentials** removes it. Any credentials or token saved by the test-era build (`trTestCreds`, `trTestToken`) are deleted the first time the panel loads.
+- Production uses its own storage keys (`trProd…`), so the old test change log, snapshots and saved emails do not appear next to production history. They are left in place and untouched.
+- Tab label and warnings now say PRODUCTION.
+
+1. **Connect** — paste the ops.tokenoftrust.com *production* API key (`public_live_…`) and secret (`secret_live_…`). The key and secret are cleared from the fields after the token exchange; the 24h token is kept only in session memory. Tick **Remember on this computer** to keep the credentials so the tab reconnects by itself; **Forget saved credentials** removes them, and **Disconnect** stays disconnected until you press Connect.
+2. **Load & find** — pick vape / nicotinePouch / hemp, load current rules (shows revision), search by state, city, county or text (e.g. `Anchorage`, `55`).
+3. **Edit & preview (dry-run)** — edit one jurisdiction as JSON, or tick "Remove". Always posts the full rule set with only that node changed, `force=false`; shows a line diff and the server's change list. Nothing is saved.
+4. **Save** — needs a matching dry-run, two different emails (requested by / approved by), a reason and the confirm box. It re-checks the live revision first, snapshots the full rule set, saves with `force=true`, then re-reads to verify.
+
+**Revert points:** every save stores the previous value of each changed jurisdiction (and a downloadable full backup of the rule set). "Revert this change…" loads the old value into the editor and runs a dry-run; you still confirm the save. Reverts are also available from the server's audited history.
+
+After updating, reload the extension at `chrome://extensions`.
+
+### Vendor overrides (sections 5–7, Client Config API)
+
+Overrides replace a global rule for **one client only** (`options.exciseTax.ruleOverrides`). Same connection as above; the API key needs the `api:clientConfig` role.
+
+1. **List clients** (or type an app domain) → **Load**. Shows that client's overrides per product type.
+2. **Edit** an override (one row per county, locality or state-wide rule) or add a **+ New override**. Pick **where it applies** from one dropdown — the state-wide rule, or any city / county listed under that state (from the global rules and this client's overrides; "not listed?" lets you type a name) — so editing Fairbanks never touches Anchorage. "Whole state node" replaces everything under the state and asks you to acknowledge anything it would delete. "Start from the global rule" copies the global rule for that jurisdiction and adds a `startDate`. New or changed rules need a `startDate` of **today or later** (the server rejects past dates as retroactive) — so an override takes effect from that date.
+3. **Preview (dry-run)** sends the client's *complete* override set with only that jurisdiction changed (a save replaces the whole set; anything omitted is deleted). Nothing is saved.
+4. **Save** needs two different emails, a reason and the confirm box. It re-reads the client first and aborts if its overrides changed since you loaded them, snapshots the full set, saves with `force=true` + an `Idempotency-Key`, then re-reads to verify.
+5. **Revert** from "Overrides saved from this extension" — it restores the previous value (or removes an override that didn't exist before) via a dry-run you confirm. The Client Config API has no history endpoint, so reverts come from the local log and the downloadable backup. A revert to an old rule with a past `startDate` may be rejected as retroactive; the "Advanced: allow retroactive change" box sets `audit.allowRetroactive`.

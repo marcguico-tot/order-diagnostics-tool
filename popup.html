@@ -61,12 +61,13 @@
   }
   label{display:block;font-size:11.5px;color:var(--muted);margin-bottom:5px;margin-top:12px;}
   label:first-of-type{margin-top:0;}
-  select, input[type=text], textarea{
+  select, input[type=text], input[type=password], input[type=email], textarea{
     width:100%;background:var(--panel2);border:1px solid var(--border);color:var(--text);
     padding:8px 9px;border-radius:6px;font-family:var(--sans);font-size:12.5px;outline:none;
   }
   select:focus, input:focus, textarea:focus{border-color:var(--accent);}
   textarea{font-family:var(--mono);font-size:11px;resize:vertical;min-height:80px;}
+  #trJurTable td:first-child{word-break:break-all;min-width:96px;font-family:var(--mono);font-size:11px;}
   .hint{font-size:10.5px;color:var(--muted);margin-top:4px;line-height:1.4;}
 
   .btn{
@@ -187,7 +188,7 @@
   .html-tag{color:#7ec8ff;} .html-attr{color:#f0b96a;}
   .html-attr-val{color:#a8e6a1;} .html-comment{color:var(--muted);font-style:italic;}
 
-  .platform-tabs{display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid var(--border);}
+  .platform-tabs{display:flex;flex-wrap:wrap;gap:0 8px;margin-bottom:16px;border-bottom:1px solid var(--border);}
   .platform-tab{
     background:none;border:none;color:var(--muted);font-family:var(--sans);
     font-size:12.5px;font-weight:600;padding:8px 6px;cursor:pointer;
@@ -223,6 +224,7 @@
     <button class="platform-tab" data-platform="backfill">Product Backfill</button>
     <button class="platform-tab" data-platform="investigate">Order Investigation</button>
     <button class="platform-tab" data-platform="verification">Verification</button>
+    <button class="platform-tab" data-platform="taxrules">Tax Rules (PROD)</button>
   </div>
 
   <div class="platform-panel active" id="platformShopify">
@@ -779,6 +781,188 @@
 
   </div>
 
+  <div class="platform-panel" id="platformTaxRules">
+
+  <div class="panel">
+    <h2>Tax Rules API <span style="text-transform:none;font-weight:400;color:var(--danger);">(PRODUCTION &mdash; live data)</span></h2>
+    <div class="hint" style="margin-bottom:8px;">Reads, previews (dry-run) and saves the <strong>global</strong> excise tax rules on <strong>production</strong> (<code>app.tokenoftrust.com</code>). The host is hard-coded &mdash; this tab cannot talk to the test server. A saved change applies to <strong>every live vendor</strong> that has not overridden that jurisdiction; per-vendor overrides live in the Client Config API and are not covered here.</div>
+    <div class="hint" style="margin-bottom:0;">Every save captures a <strong>revert point</strong> first: the full rule set is snapshotted, and the previous value of each changed jurisdiction is logged so it can be restored in two clicks.</div>
+  </div>
+
+  <div class="panel">
+    <h2>1 &middot; Connect</h2>
+    <label for="trApiKey">API key <span class="hint" style="display:inline;">(public_live_&hellip; &mdash; the ops.tokenoftrust.com <em>production</em> key)</span></label>
+    <input type="text" id="trApiKey" placeholder="public_live_..." autocomplete="off" spellcheck="false" style="font-family:var(--mono);">
+    <label for="trSecret">Secret key <span class="hint" style="display:inline;">(secret_live_&hellip;)</span></label>
+    <input type="password" id="trSecret" placeholder="secret_live_..." autocomplete="off" spellcheck="false" style="font-family:var(--mono);">
+    <label for="trAppDomain">App domain</label>
+    <input type="text" id="trAppDomain" value="ops.tokenoftrust.com" autocomplete="off" spellcheck="false">
+    <label style="display:flex;gap:7px;align-items:flex-start;margin-top:10px;"><input type="checkbox" id="trRemember" style="width:auto;margin-top:2px;"> <span>Remember on this computer <span class="hint" style="display:inline;">&mdash; so I don&rsquo;t have to paste them every session. <strong style="color:var(--warn);">Stores the live secret unencrypted in this browser profile</strong> (same as the Order Investigation tab). &ldquo;Forget&rdquo; removes it.</span></span></label>
+    <div class="hint">Exchanged for a 24-hour bearer token via <code>POST /api/accessToken</code>. The key and secret are cleared from these fields right after the exchange; the token is kept only in session memory (gone when the browser closes). With remembered credentials the tab reconnects by itself.</div>
+    <div class="btn-row">
+      <button class="btn primary" id="trConnectBtn">Connect</button>
+      <button class="btn ghost" id="trDisconnectBtn">Disconnect</button>
+      <button class="btn ghost" id="trForgetBtn" style="display:none;">Forget saved credentials</button>
+    </div>
+    <div class="status-line" id="trConnStatus"></div>
+  </div>
+
+  <div class="panel" id="trRulesPanel">
+    <h2>2 &middot; Load &amp; find a rule</h2>
+    <label for="trProductType">Product type</label>
+    <select id="trProductType">
+      <option value="vape">vape</option>
+      <option value="nicotinePouch">nicotinePouch</option>
+      <option value="hemp">hemp</option>
+    </select>
+    <div class="btn-row"><button class="btn primary" id="trLoadBtn">Load current rules</button></div>
+    <div class="status-line" id="trLoadStatus"></div>
+    <div id="trFindWrap" style="display:none;">
+      <label for="trSearch">Find a jurisdiction <span class="hint" style="display:inline;">(state code, city, county, or any text in the rule &mdash; e.g. AK, Anchorage, 55)</span></label>
+      <input type="text" id="trSearch" placeholder="Anchorage" autocomplete="off" spellcheck="false">
+      <div class="hint" id="trSearchCount"></div>
+      <div class="table-scroll" style="margin-top:6px;"><table class="cfg" id="trJurTable"><thead><tr><th>Jurisdiction</th><th>Rule summary</th><th></th></tr></thead><tbody id="trJurBody"></tbody></table></div>
+      <div class="btn-row"><button class="btn small" id="trNewJurBtn">+ New jurisdiction</button></div>
+    </div>
+  </div>
+
+  <div class="panel" id="trEditPanel" style="display:none;">
+    <h2>3 &middot; Edit &amp; preview <span style="text-transform:none;font-weight:400;color:var(--muted);">(dry-run &mdash; saves nothing)</span></h2>
+    <div class="status-line show" id="trRevertBanner" style="display:none;"></div>
+    <label for="trPath">Jurisdiction path</label>
+    <input type="text" id="trPath" placeholder="US.regionCode.AK" autocomplete="off" spellcheck="false" style="font-family:var(--mono);">
+    <label for="trEditor">Rule(s) for this jurisdiction <span class="hint" style="display:inline;">(JSON; rule, [rules], or {all, county, locality})</span></label>
+    <textarea id="trEditor" spellcheck="false" style="min-height:190px;"></textarea>
+    <label style="display:flex;gap:7px;align-items:center;margin-top:8px;"><input type="checkbox" id="trRemove" style="width:auto;"> Remove this jurisdiction entirely</label>
+    <div class="btn-row">
+      <button class="btn primary" id="trPreviewBtn">Preview change (dry-run)</button>
+      <button class="btn ghost" id="trResetEditorBtn">Reset editor</button>
+    </div>
+    <div class="status-line" id="trPreviewStatus"></div>
+    <div id="trPreviewOut" style="margin-top:10px;"></div>
+    <div id="trRevertPoint" style="display:none;margin-top:12px;">
+      <div class="hint" style="margin-bottom:5px;"><strong>Revert point</strong> &mdash; what this jurisdiction is on the server right now. It is saved automatically when you save a change.</div>
+      <pre class="json-view" id="trRevertPointJson" style="max-height:170px;"></pre>
+      <div class="btn-row">
+        <button class="btn small" id="trCopyPrevBtn">Copy previous value</button>
+        <button class="btn small" id="trDlBackupBtn">Download full rule-set backup</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" id="trSavePanel" style="display:none;">
+    <h2>4 &middot; Save to PRODUCTION <span style="text-transform:none;font-weight:400;color:var(--danger);">(force=true &mdash; changes global rules)</span></h2>
+    <div class="hint" style="margin-bottom:8px;">Needs two different people: you as requester and a reviewer as approver. The server records both emails and the reason in the audit trail before saving.</div>
+    <label for="trRequestedBy">Requested by (email)</label>
+    <input type="text" id="trRequestedBy" placeholder="you@team.tokenoftrust.com" autocomplete="off" spellcheck="false">
+    <label for="trApprovedBy">Approved by (email &mdash; must differ)</label>
+    <input type="text" id="trApprovedBy" placeholder="reviewer@team.tokenoftrust.com" autocomplete="off" spellcheck="false">
+    <label for="trReason">Reason <span class="hint" style="display:inline;">(e.g. ticket link)</span></label>
+    <input type="text" id="trReason" placeholder="Ticket link + what changed, e.g. TC-00XX Anchorage 55% -> 56%" autocomplete="off">
+    <label id="trAckRow" style="display:none;gap:7px;align-items:flex-start;margin-top:10px;"><input type="checkbox" id="trAckExtra" style="width:auto;margin-top:2px;"> <span style="color:var(--warn);">The preview shows changes to jurisdictions other than the one I edited. I have reviewed them.</span></label>
+    <label style="display:flex;gap:7px;align-items:flex-start;margin-top:10px;"><input type="checkbox" id="trConfirm" style="width:auto;margin-top:2px;"> <span>I understand this changes the global <strong id="trConfirmType">vape</strong> rules on <strong>PRODUCTION</strong> for every live vendor without an override.</span></label>
+    <div class="btn-row">
+      <button class="btn primary" id="trSaveBtn" disabled>Save change (force=true)</button>
+    </div>
+    <div class="hint" id="trSaveWhy" style="margin-top:6px;"></div>
+    <div class="status-line" id="trSaveStatus"></div>
+    <div id="trSaveOut" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="panel" id="ovPanel">
+    <h2>5 &middot; Vendor overrides <span style="text-transform:none;font-weight:400;color:var(--muted);">(Client Config API)</span></h2>
+    <div class="hint" style="margin-bottom:8px;">A vendor override replaces the global rule for <strong>one client only</strong> (<span style="font-family:var(--mono);">options.exciseTax.ruleOverrides</span>). A save <strong>replaces that client&rsquo;s whole override set</strong> &mdash; this tab always sends the complete set with just one jurisdiction changed. New or changed rules need a <span style="font-family:var(--mono);">startDate</span> of today or later. Uses the same connection as section 1 (the key needs the <span style="font-family:var(--mono);">api:clientConfig</span> role).</div>
+    <div class="btn-row" style="margin-top:0;"><button class="btn small" id="ovListBtn">List clients</button></div>
+    <select id="ovClientSel" style="display:none;margin-top:8px;"></select>
+    <label for="ovClient">Client (app domain or appId)</label>
+    <input type="text" id="ovClient" placeholder="a vendor app domain, e.g. example-vendor.com" autocomplete="off" spellcheck="false" style="font-family:var(--mono);">
+    <div class="btn-row"><button class="btn primary" id="ovLoadBtn">Load this client&rsquo;s overrides</button></div>
+    <div class="status-line" id="ovLoadStatus"></div>
+    <div id="ovWrap" style="display:none;margin-top:10px;">
+      <div class="hint" id="ovSummary"></div>
+      <label for="ovProductType">Product type</label>
+      <select id="ovProductType"><option value="vape">vape</option><option value="nicotinePouch">nicotinePouch</option><option value="hemp">hemp</option></select>
+      <div class="hint" id="ovCount"></div>
+      <div class="table-scroll" style="margin-top:6px;"><table class="cfg" id="ovJurTable"><thead><tr><th>Override</th><th>Summary</th><th></th></tr></thead><tbody id="ovJurBody"></tbody></table></div>
+      <div class="btn-row"><button class="btn small" id="ovNewBtn">+ New override</button><button class="btn small" id="ovDlAllBtn">Download all overrides (backup)</button></div>
+    </div>
+  </div>
+
+  <div class="panel" id="ovEditPanel" style="display:none;">
+    <h2>6 &middot; Edit override &amp; preview <span style="text-transform:none;font-weight:400;color:var(--muted);">(dry-run &mdash; saves nothing)</span></h2>
+    <div class="status-line show" id="ovRevertBanner" style="display:none;"></div>
+    <label for="ovPath">State node <span class="hint" style="display:inline;">(country.regionCode.state)</span></label>
+    <input type="text" id="ovPath" placeholder="US.regionCode.AK" autocomplete="off" spellcheck="false" style="font-family:var(--mono);">
+    <label for="ovLevel">Where does this override apply?</label>
+    <select id="ovLevel"></select>
+    <div class="hint" id="ovLevelHint"></div>
+    <div id="ovNameRow" style="display:none;"><label for="ovName" id="ovNameLabel">Name of the city <span class="hint" style="display:inline;">(exactly as in the rules)</span></label>
+    <input type="text" id="ovName" placeholder="Fairbanks North Star Borough" autocomplete="off" spellcheck="false"></div>
+    <label for="ovEditor">Override rule(s) <span class="hint" style="display:inline;">(JSON: one rule, or [rules] &mdash; just the rule for what you picked above)</span></label>
+    <textarea id="ovEditor" spellcheck="false" style="min-height:190px;"></textarea>
+    <div class="btn-row">
+      <button class="btn small" id="ovFromGlobalBtn">Start from the global rule</button>
+      <button class="btn small" id="ovStartTodayBtn">Add startDate (today) where missing</button>
+    </div>
+    <div class="hint" id="ovDateHint"></div>
+    <label style="display:flex;gap:7px;align-items:center;margin-top:8px;"><input type="checkbox" id="ovRemove" style="width:auto;"> Remove this override (the vendor falls back to the global rule)</label>
+    <div class="btn-row">
+      <button class="btn primary" id="ovPreviewBtn">Preview change (dry-run)</button>
+      <button class="btn ghost" id="ovResetBtn">Reset editor</button>
+    </div>
+    <div class="status-line" id="ovPreviewStatus"></div>
+    <div id="ovPreviewOut" style="margin-top:10px;"></div>
+    <div id="ovRevertPoint" style="display:none;margin-top:12px;">
+      <div class="hint" style="margin-bottom:5px;"><strong>Revert point</strong> &mdash; what this override is on the server right now. It is saved automatically when you save a change.</div>
+      <pre class="json-view" id="ovRevertPointJson" style="max-height:170px;"></pre>
+      <div class="btn-row"><button class="btn small" id="ovCopyPrevBtn">Copy previous value</button></div>
+    </div>
+  </div>
+
+  <div class="panel" id="ovSavePanel" style="display:none;">
+    <h2>7 &middot; Save override <span style="text-transform:none;font-weight:400;color:var(--danger);">(force=true &mdash; changes this client)</span></h2>
+    <div class="hint" style="margin-bottom:8px;">Needs two different people. The server records both emails and the reason in the audit trail <em>before</em> saving; if it can&rsquo;t, nothing is saved (503).</div>
+    <label for="ovRequestedBy">Requested by (email)</label>
+    <input type="text" id="ovRequestedBy" placeholder="you@team.tokenoftrust.com" autocomplete="off" spellcheck="false">
+    <label for="ovApprovedBy">Approved by (email &mdash; must differ)</label>
+    <input type="text" id="ovApprovedBy" placeholder="reviewer@team.tokenoftrust.com" autocomplete="off" spellcheck="false">
+    <label for="ovReason">Reason <span class="hint" style="display:inline;">(e.g. ticket link)</span></label>
+    <input type="text" id="ovReason" placeholder="Ticket link + what changed, e.g. TC-00XX Anchorage 50%" autocomplete="off">
+    <label id="ovAckRow" style="display:none;gap:7px;align-items:flex-start;margin-top:10px;"><input type="checkbox" id="ovAckExtra" style="width:auto;margin-top:2px;"> <span id="ovAckText" style="color:var(--warn);"></span></label>
+    <label style="display:flex;gap:7px;align-items:flex-start;margin-top:10px;"><input type="checkbox" id="ovRetro" style="width:auto;margin-top:2px;"> <span>Advanced: allow retroactive change <span class="hint" style="display:inline;">(audit.allowRetroactive &mdash; only for a deliberate back-dated correction; recorded in the audit)</span></span></label>
+    <label style="display:flex;gap:7px;align-items:flex-start;margin-top:10px;"><input type="checkbox" id="ovConfirm" style="width:auto;margin-top:2px;"> <span>I understand this replaces the whole override set of <strong id="ovConfirmClient">this client</strong> on <strong>PRODUCTION</strong> with the version in the preview.</span></label>
+    <div class="btn-row"><button class="btn primary" id="ovSaveBtn" disabled>Save override (force=true)</button></div>
+    <div class="hint" id="ovSaveWhy" style="margin-top:6px;"></div>
+    <div class="status-line" id="ovSaveStatus"></div>
+    <div id="ovSaveOut" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Overrides saved from this extension <span style="text-transform:none;font-weight:400;color:var(--muted);">(this browser)</span></h2>
+    <div class="hint" style="margin-bottom:8px;">Local log with revert points for vendor overrides (the Client Config API has no history endpoint to read back). Stored in this browser profile only; no credentials.</div>
+    <div id="ovLogOut"></div>
+    <div class="btn-row"><button class="btn small ghost" id="ovClearLogBtn">Clear override log &amp; snapshots</button></div>
+  </div>
+
+  <div class="panel">
+    <h2>Change history <span style="text-transform:none;font-weight:400;color:var(--muted);">(from the server)</span></h2>
+    <div class="hint" style="margin-bottom:8px;">Audited changes for the selected product type, newest first &mdash; who requested, who approved, why, and what changed. Any change can be reverted from its previous value.</div>
+    <div class="btn-row"><button class="btn" id="trHistBtn">Load history</button></div>
+    <div class="status-line" id="trHistStatus"></div>
+    <div id="trHistOut" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Changes saved from this extension <span style="text-transform:none;font-weight:400;color:var(--muted);">(this browser)</span></h2>
+    <div class="hint" style="margin-bottom:8px;">Local log with revert points. Survives closing the panel; stored in this browser profile only (no credentials in it).</div>
+    <div id="trLogOut"></div>
+    <div class="btn-row"><button class="btn small ghost" id="trClearLogBtn">Clear log &amp; snapshots</button></div>
+  </div>
+
+  </div>
+
 <script src="popup.js"></script>
+<script src="taxrules.js"></script>
+<script src="overrides.js"></script>
 </body>
 </html>
